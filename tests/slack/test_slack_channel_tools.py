@@ -1,0 +1,563 @@
+from datetime import UTC, datetime
+from unittest.mock import AsyncMock
+
+import pytest
+from cryptography.fernet import Fernet
+from sqlalchemy import update
+
+from openswe import tools
+from openswe.database import postgres
+from openswe.run_config import RunConfig
+from openswe.slack.channels import SlackChannel
+from openswe.slack.http import SlackBotToken, SlackConfigurationError
+from openswe.slack.tools.search import SlackSearchGrant
+from openswe.users import User
+from tests.support.slack_api import SlackAPI
+
+pytestmark = pytest.mark.usefixtures("registry_db")
+
+
+async def test_list_channels_keeps_cursor_on_empty_page(slack_api: SlackAPI) -> None:
+    slack_api.respond({"ok": True, "channels": [], "response_metadata": {"next_cursor": "more"}})
+    result = await tools.slack_list_channels()
+    assert result == {"success": True, "channels": [], "next_cursor": "more"}
+
+
+@pytest.mark.usefixtures("registry_db")
+async def test_list_channels_populates_display_name_directory(slack_api: SlackAPI) -> None:
+    slack_api.respond(
+        {"ok": True, "channels": [{"id": "C123", "name": "engineering", "is_private": False}]}
+    )
+    result = await tools.slack_list_channels()
+    assert result["success"] is True
+    assert await SlackChannel.name_for("C123") == "engineering"
+
+
+@pytest.fixture
+def member_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        RunConfig,
+        "from_runtime",
+        lambda: RunConfig.parse({"slack_thread": {"channel_id": "C123", "thread_ts": "1.0"}}),
+    )
+
+
+async def test_directory_search_uses_cached_data_without_slack(
+    slack_api: SlackAPI, member_run: None
+) -> None:
+    public = {
+        "is_channel": True,
+        "is_private": False,
+        "is_archived": False,
+        "is_ext_shared": False,
+        "is_pending_ext_shared": False,
+    }
+    await SlackChannel.save_all(
+        {**public, "id": "C123", "name": "destination"},
+        {
+            **public,
+            "id": "C456",
+            "name": "billing",
+            "purpose": {"value": "Billing questions"},
+            "topic": "Payments",
+            "num_members": 42,
+        },
+    )
+
+    result = await tools.slack_search_channel_directory("BILLING")
+
+    assert result == {
+        "success": True,
+        "channels": [
+            {
+                "id": "C456",
+                "name": "billing",
+                "purpose": "Billing questions",
+                "topic": "Payments",
+                "num_members": 42,
+            }
+        ],
+    }
+    assert not slack_api.calls
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        "public",
+        "missing_public",
+        "external",
+        "private",
+        "unavailable",
+        "malformed",
+        "wrong_channel",
+    ],
+)
+async def test_directory_search_verifies_a_stale_destination(
+    slack_api: SlackAPI, member_run: None, status: str
+) -> None:
+    public = {
+        "id": "C123",
+        "name": "destination",
+        "is_channel": True,
+        "is_private": False,
+        "is_archived": False,
+        "is_ext_shared": False,
+        "is_pending_ext_shared": False,
+    }
+    await SlackChannel.save_all(
+        {**public, "id": "C456", "name": "billing", "purpose": "Billing questions"}
+    )
+    if status != "missing_public":
+        await SlackChannel.save_all(public)
+        async with postgres.session() as session:
+            await session.execute(
+                update(SlackChannel)
+                .where(SlackChannel.id == "C123")
+                .values(fetched_at=datetime.fromtimestamp(0, UTC))
+            )
+    if status == "unavailable":
+        slack_api.respond({"ok": False, "error": "channel_not_found"})
+    else:
+        slack_api.respond(
+            {
+                "ok": True,
+                "channel": {
+                    **public,
+                    "id": "C789" if status == "wrong_channel" else "C123",
+                    "is_ext_shared": None if status == "malformed" else status == "external",
+                    "is_private": status == "private",
+                },
+            }
+        )
+
+    result = await tools.slack_search_channel_directory("billing")
+
+    assert result["success"] is (status in {"public", "missing_public"})
+    if result["success"]:
+        assert [channel["id"] for channel in result["channels"]] == ["C456"]
+        assert await tools.slack_search_channel_directory("billing") == result
+    assert [(method, params["channel"]) for method, params in slack_api.calls] == [
+        ("conversations.info", "C123")
+    ]
+
+
+async def test_directory_search_refuses_missing_token(
+    slack_api: SlackAPI, member_run: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(SlackBotToken, "read", AsyncMock(side_effect=SlackConfigurationError()))
+    assert (await tools.slack_search_channel_directory("billing"))["success"] is False
+    assert not slack_api.calls
+
+
+async def test_directory_search_refuses_unverifiable_or_external_destination(
+    slack_api: SlackAPI, member_run: None
+) -> None:
+    slack_api.respond({"ok": False, "error": "channel_not_found"})
+    assert (await tools.slack_search_channel_directory("billing"))["success"] is False
+    await SlackChannel.save_all(
+        {
+            "id": "C123",
+            "name": "external",
+            "is_channel": True,
+            "is_private": False,
+            "is_ext_shared": True,
+            "is_pending_ext_shared": False,
+        }
+    )
+    assert (await tools.slack_search_channel_directory("billing"))["success"] is False
+    assert [method for method, _ in slack_api.calls] == ["conversations.info"]
+
+
+async def test_list_members_preserves_pagination_and_only_exposes_public_identity(
+    slack_api: SlackAPI, member_run: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(User, "login_for_slack", AsyncMock(return_value="octocat"))
+    slack_api.respond({"ok": True, "channel": {"id": "C123", "is_private": True}})
+    slack_api.respond({"ok": True, "members": [], "response_metadata": {"next_cursor": "more"}})
+    assert await tools.slack_list_channel_members("C123") == {
+        "success": True,
+        "channel_id": "C123",
+        "members": [],
+        "next_cursor": "more",
+    }
+    slack_api.respond({"ok": True, "channel": {"id": "C123", "is_private": True}})
+    slack_api.respond({"ok": True, "members": ["U123"]})
+    slack_api.respond(
+        {
+            "ok": True,
+            "user": {
+                "profile": {
+                    "display_name": "Ada",
+                    "email": "private@example.com",
+                    "status_text": "On vacation",
+                    "status_emoji": ":palm_tree:",
+                    "status_expiration": 2000000000,
+                }
+            },
+        }
+    )
+    assert await tools.slack_list_channel_members("C123", cursor="more") == {
+        "success": True,
+        "channel_id": "C123",
+        "members": [
+            {
+                "id": "U123",
+                "name": "Ada",
+                "github_login": "octocat",
+                "status_text": "On vacation",
+                "status_emoji": ":palm_tree:",
+                "status_expiration": 2000000000,
+            }
+        ],
+        "next_cursor": "",
+    }
+    assert slack_api.calls[3][1]["cursor"] == "more"
+
+
+@pytest.mark.parametrize("private,external", [(False, False), (True, False), (False, True)])
+async def test_list_members_restricts_other_channels(
+    slack_api: SlackAPI, member_run: None, private: bool, external: bool
+) -> None:
+    slack_api.respond(
+        {
+            "ok": True,
+            "channel": {
+                "id": "C456",
+                "is_channel": True,
+                "is_private": private,
+                "is_ext_shared": external,
+                "is_pending_ext_shared": False,
+            },
+        }
+    )
+    slack_api.respond({"ok": True, "members": []})
+    result = await tools.slack_list_channel_members("C456")
+    assert result["success"] is (not private and not external)
+    assert ("conversations.members" in [method for method, _ in slack_api.calls]) is (
+        not private and not external
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [{"members": [42]}, {"members": [], "response_metadata": {"next_cursor": 42}}],
+)
+async def test_list_members_rejects_malformed_pages(
+    slack_api: SlackAPI, member_run: None, payload: dict[str, object]
+) -> None:
+    slack_api.respond({"ok": True, "channel": {"id": "C123"}})
+    slack_api.respond({"ok": True, **payload})
+    assert await tools.slack_list_channel_members("C123") == {
+        "success": False,
+        "error": "invalid_slack_response",
+    }
+
+
+async def test_list_members_keeps_unknown_identity_when_profile_lookup_fails(
+    slack_api: SlackAPI, member_run: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(User, "login_for_slack", AsyncMock(return_value=None))
+    slack_api.respond({"ok": True, "channel": {"id": "C123"}})
+    slack_api.respond({"ok": True, "members": ["U123"]})
+    slack_api.respond({"ok": False, "error": "user_not_found"})
+    result = await tools.slack_list_channel_members("C123")
+    assert result == {
+        "success": True,
+        "channel_id": "C123",
+        "members": [
+            {
+                "id": "U123",
+                "name": "U123",
+                "github_login": None,
+                "status_text": None,
+                "status_emoji": None,
+                "status_expiration": None,
+            }
+        ],
+        "next_cursor": "",
+    }
+
+
+async def test_list_members_reports_rate_limit_instead_of_empty_page(
+    slack_api: SlackAPI, member_run: None
+) -> None:
+    slack_api.respond({"ok": True, "channel": {"id": "C123"}})
+    slack_api.respond(
+        {"ok": False, "error": "ratelimited"}, status=429, headers={"Retry-After": "30"}
+    )
+    assert await tools.slack_list_channel_members("C123") == {
+        "success": False,
+        "error": "rate_limited: 30",
+    }
+
+
+async def test_post_channel_message_requires_active_channel_membership(
+    slack_api: SlackAPI,
+) -> None:
+    slack_api.respond(
+        {"ok": True, "channels": [{"id": "C456", "name": "other", "is_private": False}]}
+    )
+    result = await tools.slack_post_message("C123", "hello")
+    assert result == {"success": False, "error": "not_in_channel"}
+    assert [method for method, _ in slack_api.calls] == ["users.conversations"]
+
+
+@pytest.mark.parametrize("source_channel", ["C123", "C456", ""])
+async def test_post_channel_message_finds_membership_after_empty_page(
+    slack_api: SlackAPI, monkeypatch: pytest.MonkeyPatch, source_channel: str
+) -> None:
+    from openswe.slack.tools import channels
+
+    monkeypatch.setenv("DASHBOARD_BASE_URL", "https://openswe.example.com")
+    monkeypatch.setattr(
+        RunConfig, "from_runtime", lambda: RunConfig.parse({"thread_id": "agent-thread"})
+    )
+    monkeypatch.setattr(
+        channels, "run_slack_location", AsyncMock(return_value=(source_channel, "1.0"))
+    )
+    slack_api.respond({"ok": True, "channels": [], "response_metadata": {"next_cursor": "more"}})
+    slack_api.respond(
+        {"ok": True, "channels": [{"id": "C123", "name": "target", "is_private": False}]}
+    )
+    if source_channel:
+        slack_api.respond(
+            {"ok": True, "permalink": "https://example.slack.com/archives/source/p10"}
+        )
+    slack_api.respond({"ok": True, "ts": "1700000000.000123"})
+    result = await tools.slack_post_message("C123", "hello")
+    assert result["success"] is True
+    assert slack_api.calls[1][1]["cursor"] == "more"
+    assert slack_api.calls[-1][0] == "chat.postMessage"
+    blocks = slack_api.calls[-1][1]["blocks"]
+    for payload in (str(blocks), slack_api.calls[-1][1]["text"]):
+        assert "https://openswe.example.com/agents/agent-thread" in payload
+        assert ("https://example.slack.com/archives/source/p10" in payload) is bool(source_channel)
+
+
+async def test_post_channel_message_stops_on_repeated_membership_cursor(
+    slack_api: SlackAPI,
+) -> None:
+    for _ in range(2):
+        slack_api.respond(
+            {"ok": True, "channels": [], "response_metadata": {"next_cursor": "same"}}
+        )
+    result = await tools.slack_post_message("C123", "hello")
+    assert result == {"success": False, "error": "invalid_slack_response"}
+    assert len(slack_api.calls) == 2
+
+
+@pytest.mark.parametrize(
+    "error,status,expected",
+    [("ratelimited", 429, "rate_limited: 30"), ("not_in_channel", 200, "not_in_channel")],
+)
+async def test_post_channel_message_reports_slack_failure_without_retry(
+    slack_api: SlackAPI, monkeypatch: pytest.MonkeyPatch, error: str, status: int, expected: str
+) -> None:
+    from openswe.slack.tools import channels
+
+    monkeypatch.setenv("DASHBOARD_BASE_URL", "https://openswe.example.com")
+    monkeypatch.setattr(
+        RunConfig, "from_runtime", lambda: RunConfig.parse({"thread_id": "agent-thread"})
+    )
+    monkeypatch.setattr(channels, "run_slack_location", AsyncMock(return_value=("", "")))
+    slack_api.respond(
+        {"ok": True, "channels": [{"id": "C123", "name": "target", "is_private": False}]}
+    )
+    slack_api.respond({"ok": False, "error": error}, status=status, headers={"Retry-After": "30"})
+    result = await tools.slack_post_message("C123", "hello")
+    assert result == {"success": False, "error": expected}
+    assert len(slack_api.calls) == 2
+
+
+@pytest.mark.parametrize("thread_id", ["", "agent-thread"])
+async def test_post_channel_message_refuses_missing_origin_link(
+    slack_api: SlackAPI, monkeypatch: pytest.MonkeyPatch, thread_id: str
+) -> None:
+    from openswe.slack.tools import channels
+
+    monkeypatch.setattr(
+        RunConfig, "from_runtime", lambda: RunConfig.parse({"thread_id": thread_id})
+    )
+    monkeypatch.setattr(channels, "run_slack_location", AsyncMock(return_value=("", "")))
+    monkeypatch.setattr(channels, "origin_footer", AsyncMock(return_value=[]))
+    slack_api.respond(
+        {"ok": True, "channels": [{"id": "C123", "name": "target", "is_private": False}]}
+    )
+    assert await tools.slack_post_message("C123", "hello") == {
+        "success": False,
+        "error": "origin_link_unavailable" if thread_id else "origin_thread_required",
+    }
+    assert [method for method, _ in slack_api.calls] == ["users.conversations"]
+
+
+@pytest.fixture
+def automation_post(slack_api: SlackAPI, monkeypatch: pytest.MonkeyPatch) -> None:
+    from openswe.slack.tools import channels
+
+    monkeypatch.setenv("DASHBOARD_BASE_URL", "https://openswe.example.com")
+    monkeypatch.setattr(
+        RunConfig,
+        "from_runtime",
+        lambda: RunConfig.parse({"thread_id": "agent-thread", "schedule_id": "sched"}),
+    )
+    monkeypatch.setattr(channels, "run_slack_location", AsyncMock(return_value=("", "")))
+    slack_api.respond(
+        {"ok": True, "channels": [{"id": "C123", "name": "target", "is_private": False}]}
+    )
+
+
+async def test_automation_channel_post_refuses_a_wall_of_text(
+    slack_api: SlackAPI, automation_post: None
+) -> None:
+    result = await tools.slack_post_message("C123", "x" * 401)
+    assert result["success"] is False
+    assert "details" in result["error"]
+    assert [method for method, _ in slack_api.calls] == ["users.conversations"]
+
+
+async def test_channel_post_refuses_oversized_rendered_details_before_posting(
+    slack_api: SlackAPI, automation_post: None
+) -> None:
+    result = await tools.slack_post_message("C123", "Report", details="&" * 38_000)
+    assert result == {"success": False, "error": "msg_too_long"}
+    assert not any(method == "chat.postMessage" for method, _ in slack_api.calls)
+
+
+async def test_channel_post_threads_its_details_under_the_headline(
+    slack_api: SlackAPI, automation_post: None
+) -> None:
+    slack_api.respond({"ok": True, "ts": "1700000000.000123"})
+    slack_api.respond({"ok": True, "ts": "1700000000.000456"})
+    details = "- **Adopt** the cache API\n" * 100
+    result = await tools.slack_post_message("C123", "3 MDA changes matter", details=details)
+    assert result == {
+        "success": True,
+        "channel_id": "C123",
+        "message_ts": "1700000000.000123",
+        "details_ts": "1700000000.000456",
+    }
+    (_, headline), (_, reply) = slack_api.calls[-2:]
+    assert "thread_ts" not in headline
+    assert "cache API" not in headline["text"]
+    assert reply["thread_ts"] == "1700000000.000123"
+    assert "cache API" in reply["text"]
+    assert reply["unfurl_links"] is False
+
+
+def _search_run(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    shared: bool,
+    token: str,
+    message_ts: str = "",
+    started_by_message: bool = True,
+) -> None:
+    channel = {"id": "C123", "is_ext_shared": shared, "is_pending_ext_shared": False}
+    monkeypatch.setattr(
+        RunConfig,
+        "from_runtime",
+        lambda: RunConfig.parse(
+            {
+                "slack_thread": {
+                    "channel_id": "C123",
+                    "thread_ts": "1.0",
+                    "triggering_event_ts": message_ts,
+                    "channel_context": channel,
+                },
+                "source": "slack",
+                "slack_action_token": token,
+                "slack_search_message_ts": message_ts if started_by_message else None,
+            }
+        ),
+    )
+
+
+@pytest.mark.parametrize(("shared", "token"), [(True, "grant"), (False, "")])
+async def test_slack_search_refuses_shared_channels_and_runs_without_a_grant(
+    slack_api: SlackAPI, monkeypatch: pytest.MonkeyPatch, shared: bool, token: str
+) -> None:
+    _search_run(monkeypatch, shared=shared, token=token)
+    result = await tools.slack_search("launch plan")
+    assert result["success"] is False
+    assert slack_api.calls == []
+
+
+@pytest.mark.usefixtures("registry_db")
+async def test_slack_search_searches_public_channels_with_the_runs_grant(
+    slack_api: SlackAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _search_run(monkeypatch, shared=False, token="grant")
+    hit = {
+        "channel_id": "C9",
+        "message_ts": "2.0",
+        "author_user_id": "U1",
+        "content": "We ship Friday",
+        "permalink": "https://x.slack.com/archives/C9/p20",
+    }
+    slack_api.respond(
+        {"ok": True, "results": {"messages": [hit]}, "response_metadata": {"next_cursor": "n"}}
+    )
+    result = await tools.slack_search("launch plan", limit=50)
+    assert result["success"] is True
+    assert result["next_cursor"] == "n"
+    assert result["messages"] == [
+        {
+            "channel_name": "",
+            "author_name": "",
+            "is_author_bot": False,
+            **hit,
+        }
+    ]
+    method, payload = slack_api.calls[0]
+    assert method == "assistant.search.context"
+    assert payload["action_token"] == "grant"
+    assert payload["channel_types"] == ["public_channel"]
+    assert payload["include_bots"] is False
+    assert payload["limit"] == 20
+
+
+@pytest.mark.usefixtures("registry_db")
+async def test_slack_search_uses_the_grant_kept_for_the_runs_message(
+    slack_api: SlackAPI, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level("INFO", logger="openswe.slack.tools.search")
+    # The mention's `message` event started the run; its `app_mention` brought the grant.
+    monkeypatch.setenv("TOKEN_ENCRYPTION_KEY", Fernet.generate_key().decode())
+    await SlackSearchGrant.keep("C123", "1.5", "grant")
+    await SlackSearchGrant.keep("C123", "1.5", "duplicate-secret-token")
+    await SlackSearchGrant.keep("C123", "1.6", "another message's grant")
+    # A later run that only copied the thread's `slack_thread` gets no grant.
+    _search_run(monkeypatch, shared=False, token="", message_ts="1.5", started_by_message=False)
+    assert (await tools.slack_search("launch plan"))["success"] is False
+    assert slack_api.calls == []
+    _search_run(monkeypatch, shared=False, token="", message_ts="1.5")
+    slack_api.respond({"ok": True, "results": {"messages": []}})
+    assert (await tools.slack_search("launch plan"))["success"] is True
+    _, payload = slack_api.calls[0]
+    assert payload["action_token"] == "grant"
+    diagnostics = [r for r in caplog.records if r.name == "openswe.slack.tools.search"]
+    assert [
+        r.grant_store_outcome for r in diagnostics if r.message == "Slack search grant stored"
+    ] == ["inserted", "conflict", "inserted"]
+    assert [r.grant_source for r in diagnostics if r.message == "Slack search grant resolved"] == [
+        "none",
+        "store",
+    ]
+    assert any(r.message == "Slack search grant lookup" and r.grant_found for r in diagnostics)
+    for record in diagnostics:
+        assert "action_token" not in record.__dict__
+        assert "duplicate-secret-token" not in repr(record.__dict__)
+        assert "another message's grant" not in repr(record.__dict__)
+
+
+@pytest.mark.usefixtures("registry_db")
+async def test_slack_search_stops_once_the_grants_searches_are_spent(
+    slack_api: SlackAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _search_run(monkeypatch, shared=False, token="grant")
+    for _ in range(6):
+        assert (await tools.slack_search("launch plan"))["success"] is True
+    refused = await tools.slack_search("launch plan")
+    assert refused["success"] is False
+    assert len(slack_api.calls) == 6

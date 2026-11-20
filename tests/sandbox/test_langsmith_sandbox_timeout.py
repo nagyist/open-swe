@@ -1,0 +1,293 @@
+"""Client-side execution deadline for the LangSmith sandbox backend."""
+
+import asyncio
+import time
+from types import SimpleNamespace
+from typing import Any, cast
+from unittest.mock import AsyncMock
+
+import pytest
+from deepagents.backends.composite import CompositeBackend
+from deepagents.backends.protocol import ExecuteResponse
+from langsmith.sandbox import (
+    CommandTimeoutError,
+    SandboxConnectionError,
+    SandboxOperationError,
+    SandboxRetryableConnectionError,
+)
+from runtime_api.sandbox_setup import GitIdentity
+
+from openswe.sandboxes.providers.langsmith import TimeoutLangSmithSandbox
+
+
+class _FakeHandle:
+    def __init__(self, *, sleep: float = 0.0, result: Any = None, raises: Exception | None = None):
+        self._sleep = sleep
+        self._result = result
+        self._raises = raises
+        self.killed = False
+        self.streaming = False
+        self.killed_while_streaming = False
+
+    @property
+    async def result(self) -> Any:
+        self.streaming = True
+        try:
+            if self._sleep:
+                await asyncio.sleep(self._sleep)
+        finally:
+            self.streaming = False
+        if self._raises is not None:
+            raise self._raises
+        return self._result
+
+    async def kill(self) -> None:
+        self.killed = True
+        self.killed_while_streaming = self.streaming
+
+
+class _FakeSandbox:
+    def __init__(self, handle: _FakeHandle, *, run_raises: Exception | None = None):
+        self._handle = handle
+        self._run_raises = run_raises
+        self.run_calls: list[dict[str, Any]] = []
+
+    async def run(self, command: str, *, timeout: int, wait: bool) -> _FakeHandle:
+        self.run_calls.append({"command": command, "timeout": timeout, "wait": wait})
+        if self._run_raises is not None:
+            raise self._run_raises
+        return self._handle
+
+
+def _backend(
+    handle: _FakeHandle, *, run_raises: Exception | None = None
+) -> TimeoutLangSmithSandbox:
+    sb = TimeoutLangSmithSandbox.__new__(TimeoutLangSmithSandbox)
+    object.__setattr__(sb, "_sandbox", SimpleNamespace(name="sandbox-test"))
+    object.__setattr__(sb, "_async_sandbox", _FakeSandbox(handle, run_raises=run_raises))
+    object.__setattr__(sb, "_async_client", None)
+    sb._default_timeout = 30 * 60
+    return sb
+
+
+@pytest.fixture(autouse=True)
+def _no_grace(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SANDBOX_EXECUTE_CLIENT_GRACE_SECONDS", "0")
+
+
+@pytest.mark.parametrize("reset", [False, True])
+async def test_aexecute_kills_on_client_timeout(reset: bool) -> None:
+    handle = _FakeHandle(sleep=5.0)
+    sb = _backend(handle)
+    if reset:
+        sb.reset_git_identity(GitIdentity())
+    start = time.monotonic()
+    resp = await sb.aexecute("sleep 999", timeout=1)
+    assert time.monotonic() - start < 3.0
+    assert resp.exit_code == 124
+    assert "killed" in resp.output
+    assert handle.killed_while_streaming
+    sandbox = cast(_FakeSandbox, sb._async_sandbox)
+    assert sandbox.run_calls[0]["wait"] is False
+    assert sb._git_identity_pending is None
+    handle._sleep = 0
+    handle._result = SimpleNamespace(stdout="next command", stderr="", exit_code=0)
+    assert (await sb.aexecute("echo next command", timeout=1)).output == "next command"
+    assert sandbox.run_calls[-1]["command"] == "echo next command"
+
+
+async def test_cancelling_aexecute_kills_the_running_command() -> None:
+    """A stopped run must not leave its command running on the sandbox."""
+    handle = _FakeHandle(sleep=60.0)
+    call = asyncio.ensure_future(_backend(handle).aexecute("sleep 999", timeout=120))
+    await asyncio.sleep(0.05)
+    call.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await call
+    assert handle.killed_while_streaming
+
+
+async def test_aexecute_success_combines_streams() -> None:
+    handle = _FakeHandle(result=SimpleNamespace(stdout="out", stderr="err", exit_code=0))
+    sb = _backend(handle)
+    resp = await sb.aexecute("echo hi", timeout=5)
+    assert resp.exit_code == 0
+    assert resp.output == "out\nerr"
+    assert not handle.killed
+
+
+@pytest.mark.parametrize("reset", [False, True])
+async def test_aexecute_server_timeout_not_killed(reset: bool) -> None:
+    handle = _FakeHandle(raises=CommandTimeoutError("server enforced"))
+    sb = _backend(handle)
+    if reset:
+        sb.reset_git_identity(GitIdentity())
+    resp = await sb.aexecute("make hang", timeout=2)
+    assert resp.exit_code == 124
+    assert "on the sandbox" in resp.output
+    assert not handle.killed
+    assert sb._git_identity_pending is None
+
+
+def _patch_base_execute(monkeypatch: pytest.MonkeyPatch, sink: dict[str, Any]) -> None:
+    async def fake_base_execute(self: Any, command: str, *, timeout: int | None = None) -> Any:
+        sink["command"] = command
+        sink["timeout"] = timeout
+        return SimpleNamespace(output="via-http", exit_code=0, truncated=False)
+
+    monkeypatch.setattr(
+        "openswe.sandboxes.providers.langsmith.LangSmithSandbox.aexecute", fake_base_execute
+    )
+
+
+async def test_aexecute_ws_connect_failure_falls_back_to_base(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # run(wait=False) connects eagerly, so a connect failure raises from run().
+    sb = _backend(_FakeHandle(), run_raises=SandboxConnectionError("no ws"))
+    called: dict[str, Any] = {}
+    _patch_base_execute(monkeypatch, called)
+    resp = await sb.aexecute("git status", timeout=5)
+    assert called == {"command": "git status", "timeout": 5}
+    assert resp.output == "via-http"
+
+
+async def test_aexecute_ws_connect_timeout_falls_back_to_base(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sb = _backend(_FakeHandle(), run_raises=TimeoutError("connect timed out"))
+    called: dict[str, Any] = {}
+    _patch_base_execute(monkeypatch, called)
+    resp = await sb.aexecute("git status", timeout=5)
+    assert called["command"] == "git status"
+    assert resp.output == "via-http"
+
+
+async def test_aexecute_midstream_ws_drop_falls_back_to_base(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Connect succeeds (run returns a handle) but the stream drops while draining.
+    sb = _backend(_FakeHandle(raises=SandboxConnectionError("dropped")))
+    called: dict[str, Any] = {}
+    _patch_base_execute(monkeypatch, called)
+    resp = await sb.aexecute("git status", timeout=5)
+    assert called["command"] == "git status"
+    assert resp.output == "via-http"
+
+
+@pytest.mark.parametrize(
+    ("error_type", "operation"),
+    [
+        ("CommandNotFound", "reconnect"),
+        ("CommandNotFound", "command"),
+        ("OtherFailure", "reconnect"),
+    ],
+)
+async def test_aexecute_operation_error_does_not_replay(
+    monkeypatch: pytest.MonkeyPatch, error_type: str, operation: str
+) -> None:
+    error = SandboxOperationError(
+        "Command not found: command-id", error_type=error_type, operation=operation
+    )
+    sb = _backend(_FakeHandle(raises=error))
+    fallback = AsyncMock()
+    monkeypatch.setattr(sb, "_afallback_execute", fallback)
+
+    if error_type == "CommandNotFound" and operation == "reconnect":
+        with pytest.raises(RuntimeError, match="outcome is unknown") as caught:
+            await sb.aexecute("git commit", timeout=5)
+        assert caught.value.__cause__ is error
+    else:
+        with pytest.raises(SandboxOperationError) as caught:
+            await sb.aexecute("git commit", timeout=5)
+        assert caught.value is error
+
+    assert len(cast(_FakeSandbox, sb._async_sandbox).run_calls) == 1
+    fallback.assert_not_awaited()
+
+
+def test_execute_is_async_only() -> None:
+    with pytest.raises(NotImplementedError):
+        _backend(_FakeHandle()).execute("echo hi", timeout=5)
+
+
+async def test_composite_backend_deletes_through_async_langsmith_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sb = _backend(_FakeHandle())
+    commands: list[str] = []
+
+    async def execute(command: str, *, timeout: int | None = None) -> ExecuteResponse:
+        commands.append(command)
+        return ExecuteResponse(output="", exit_code=0)
+
+    monkeypatch.setattr(sb, "aexecute", execute)
+    result = await CompositeBackend(default=sb, routes={}).adelete("/workspace/repo/obsolete.txt")
+
+    assert result.path == "/workspace/repo/obsolete.txt"
+    assert result.error is None
+    assert commands == [
+        "test -e /workspace/repo/obsolete.txt || test -L /workspace/repo/obsolete.txt",
+        "rm -rf /workspace/repo/obsolete.txt",
+    ]
+
+
+async def test_aexecute_retries_a_transient_rejection(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A 503 on the WebSocket upgrade is a blip, not a dead sandbox.
+
+    The command never started, so re-issuing it cannot double-run anything.
+    """
+    handle = _FakeHandle(result=SimpleNamespace(stdout="out", stderr="", exit_code=0))
+    sb = _backend(handle)
+    sandbox = cast(_FakeSandbox, sb._async_sandbox)
+    attempts = 0
+
+    async def flaky_run(command: str, *, timeout: int, wait: bool) -> _FakeHandle:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise SandboxRetryableConnectionError("WebSocket upgrade temporarily rejected (503)")
+        return handle
+
+    async def failing_base_execute(self: Any, command: str, *, timeout: int | None = None) -> Any:
+        raise SandboxRetryableConnectionError("WebSocket upgrade temporarily rejected (503)")
+
+    monkeypatch.setattr(
+        "openswe.sandboxes.providers.langsmith.LangSmithSandbox.aexecute", failing_base_execute
+    )
+    monkeypatch.setattr(sandbox, "run", flaky_run)
+    monkeypatch.setattr("openswe.sandboxes.retry.asyncio.sleep", AsyncMock(), raising=True)
+
+    resp = await sb.aexecute("git status", timeout=5)
+
+    assert resp.exit_code == 0
+    assert attempts == 2
+
+
+class _StatSandbox(_FakeSandbox):
+    def __init__(self, handle: _FakeHandle, *, size_bytes: int):
+        super().__init__(handle)
+        self._size_bytes = size_bytes
+
+    async def stat(self, path: str) -> SimpleNamespace:  # noqa: ARG002
+        return SimpleNamespace(size_bytes=self._size_bytes)
+
+
+async def test_aread_pages_a_large_file_inside_the_sandbox() -> None:
+    """The file API returns whole files, so a large one must not be pulled into the worker."""
+    handle = _FakeHandle(result=SimpleNamespace(stdout="", stderr="", exit_code=0))
+    sb = _backend(handle)
+    sandbox = _StatSandbox(handle, size_bytes=64 * 1024 * 1024)
+    object.__setattr__(sb, "_async_sandbox", sandbox)
+    downloads: list[str] = []
+
+    def read(path: str, **_: object) -> bytes:
+        downloads.append(path)
+        return b""
+
+    object.__setattr__(sb, "_sandbox", SimpleNamespace(name="sandbox-test", read=read))
+
+    await sb.aread("/workspace/build.log", limit=100)
+
+    assert downloads == []
+    assert sandbox.run_calls

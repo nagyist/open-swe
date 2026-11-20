@@ -1,0 +1,71 @@
+"""One Slack message or interaction addressed to Open SWE, as the routes hand it to processing."""
+
+from pydantic import BaseModel, Field
+
+from openswe.input_messages import SystemIdentity
+from openswe.slack.failures import SlackRequestTarget
+from openswe.slack.payloads import SlackChannelContext
+from openswe.trace_metadata import RunOrigin
+from openswe.utils.json_types import JsonObject
+
+
+class SlackRequest(BaseModel):
+    channel_id: str
+    origin: RunOrigin = RunOrigin.SLACK
+    thread_ts: str
+    event_ts: str = ""
+    original_message_ts: str = ""
+    source_message_ts: str = ""
+    retry_message_ts: str = ""
+    retry_user_id: str = ""
+    event_id: str = ""
+    user_id: str = ""
+    user_name: str = ""
+    text: str = ""
+    attachments: list[JsonObject] = Field(default_factory=list)
+    # Slack's search grant, sent only with a message that @mentions Open SWE or is a DM.
+    action_token: str = ""
+    bot_user_id: str = ""
+    triggering_bot_id: str = ""
+    triggering_bot_app_id: str = ""
+    # Open SWE wrote the request; ``user_id`` is only who the run acts for.
+    trigger_system: SystemIdentity | None = None
+    thread_id: str | None = None
+    # A branch's new thread starts with what this thread holds (MDA's Slack channel
+    # seeds it), so the Slack messages this thread holds stay out of the prompt.
+    held_thread_id: str = ""
+    channel_context: SlackChannelContext | None = None
+    team_id: str = ""
+    reply_thread_ts: str = ""
+    # Another Slack thread whose whole transcript becomes this run's context.
+    context_thread_ts: str = ""
+    context_channel_id: str = ""
+    breakout_root_suffix: str | None = None
+    prior_message_text: str = ""
+    # A `/btw` question, answered on this request's thread rather than as a turn.
+    by_the_way: str | None = None
+    # A bare `/breakout` in a conversation MDA's channel holds: the run moves the thread,
+    # into ``move_channel_id`` when the command names another Slack channel.
+    move_thread: bool = False
+    move_channel_id: str = ""
+    # Guidance for this turn alone, from whatever stood in for a typed message.
+    turn_context: str = ""
+    treat_all_messages_as_mentions: bool = False
+    listening_channel: bool = False
+    message_update: bool = False
+    concierge_mode: bool = False
+    web_only: bool = False
+    explicit_request: bool = False
+    explicit_mention: bool = False
+
+    @property
+    def target(self) -> SlackRequestTarget:
+        return SlackRequestTarget(
+            channel_id=self.channel_id,
+            thread_ts=self.thread_ts,
+            event_id=self.event_id,
+            agent_thread_id=self.thread_id,
+            user_id=self.retry_user_id or self.user_id,
+            message_ts=self.retry_message_ts,
+            reply_thread_ts=self.reply_thread_ts,
+        )

@@ -1,0 +1,2 @@
+The person {% if action == "decline" %}declined{% elif action == "snooze" %}snoozed{% elif action == "dismiss" %}dismissed{% else %}accepted{% endif %} Robin's review request for {{ pr_url }}{% if action == "snooze" %} for {{ choice }}{% elif action == "decline" %} ({{ choice }}){% endif %}.
+Robin told them: {{ outcome }}

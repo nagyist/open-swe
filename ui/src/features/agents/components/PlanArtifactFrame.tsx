@@ -1,0 +1,532 @@
+import { Button } from "@langchain/macaw-components/Button"
+import { Dialog, DialogContent } from "@langchain/macaw-components/Dialog"
+import { useEffect, useEffectEvent, useMemo, useRef, useState } from "react"
+
+import type { PlanComment, PlanTextAnchor } from "@/lib/plan"
+import { SandboxedHtmlFrame } from "@/features/agents/components/SandboxedHtmlFrame"
+import {
+  ARTIFACT_ALLOW,
+  ARTIFACT_CSP,
+  ARTIFACT_SANDBOX,
+  withArtifactShell,
+} from "@/features/agents/lib/artifactShell"
+import { useResolvedTheme } from "@/lib/theme"
+import { cn } from "@/lib/utils"
+
+function frameScript(channel: string): string {
+  return `(() => {
+    const channel = ${JSON.stringify(channel)};
+    const markers = new Map();
+    const ranges = new Map();
+    const ignored = new Set(["SCRIPT", "STYLE", "NOSCRIPT"]);
+    let port = null;
+    let scrollLocked = false;
+    let selecting = false;
+    document.addEventListener("pointerdown", event => {
+      selecting = event.button === 0 && !scrollLocked &&
+        !(event.target instanceof Element && event.target.closest("[data-plan-annotation]"));
+    }, { passive: true });
+    document.addEventListener("pointercancel", () => { selecting = false; });
+    for (const type of ["wheel", "touchmove"]) {
+      document.addEventListener(type, event => {
+        if (scrollLocked) event.preventDefault();
+      }, { passive: false, capture: true });
+    }
+    document.addEventListener("keydown", event => {
+      if (scrollLocked && event.key === "Escape") {
+        event.preventDefault();
+        post({ type: "dismiss-comments" });
+      }
+      if (scrollLocked && ["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "PageUp", "PageDown", "Home", "End", " "].includes(event.key)) event.preventDefault();
+    }, true);
+    document.documentElement.dataset.annotationReady = "true";
+
+    function post(message) {
+      port?.postMessage(message);
+    }
+
+    function textNodes() {
+      const nodes = [];
+      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
+        acceptNode(node) {
+          const parent = node.parentElement;
+          return parent && !ignored.has(parent.tagName) && !parent.closest("[data-plan-annotation]")
+            ? NodeFilter.FILTER_ACCEPT
+            : NodeFilter.FILTER_REJECT;
+        }
+      });
+      while (walker.nextNode()) nodes.push(walker.currentNode);
+      return nodes;
+    }
+
+    function documentText(nodes) {
+      return nodes.map(node => node.data).join("");
+    }
+
+    function offsetFor(nodes, target, offset) {
+      let position = 0;
+      for (const node of nodes) {
+        if (node === target) return position + offset;
+        position += node.data.length;
+      }
+      return -1;
+    }
+
+    function pointAt(nodes, offset) {
+      let position = 0;
+      for (const node of nodes) {
+        const next = position + node.data.length;
+        if (offset <= next) return [node, Math.max(0, offset - position)];
+        position = next;
+      }
+      const last = nodes[nodes.length - 1];
+      return last ? [last, last.data.length] : null;
+    }
+
+    function rangeAt(anchor) {
+      const nodes = textNodes();
+      const text = documentText(nodes);
+      let start = anchor.start;
+      if (text.slice(start, anchor.end) !== anchor.exact) {
+        let best = null;
+        let from = 0;
+        while (from <= text.length) {
+          const match = text.indexOf(anchor.exact, from);
+          if (match < 0) break;
+          const prefix = text.slice(Math.max(0, match - anchor.prefix.length), match);
+          const suffix = text.slice(match + anchor.exact.length, match + anchor.exact.length + anchor.suffix.length);
+          const score = (prefix === anchor.prefix ? 1000000 : 0) +
+            (suffix === anchor.suffix ? 1000000 : 0) - Math.abs(match - anchor.start);
+          if (!best || score > best.score) best = { start: match, score };
+          from = match + Math.max(1, anchor.exact.length);
+        }
+        if (!best) return null;
+        start = best.start;
+      }
+      const startPoint = pointAt(nodes, start);
+      const endPoint = pointAt(nodes, start + anchor.exact.length);
+      if (!startPoint || !endPoint) return null;
+      const range = document.createRange();
+      range.setStart(startPoint[0], startPoint[1]);
+      range.setEnd(endPoint[0], endPoint[1]);
+      return range;
+    }
+
+    function clearAnnotations() {
+      CSS.highlights?.delete("plan-comments");
+      for (const marker of markers.values()) marker.remove();
+      markers.clear();
+      ranges.clear();
+    }
+
+    function placeMarkers() {
+      for (const [id, marker] of markers) {
+        const range = ranges.get(id);
+        const rects = range ? Array.from(range.getClientRects()) : [];
+        const rect = rects[rects.length - 1];
+        if (!rect) {
+          marker.hidden = true;
+          continue;
+        }
+        marker.hidden = false;
+        marker.style.left = Math.min(window.innerWidth - 30, rect.right + 6) + "px";
+        marker.style.top = Math.max(4, rect.top - 2) + "px";
+      }
+    }
+
+    function setAnnotations(comments) {
+      clearAnnotations();
+      comments.forEach(comment => {
+        const range = rangeAt(comment.anchor);
+        if (!range) return;
+        const marker = document.createElement("button");
+        marker.type = "button";
+        marker.dataset.planAnnotation = "";
+        marker.className = "plan-annotation-marker";
+        marker.textContent = String(comment.number);
+        marker.title = "Open comment " + comment.number;
+        marker.addEventListener("click", () => post({ type: "comment-selected", id: comment.id, selectionBounds: range.getBoundingClientRect().toJSON() }));
+        document.body.append(marker);
+        markers.set(comment.id, marker);
+        ranges.set(comment.id, range);
+      });
+      if (CSS.highlights && window.Highlight && ranges.size) {
+        CSS.highlights.set("plan-comments", new Highlight(...ranges.values()));
+      }
+      placeMarkers();
+    }
+
+    function selectedAnchor() {
+      const selection = getSelection();
+      if (!selection || selection.rangeCount === 0 || selection.isCollapsed) return null;
+      const range = selection.getRangeAt(0);
+      if (!document.body.contains(range.startContainer) || !document.body.contains(range.endContainer)) return null;
+      const exact = range.toString();
+      if (!exact.trim() || exact.length > 1000) return null;
+      const nodes = textNodes();
+      const text = documentText(nodes);
+      const before = document.createRange();
+      before.selectNodeContents(document.body);
+      before.setEnd(range.startContainer, range.startOffset);
+      const estimate = before.toString().length;
+      let start = text.indexOf(exact);
+      for (let match = start; match >= 0; match = text.indexOf(exact, match + 1)) {
+        if (Math.abs(match - estimate) < Math.abs(start - estimate)) start = match;
+      }
+      if (start < 0) return null;
+      const end = start + exact.length;
+      const nearbyLines = value => value
+        .split("\\n")
+        .map(line => line.trim())
+        .filter(Boolean);
+      const context_before = nearbyLines(text.slice(0, start)).slice(-3).join("\\n").slice(-1000);
+      const context_after = nearbyLines(text.slice(end)).slice(0, 3).join("\\n").slice(0, 1000);
+      return {
+        exact,
+        prefix: text.slice(Math.max(0, start - 64), start),
+        suffix: text.slice(end, end + 64),
+        context_before,
+        context_after,
+        start,
+        end
+      };
+    }
+
+    for (const type of ["click", "auxclick"]) {
+      document.addEventListener(type, event => {
+        if (event.button !== (type === "click" ? 0 : 1)) return;
+        const link = event.target instanceof Element ? event.target.closest("a[href]") : null;
+        const href = link?.getAttribute("href")?.trim();
+        if (!href || href.startsWith("#") || link.hasAttribute("download")) return;
+        let url;
+        try { url = new URL(href, document.baseURI); } catch { return; }
+        if (url.protocol !== "https:" && url.protocol !== "http:") return;
+        event.preventDefault();
+        if (event.isTrusted) post({ type: "open-external", url: url.href });
+      }, true);
+    }
+
+    document.addEventListener("mouseup", event => {
+      if (event.button !== 0) return;
+      const startedHere = selecting;
+      selecting = false;
+      if (!startedHere) return;
+      setTimeout(() => {
+        const anchor = selectedAnchor();
+        const selection = window.getSelection();
+        const selectionBounds = anchor && selection?.rangeCount
+          ? selection.getRangeAt(0).getBoundingClientRect().toJSON()
+          : null;
+        post({ type: "text-selected", anchor, selectionBounds });
+      });
+    });
+
+    function receive(message) {
+      if (message.type === "set-scroll-locked" && typeof message.locked === "boolean") {
+        scrollLocked = message.locked;
+      }
+      if (message.type === "set-comments" && Array.isArray(message.comments)) {
+        setAnnotations(message.comments);
+      }
+      if (message.type === "focus-comment" && typeof message.id === "string") {
+        const range = ranges.get(message.id);
+        const marker = markers.get(message.id);
+        if (range && !scrollLocked) range.startContainer.parentElement?.scrollIntoView({ behavior: "smooth", block: "center" });
+        if (marker) {
+          marker.classList.remove("plan-annotation-marker-active");
+          requestAnimationFrame(() => marker.classList.add("plan-annotation-marker-active"));
+        }
+      }
+    }
+
+    addEventListener("message", event => {
+      if (event.source !== parent || !event.data || event.data.channel !== channel || !event.ports[0]) return;
+      port = event.ports[0];
+      port.onmessage = portEvent => receive(portEvent.data || {});
+      port.start();
+      post({ type: "ready" });
+    }, { once: true });
+
+    addEventListener("scroll", placeMarkers, { passive: true });
+    addEventListener("resize", placeMarkers);
+    new ResizeObserver(placeMarkers).observe(document.body);
+  })();`
+}
+
+function withViewerPolicy(
+  html: string,
+  theme: "light" | "dark",
+  channel: string
+): string {
+  const nonce = channel
+  const policy = ARTIFACT_CSP
+  const head = `<meta http-equiv="Content-Security-Policy" content="${policy}"><style>::highlight(plan-comments){background:#facc15;color:inherit}.plan-annotation-marker{position:fixed;z-index:2147483647;width:24px;height:24px;padding:0;border:2px solid white;border-radius:999px;background:#2563eb;color:white;font:700 12px/20px system-ui;box-shadow:0 2px 8px #0005;cursor:pointer}.plan-annotation-marker-active{animation:plan-comment-pulse 1.2s ease-out}@keyframes plan-comment-pulse{0%{box-shadow:0 0 0 0 #2563ebaa}100%{box-shadow:0 0 0 12px transparent}}</style>`
+  const script = `<script nonce="${nonce}">${frameScript(channel)}</script>`
+  const themed = withArtifactShell(html, theme).replace(
+    /<meta\s+[^>]*http-equiv\s*=\s*["']?Content-Security-Policy["']?[^>]*>/gi,
+    ""
+  )
+  const withHead = /<head(?=\s|>)/i.test(themed)
+    ? themed.replace(/<head([^>]*)>/i, `<head$1>${head}`)
+    : `<!doctype html><html data-theme="${theme}" data-viewer-theme="${theme}"><head>${head}</head><body>${themed}</body></html>`
+  return /<\/body\s*>/i.test(withHead)
+    ? withHead.replace(/<\/body\s*>/i, `${script}</body>`)
+    : `${withHead}${script}`
+}
+
+function isAnchor(value: unknown): value is PlanTextAnchor {
+  if (!value || typeof value !== "object") return false
+  const anchor = value as Record<string, unknown>
+  return (
+    typeof anchor.exact === "string" &&
+    anchor.exact.length > 0 &&
+    anchor.exact.length <= 1000 &&
+    typeof anchor.prefix === "string" &&
+    anchor.prefix.length <= 64 &&
+    typeof anchor.suffix === "string" &&
+    anchor.suffix.length <= 64 &&
+    (anchor.context_before === undefined ||
+      (typeof anchor.context_before === "string" &&
+        anchor.context_before.length <= 1000)) &&
+    (anchor.context_after === undefined ||
+      (typeof anchor.context_after === "string" &&
+        anchor.context_after.length <= 1000)) &&
+    typeof anchor.start === "number" &&
+    typeof anchor.end === "number" &&
+    anchor.start >= 0 &&
+    anchor.end - anchor.start === anchor.exact.length
+  )
+}
+
+export interface ArtifactSelectionBounds {
+  left: number
+  top: number
+  right: number
+  bottom: number
+}
+
+export function PlanArtifactFrame({
+  html,
+  comments = [],
+  onTextSelected,
+  scrollLocked = false,
+  onDismissComments,
+  onCommentSelected,
+  focusCommentId,
+  focusCommentKey = 0,
+  title = "Artifact",
+  className,
+}: {
+  html: string
+  comments?: Array<PlanComment>
+  onTextSelected?: (
+    anchor: PlanTextAnchor | null,
+    selectionBounds: ArtifactSelectionBounds | null
+  ) => void
+  scrollLocked?: boolean
+  onDismissComments?: () => void
+  onCommentSelected?: (
+    id: string,
+    selectionBounds: ArtifactSelectionBounds | null
+  ) => void
+  focusCommentId?: string | null
+  focusCommentKey?: number
+  title?: string
+  className?: string
+}) {
+  const theme = useResolvedTheme()
+  const [externalUrl, setExternalUrl] = useState<string | null>(null)
+  const frameRef = useRef<HTMLIFrameElement>(null)
+  const portRef = useRef<MessagePort | null>(null)
+  const channel = useMemo(() => globalThis.crypto.randomUUID(), [])
+  const srcDoc = useMemo(
+    () => withViewerPolicy(html, theme, channel),
+    [channel, html, theme]
+  )
+  const anchoredComments = useMemo(
+    () =>
+      comments
+        .map((comment, index) => ({ ...comment, number: index + 1 }))
+        .filter(
+          (
+            comment
+          ): comment is PlanComment & {
+            anchor: PlanTextAnchor
+            number: number
+          } => isAnchor(comment.anchor)
+        )
+        .map(({ id, anchor, number }) => ({ id, anchor, number })),
+    [comments]
+  )
+  const commentsRef = useRef(anchoredComments)
+  useEffect(() => {
+    commentsRef.current = anchoredComments
+  }, [anchoredComments])
+
+  const receive = useEffectEvent((event: MessageEvent) => {
+    const raw: unknown = event.data?.selectionBounds
+    const selectionBounds = (() => {
+      const isRecord = (input: unknown): input is Record<string, unknown> =>
+        typeof input === "object" && input !== null
+
+      const isBounds = (input: unknown): input is ArtifactSelectionBounds => {
+        if (!isRecord(input)) return false
+        return (
+          Number.isFinite(input.left) &&
+          Number.isFinite(input.top) &&
+          Number.isFinite(input.right) &&
+          Number.isFinite(input.bottom) &&
+          Number(input.right) >= Number(input.left) &&
+          Number(input.bottom) >= Number(input.top)
+        )
+      }
+
+      if (!isBounds(raw)) return null
+
+      const frameWidth = frameRef.current?.clientWidth ?? 0
+      const frameHeight = frameRef.current?.clientHeight ?? 0
+      return {
+        left: Math.max(0, Math.min(raw.left, frameWidth)),
+        top: Math.max(0, Math.min(raw.top, frameHeight)),
+        right: Math.max(0, Math.min(raw.right, frameWidth)),
+        bottom: Math.max(0, Math.min(raw.bottom, frameHeight)),
+      }
+    })()
+
+    if (
+      event.data?.type === "open-external" &&
+      typeof event.data.url === "string" &&
+      event.data.url.length <= 8192
+    ) {
+      try {
+        const url = new URL(event.data.url)
+        if (
+          (url.protocol === "https:" || url.protocol === "http:") &&
+          !url.username &&
+          !url.password
+        )
+          setExternalUrl((pending) => pending ?? url.href)
+      } catch {
+        return
+      }
+    }
+    if (event.data?.type === "dismiss-comments") {
+      onDismissComments?.()
+    }
+
+    if (event.data?.type === "ready") {
+      portRef.current?.postMessage({
+        type: "set-scroll-locked",
+        locked: scrollLocked,
+      })
+      portRef.current?.postMessage({
+        type: "set-comments",
+        comments: commentsRef.current,
+      })
+    }
+
+    if (
+      event.data?.type === "text-selected" &&
+      (event.data.anchor === null || isAnchor(event.data.anchor))
+    ) {
+      onTextSelected?.(event.data.anchor, selectionBounds)
+    }
+
+    if (
+      event.data?.type === "comment-selected" &&
+      typeof event.data.id === "string"
+    ) {
+      onCommentSelected?.(event.data.id, selectionBounds)
+    }
+  })
+
+  const connect = () => {
+    portRef.current?.close()
+    const messageChannel = new MessageChannel()
+    portRef.current = messageChannel.port1
+    messageChannel.port1.onmessage = receive
+    messageChannel.port1.start()
+    frameRef.current?.contentWindow?.postMessage(
+      { type: "connect-annotations", channel },
+      "*",
+      [messageChannel.port2]
+    )
+  }
+
+  useEffect(
+    () => () => {
+      portRef.current?.close()
+      portRef.current = null
+    },
+    []
+  )
+
+  useEffect(() => {
+    portRef.current?.postMessage({
+      type: "set-comments",
+      comments: anchoredComments,
+    })
+  }, [anchoredComments])
+
+  useEffect(() => {
+    portRef.current?.postMessage({
+      type: "set-scroll-locked",
+      locked: scrollLocked,
+    })
+  }, [scrollLocked])
+
+  useEffect(() => {
+    if (!focusCommentId) return
+    portRef.current?.postMessage({ type: "focus-comment", id: focusCommentId })
+  }, [focusCommentId, focusCommentKey])
+
+  return (
+    <>
+      <SandboxedHtmlFrame
+        ref={frameRef}
+        testId="plan-artifact-frame"
+        title={title}
+        html={srcDoc}
+        sandbox={ARTIFACT_SANDBOX}
+        allow={ARTIFACT_ALLOW}
+        onLoad={connect}
+        className={cn("bg-surface-level-1", className)}
+      />
+      <Dialog
+        open={externalUrl !== null}
+        onOpenChange={(open) => {
+          if (!open) setExternalUrl(null)
+        }}
+      >
+        <DialogContent
+          title="Open external link?"
+          description="This destination comes from the report. Check the full address before opening it."
+          showClose={false}
+          className="w-[min(28rem,calc(100vw-2rem))]"
+        >
+          <p className="text-sm break-all text-secondary">{externalUrl}</p>
+          <div className="flex justify-end gap-space-2">
+            <Button
+              size="xs"
+              color="secondary"
+              variant="outlined"
+              onClick={() => setExternalUrl(null)}
+            >
+              Cancel
+            </Button>
+            <Button
+              size="xs"
+              onClick={() => {
+                if (externalUrl)
+                  window.open(externalUrl, "_blank", "noopener,noreferrer")
+                setExternalUrl(null)
+              }}
+            >
+              Open link
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+    </>
+  )
+}

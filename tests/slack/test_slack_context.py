@@ -1,0 +1,1995 @@
+import asyncio
+from collections.abc import Mapping
+from datetime import UTC, datetime
+from types import SimpleNamespace
+from typing import Any, cast
+from unittest.mock import AsyncMock
+from uuid import NAMESPACE_URL, uuid5
+from xml.etree import ElementTree
+
+import pytest
+from fastapi import HTTPException
+from langchain_core.messages import convert_to_messages, messages_from_dict, messages_to_dict
+from pydantic import JsonValue
+from runtime_api.provenance import PROVENANCE_KEY, Provenance
+from runtime_api.slack import SlackMessageOrigin
+
+from openswe.github.token_scope import GITHUB_TOKEN_REPOSITORIES_KEY
+from openswe.routing.store import INTEGRATIONS
+from openswe.run_config import Repo
+from openswe.slack import client as slack_utils
+from openswe.slack import webhook as slack_webhooks
+from openswe.slack.allowed_bots import AllowedSlackBot
+from openswe.slack.channels import SlackChannel
+from openswe.slack.client import (
+    format_slack_messages_for_prompt,
+)
+from openswe.slack.payloads import SlackChannelContext, SlackChannelPayload
+from openswe.slack.request import SlackRequest
+from openswe.source_context import SourceContext
+from openswe.threads.index import IndexedThread, ThreadStatus
+from openswe.users import User
+from openswe.users.models import UserIdentity
+from openswe.utils import thread_reads
+from openswe.utils.run_usage import RunUsageSummary
+from openswe.utils.thread_participants import participant_ids
+from openswe.webhooks import common as webhook_common
+
+pytestmark = pytest.mark.usefixtures("registry_db")
+
+
+async def _fake_trace_url(thread_id: str, **kwargs: object) -> str:
+    return "https://smith/x"
+
+
+class _FakeNotFoundError(Exception):
+    status_code = 404
+
+
+class _FakeThreadsClient:
+    def __init__(self, thread: dict | None = None, raise_not_found: bool = False) -> None:
+        self.thread = thread
+        self.raise_not_found = raise_not_found
+        self.requested_thread_id: str | None = None
+
+    async def get(self, thread_id: str) -> dict:
+        self.requested_thread_id = thread_id
+        if self.raise_not_found:
+            raise _FakeNotFoundError("not found")
+        if self.thread is None:
+            raise AssertionError("thread must be provided when raise_not_found is False")
+        return self.thread
+
+    async def update(self, *, thread_id: str, metadata: dict) -> None:
+        cast(dict, self.thread)["metadata"].update(metadata)
+
+    async def indexed_update(self, thread_id: str, metadata: dict) -> IndexedThread | None:
+        """``THREADS.update``, on this fake's thread: ``None`` when it has none."""
+        if await self.indexed_get(thread_id) is None:
+            return None
+        await self.update(thread_id=thread_id, metadata=metadata)
+        return await self.indexed_get(thread_id)
+
+    async def indexed_get(self, thread_id: str) -> IndexedThread | None:
+        try:
+            raw = await self.get(thread_id)
+        except _FakeNotFoundError:
+            return None
+        now = datetime.now(UTC)
+        return IndexedThread(
+            thread_id=thread_id,
+            runtime="mda",
+            metadata=raw.get("metadata") or {},
+            status="idle",
+            created_at=now,
+            updated_at=now,
+        )
+
+
+class _FakeClient:
+    def __init__(self, threads_client: _FakeThreadsClient) -> None:
+        self.threads = threads_client
+
+
+def test_channel_operations_fail_closed_without_external_sharing_status() -> None:
+    context = SlackChannelPayload.of(None).to_context("C123")
+
+    assert context.is_ext_shared is None
+    assert not context.allows_operations
+    assert SlackChannelContext(is_ext_shared=False, is_pending_ext_shared=False).allows_operations
+    assert not SlackChannelContext(
+        is_ext_shared=False, is_pending_ext_shared=True
+    ).allows_operations
+    assert SlackChannelContext(is_im=True).allows_operations
+
+
+def test_source_context_does_not_reuse_permalink_for_different_slack_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_get_slack_permalink(_channel_id: str, _thread_ts: str) -> str | None:
+        return None
+
+    monkeypatch.setattr(webhook_common, "get_slack_permalink", fake_get_slack_permalink)
+
+    enriched = asyncio.run(
+        webhook_common._source_context_with_slack_permalink(
+            SourceContext.parse(
+                {"slack_thread": {"channel_id": "C999", "thread_ts": "1700000000.000999"}}
+            ),
+            {
+                "source_context": {
+                    "slack_thread": {
+                        "channel_id": "C123",
+                        "thread_ts": "1700000000.000100",
+                        "permalink": "https://slack.example/existing",
+                    }
+                }
+            },
+        )
+    )
+
+    assert "permalink" not in enriched.dump()["slack_thread"]
+
+
+def test_upsert_stamps_visibility_and_owner_only_on_creation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    threads = _FakeThreadsClient(raise_not_found=True)
+    created: dict = {}
+
+    async def create(*, thread_id: str, if_exists: str, metadata: dict) -> None:
+        created.update(metadata)
+        threads.thread = {"metadata": dict(metadata)}
+        threads.raise_not_found = False
+
+    threads.create = create  # type: ignore[attr-defined]
+    monkeypatch.setattr(webhook_common, "get_client", lambda url: _FakeClient(threads))
+    monkeypatch.setattr(webhook_common.THREADS, "get", threads.indexed_get)
+    monkeypatch.setattr(webhook_common.THREADS, "update", threads.indexed_update)
+
+    assert asyncio.run(
+        webhook_common.upsert_agent_thread_metadata(
+            "thread-id", source="slack", visibility="private", owner_login="Alice", title="Thread"
+        )
+    )
+    assert created["visibility"] == "private"
+    assert created["owner_login"] == "Alice"
+
+    asyncio.run(
+        webhook_common.upsert_agent_thread_metadata(
+            "thread-id", source="slack", visibility="public", owner_login="bob", title="Thread"
+        )
+    )
+    metadata = cast(dict, threads.thread)["metadata"]
+    assert metadata["visibility"] == "private"
+    assert metadata["owner_login"] == "Alice"
+
+
+@pytest.mark.parametrize(
+    ("stub", "visibility"),
+    [
+        # A stub's provisional visibility lasts only until its first write, whether the
+        # channel still holds it or handed it back to the backend.
+        (
+            {
+                "channel": "slack",
+                "visibility": "private",
+                webhook_common.PROVISIONAL_VISIBILITY_KEY: True,
+            },
+            "public",
+        ),
+        (
+            {
+                "channel": None,
+                "visibility": "private",
+                webhook_common.PROVISIONAL_VISIBILITY_KEY: True,
+            },
+            "public",
+        ),
+        # Any other thread that already chose its visibility keeps it.
+        ({"visibility": "private"}, "private"),
+    ],
+)
+def test_upsert_stamps_an_adopted_channel_stub_once(
+    monkeypatch: pytest.MonkeyPatch, stub: dict, visibility: str
+) -> None:
+    threads = _FakeThreadsClient(thread={"metadata": dict(stub)})
+    monkeypatch.setattr(webhook_common, "get_client", lambda url: _FakeClient(threads))
+    monkeypatch.setattr(webhook_common.THREADS, "get", threads.indexed_get)
+    monkeypatch.setattr(webhook_common.THREADS, "update", threads.indexed_update)
+    monkeypatch.setattr(webhook_common, "mirror_thread_metadata", AsyncMock())
+    original_owner = User()
+    monkeypatch.setattr(
+        User,
+        "for_login",
+        AsyncMock(
+            side_effect=lambda provider, login: original_owner if login == "alice" else User()
+        ),
+    )
+
+    for login, requested in (("alice", "public"), ("bob", "private")):
+        assert asyncio.run(
+            webhook_common.upsert_agent_thread_metadata(
+                "thread-id",
+                source="slack",
+                visibility=requested,
+                owner_login=login,
+                title="Thread",
+            )
+        )
+
+    metadata = cast(dict, threads.thread)["metadata"]
+    assert metadata["visibility"] == visibility
+    assert metadata.get("owner_login") == ("alice" if visibility == "public" else None)
+    assert metadata.get("owner_user_id") == (
+        str(original_owner.id) if visibility == "public" else None
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("linked_slack", [True, False])
+async def test_upsert_counts_linked_and_unregistered_slack_participants(
+    monkeypatch: pytest.MonkeyPatch,
+    linked_slack: bool,
+) -> None:
+    threads = _FakeThreadsClient(thread={"metadata": {}})
+    monkeypatch.setattr(webhook_common, "get_client", lambda url: _FakeClient(threads))
+    monkeypatch.setattr(webhook_common.THREADS, "get", threads.indexed_get)
+    monkeypatch.setattr(webhook_common.THREADS, "update", threads.indexed_update)
+    alice = User()
+
+    monkeypatch.setattr(User, "for_login", AsyncMock(return_value=alice))
+    monkeypatch.setattr(User, "for_email", AsyncMock(return_value=alice))
+    monkeypatch.setattr(User, "login_for_email", AsyncMock(return_value="alice"))
+    monkeypatch.setattr(
+        User,
+        "for_identity",
+        AsyncMock(
+            side_effect=lambda provider, uid: alice if linked_slack and uid == "U1" else None
+        ),
+    )
+    monkeypatch.setattr(
+        User,
+        "login_for_slack",
+        AsyncMock(side_effect=lambda uid: "alice" if linked_slack and uid == "U1" else None),
+    )
+    for slack_ids, expected in [
+        (["U1"], {f"user:{alice.id}"}),
+        (["U1", "U2"], {f"user:{alice.id}", "slack:U2"}),
+    ]:
+        assert await webhook_common.upsert_agent_thread_metadata(
+            "thread-id",
+            source="slack",
+            github_login="alice" if linked_slack else "",
+            user_email="alice@example.com",
+            source_context=SourceContext.parse(
+                {
+                    "slack_thread": {
+                        "channel_id": "C1",
+                        "thread_ts": "1.0",
+                        "triggering_user_id": "U1",
+                        "permalink": "https://slack.example/thread",
+                    }
+                }
+            ),
+            slack_participant_user_ids=slack_ids,
+            title="Thread",
+        )
+        assert participant_ids(cast(dict, threads.thread)["metadata"]) == expected
+
+
+@pytest.mark.parametrize("trigger_kind", ["system", "slack_bot"])
+def test_github_followups_preserve_incident_lifecycle_metadata(monkeypatch, trigger_kind):
+    threads = _FakeThreadsClient(
+        thread={
+            "metadata": {
+                "source": "incidents_agent",
+                "origin": "incidents_agent",
+                "thread_category": "interactive",
+                "trigger_kind": trigger_kind,
+                "incident_id": "incident",
+                "owner_type": "system",
+                "visibility": "public",
+                "created_at_ms": 1,
+            }
+        }
+    )
+    monkeypatch.setattr(webhook_common, "get_client", lambda url: _FakeClient(threads))
+    monkeypatch.setattr(webhook_common.THREADS, "get", threads.indexed_get)
+    monkeypatch.setattr(webhook_common.THREADS, "update", threads.indexed_update)
+    assert asyncio.run(
+        webhook_common.upsert_agent_thread_metadata(
+            "thread-id",
+            source="github",
+            title="Pull request",
+            source_context=SourceContext(pr_number=42),
+        )
+    )
+    metadata = threads.thread["metadata"]
+    assert (metadata["source"], metadata["origin"]) == ("incidents_agent", "incidents_agent")
+    assert metadata["thread_category"] == "interactive"
+    assert metadata["trigger_kind"] == trigger_kind
+    assert metadata["incident_id"] == "incident"
+    assert metadata["owner_type"] == "system" and metadata["visibility"] == "public"
+
+
+def test_upsert_records_a_token_scope_only_on_creation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    threads = _FakeThreadsClient(raise_not_found=True)
+
+    async def create(*, thread_id: str, if_exists: str, metadata: dict) -> None:
+        threads.thread = {"metadata": dict(metadata)}
+        threads.raise_not_found = False
+
+    threads.create = create  # type: ignore[attr-defined]
+    monkeypatch.setattr(webhook_common, "get_client", lambda url: _FakeClient(threads))
+    monkeypatch.setattr(webhook_common.THREADS, "get", threads.indexed_get)
+    monkeypatch.setattr(webhook_common.THREADS, "update", threads.indexed_update)
+
+    assert asyncio.run(
+        webhook_common.upsert_agent_thread_metadata(
+            "thread-id", source="github", title="Issue", token_repositories=["acme/oss"]
+        )
+    )
+    asyncio.run(
+        webhook_common.upsert_agent_thread_metadata(
+            "thread-id", source="github", title="Issue", token_repositories=None
+        )
+    )
+
+    metadata = cast(dict, threads.thread)["metadata"]
+    assert metadata[GITHUB_TOKEN_REPOSITORIES_KEY] == ["acme/oss"]
+
+
+def test_format_slack_messages_for_prompt_caps_forwarded_attachment_depth() -> None:
+    root: dict[str, object] = {
+        "is_share": True,
+        "text": "level 0",
+    }
+    current = root
+    for depth in range(1, slack_utils.SLACK_FORWARDED_ATTACHMENT_MAX_DEPTH + 2):
+        nested: dict[str, object] = {
+            "is_share": True,
+            "text": f"level {depth}",
+        }
+        current["attachments"] = [nested]
+        current = nested
+
+    formatted = format_slack_messages_for_prompt(
+        [{"ts": "1.0", "text": "context", "user": "U123", "attachments": [root]}],
+        {"U123": "alice"},
+    )
+
+    assert f"level {slack_utils.SLACK_FORWARDED_ATTACHMENT_MAX_DEPTH}" in formatted
+    assert f"level {slack_utils.SLACK_FORWARDED_ATTACHMENT_MAX_DEPTH + 1}" not in formatted
+
+
+def test_format_slack_messages_for_prompt_renders_app_card_attachments() -> None:
+    alert = {
+        "ts": "1.0",
+        "text": "",
+        "bot_id": "B1",
+        "attachments": [
+            {
+                "title": "Triggered: Webhook delivery failures",
+                "blocks": [
+                    {"type": "section", "text": {"type": "mrkdwn", "text": "6 deliveries failed"}},
+                    {"type": "actions", "elements": [{"type": "button", "text": {"text": "Mute"}}]},
+                ],
+            }
+        ],
+    }
+
+    formatted = format_slack_messages_for_prompt([alert])
+
+    assert "Triggered: Webhook delivery failures\n6 deliveries failed" in formatted
+    assert "Mute" not in formatted
+
+
+def _setup_slack_mention_fakes(
+    monkeypatch: pytest.MonkeyPatch, captured: dict[str, object]
+) -> None:
+    monkeypatch.setattr(slack_webhooks.INTEGRATIONS, "channel_prompt", AsyncMock(return_value=None))
+
+    async def fake_get_slack_user_info(user_id: str) -> dict:
+        return {
+            "profile": {
+                "email": "mason@example.com",
+                "display_name": "Mason",
+            },
+            "tz": "America/New_York",
+        }
+
+    async def fake_fetch_slack_thread_messages(channel_id: str, thread_ts: str) -> list[dict]:
+        captured["fetch_thread"] = {"channel_id": channel_id, "thread_ts": thread_ts}
+        return [
+            {"ts": "1700000000.000100", "text": "<@UBOT> first request", "user": "U123"},
+            {"ts": "1700000000.000150", "text": "context", "user": "U456"},
+            {
+                "ts": "1700000000.000200",
+                "text": "<@UBOT> continue on the branch",
+                "user": "U123",
+            },
+        ]
+
+    async def fake_get_slack_user_names(user_ids: list[str]) -> dict[str, str]:
+        captured["user_ids"] = user_ids
+        return {"U123": "Mason", "U456": "Teammate"}
+
+    async def fake_resolve_slack_links_in_context(
+        context_messages: list[dict], user_names_by_id: dict[str, str]
+    ) -> tuple[str, list[str]]:
+        captured["context_messages"] = context_messages
+        captured["user_names_by_id"] = user_names_by_id
+        return "", []
+
+    async def fake_post_slack_trace_reply(channel_id: str, thread_ts: str, thread_id: str) -> None:
+        captured["trace_reply"] = {
+            "channel_id": channel_id,
+            "thread_ts": thread_ts,
+            "thread_id": thread_id,
+        }
+
+    class _FakeRunsClient:
+        async def create(self, thread_id: str, graph: str, **kwargs) -> dict[str, str]:
+            captured["run_create"] = {
+                "thread_id": thread_id,
+                "graph": graph,
+                "kwargs": kwargs,
+            }
+            return {"run_id": "run-123"}
+
+    class _FakeThreadsClientForProcess(_FakeThreadsClient):
+        async def get(self, thread_id: str) -> dict:
+            return {"metadata": {"visibility": "public"}}
+
+        async def get_state(self, thread_id: str) -> dict:
+            return {"values": captured.get("thread_state_values", {"messages": []})}
+
+        async def update(self, *, thread_id: str, metadata: dict) -> None:
+            captured["metadata_update"] = {"thread_id": thread_id, "metadata": metadata}
+
+    class _FakeLangGraphClientForProcess:
+        runs = _FakeRunsClient()
+        threads = _FakeThreadsClientForProcess()
+
+    monkeypatch.setenv("DASHBOARD_BASE_URL", "https://app.example.com")
+    monkeypatch.setattr(slack_webhooks, "get_langsmith_trace_url", _fake_trace_url)
+    monkeypatch.setattr(webhook_common, "SLACK_BOT_USERNAME", "open-swe")
+    monkeypatch.setattr(webhook_common, "get_slack_user_info", fake_get_slack_user_info)
+    monkeypatch.setattr(
+        webhook_common, "fetch_slack_thread_messages", fake_fetch_slack_thread_messages
+    )
+    monkeypatch.setattr(webhook_common, "get_slack_user_names", fake_get_slack_user_names)
+    monkeypatch.setattr(
+        webhook_common, "resolve_slack_links_in_context", fake_resolve_slack_links_in_context
+    )
+
+    async def fake_login_for_slack_id(slack_user_id):
+        return "mason-gh"
+
+    async def fake_login_for_email(email):
+        return None
+
+    async def fake_refresh_cache() -> list:
+        return []
+
+    async def fake_get_valid_access_token(login):
+        return "user-token"
+
+    async def fake_post_prompt(*args, **kwargs) -> None:
+        captured["prompt"] = {"args": args, "kwargs": kwargs}
+
+    async def fake_resolve_slack_thread_id(channel_id, thread_ts):
+        return "mapped-thread"
+
+    monkeypatch.setattr(webhook_common, "post_slack_trace_reply", fake_post_slack_trace_reply)
+    monkeypatch.setattr(webhook_common, "resolve_slack_thread_id", fake_resolve_slack_thread_id)
+    client = _FakeLangGraphClientForProcess()
+    monkeypatch.setattr(webhook_common.THREADS, "get", client.threads.indexed_get)
+    monkeypatch.setattr(webhook_common.THREADS, "update", client.threads.indexed_update)
+    monkeypatch.setattr(webhook_common, "get_client", lambda url: client)
+    monkeypatch.setattr(slack_webhooks, "get_langgraph_client", lambda: client)
+    monkeypatch.setattr(webhook_common.User, "login_for_slack", fake_login_for_slack_id)
+    monkeypatch.setattr(webhook_common.User, "login_for_email", fake_login_for_email)
+
+    async def fake_slack_user(provider: str, user_id: str) -> User | None:
+        login = await webhook_common.User.login_for_slack(user_id)
+        return (
+            User(
+                id=uuid5(NAMESPACE_URL, f"slack-test:{login}"),
+                identities=[
+                    UserIdentity(provider="github", external_id=login, login=login),
+                    UserIdentity(provider="langsmith", external_id=f"ls-{login}"),
+                ],
+            )
+            if login
+            else None
+        )
+
+    monkeypatch.setattr(User, "for_identity", fake_slack_user)
+    monkeypatch.setattr(
+        slack_webhooks.LangSmithLogin, "authorize_session", AsyncMock(return_value="ls_token")
+    )
+
+    async def fake_slack_accounts(user_ids: list[str]) -> tuple[dict[str, str], dict[str, str]]:
+        # Follows whatever login_for_slack the test installs, as the per-user lookup did.
+        logins: dict[str, str] = {}
+        for user_id in {value for value in user_ids if value}:
+            if login := await webhook_common.User.login_for_slack(user_id):
+                logins[user_id] = login
+        return logins, {}
+
+    monkeypatch.setattr(slack_webhooks, "_slack_accounts_by_user_id", fake_slack_accounts)
+    monkeypatch.setattr(webhook_common, "get_valid_access_token", fake_get_valid_access_token)
+    monkeypatch.setattr(webhook_common, "post_account_link_prompt", fake_post_prompt)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_choice", [None, ("anthropic:claude-opus-5-5", "max")])
+@pytest.mark.parametrize("origin", ["slack", "github"])
+async def test_web_question_keeps_context_without_slack_delivery(
+    monkeypatch, model_choice: tuple[str, str] | None, origin: str
+):
+    captured: dict[str, object] = {}
+    _setup_slack_mention_fakes(monkeypatch, captured)
+    persisted = AsyncMock(return_value=True)
+    mapping = AsyncMock()
+    status = AsyncMock()
+    monkeypatch.setattr(webhook_common, "upsert_agent_thread_metadata", persisted)
+    monkeypatch.setattr(webhook_common, "store_slack_run_mapping", mapping)
+    monkeypatch.setattr(slack_webhooks, "show_slack_thinking_status", status)
+    request = SlackRequest(
+        channel_id="C123",
+        thread_ts="1700000000.000100",
+        event_ts="1700000000.000200",
+        thread_id="web-question",
+        origin=origin,
+        user_id="U123",
+        text="quick question",
+        bot_user_id="UBOT",
+        context_thread_ts="1700000000.000100",
+    )
+    assert await slack_webhooks.process_slack_web_mention(request, None, model_choice=model_choice)
+    run = captured["run_create"]
+    assert isinstance(run, dict)
+    config = run["kwargs"]["config"]["configurable"]
+    assert config["source"] == "web"
+    assert config["origin"] == origin
+    assert run["kwargs"]["metadata"]["origin"] == origin
+    assert "slack_thread" not in config
+    assert "slack_breakout" not in config
+    if model_choice is not None:
+        assert config["agent_model_id"] == model_choice[0]
+        assert config["agent_effort"] == model_choice[1]
+        assert config["model_selection"] == "explicit"
+    assert persisted.await_args.kwargs["visibility"] == "private"
+    assert persisted.await_args.kwargs["source_context"] is None
+    messages = str(run["kwargs"]["input"])
+    assert "first request" in messages and "context" in messages
+    assert 'surface="web"' in messages
+    mapping.assert_not_awaited()
+    status.assert_not_awaited()
+
+
+@pytest.fixture
+async def slack_file_mention(monkeypatch, registry_db):
+    from openswe.sandboxes import lifecycle, state
+    from openswe.slack import staged_files
+
+    captured: dict[str, Any] = {}
+    _setup_slack_mention_fakes(monkeypatch, captured)
+
+    class Threads(_FakeThreadsClient):
+        metadata: dict[str, Any] | None = None
+
+        async def get(self, thread_id: str) -> dict[str, Any]:
+            if self.metadata is None:
+                raise _FakeNotFoundError()
+            return {"thread_id": thread_id, "metadata": dict(self.metadata)}
+
+        async def create(self, *, thread_id: str, metadata: dict, **kwargs) -> None:
+            if self.metadata is None:
+                self.metadata = dict(metadata)
+
+        async def update(self, *, thread_id: str, metadata: dict) -> None:
+            if self.metadata is None:
+                raise _FakeNotFoundError()
+            self.metadata.update(metadata)
+
+    client = slack_webhooks.get_langgraph_client()
+    client.threads = Threads()
+    monkeypatch.setattr(lifecycle, "client", client)
+    monkeypatch.setattr(staged_files, "get_client", lambda: client)
+
+    monkeypatch.setattr(state.THREADS, "get", client.threads.indexed_get)
+
+    monkeypatch.setattr(state.THREADS, "update", client.threads.indexed_update)
+    monkeypatch.setattr(webhook_common, "get_slack_permalink", AsyncMock(return_value=None))
+    monkeypatch.setattr(slack_utils, "download_slack_file", AsyncMock(return_value=b"zip"))
+    request = SlackRequest(
+        channel_id="C123",
+        thread_ts="1700000000.000100",
+        event_ts="1700000000.000100",
+        thread_id="mapped-thread",
+        user_id="U123",
+        text="<@UBOT> analyze this zip",
+        bot_user_id="UBOT",
+    )
+    monkeypatch.setattr(
+        webhook_common,
+        "fetch_slack_thread_messages",
+        AsyncMock(
+            return_value=[
+                {
+                    "ts": request.event_ts,
+                    "text": request.text,
+                    "user": request.user_id,
+                    "files": [
+                        {
+                            "name": "bundle.zip",
+                            "mimetype": "application/zip",
+                            "url_private": "https://files.slack.com/bundle.zip",
+                        }
+                    ],
+                }
+            ]
+        ),
+    )
+    return request, client.threads, captured
+
+
+@pytest.mark.parametrize("private", [False, True])
+@pytest.mark.parametrize(
+    ("existing", "tag"),
+    [(False, ""), (False, "env:staging"), (True, "")],
+)
+async def test_slack_files_wait_for_the_sandbox_mda_opens_for_the_run(
+    slack_file_mention, private, existing, tag
+):
+    """The webhook never gives the thread a sandbox: it records where the files go."""
+    from openswe.slack.staged_files import PENDING_SLACK_FILES_KEY
+
+    request, threads, captured = slack_file_mention
+    if private:
+        request = request.model_copy(update={"channel_context": SlackChannelContext(is_im=True)})
+    if existing:
+        threads.metadata = {
+            "visibility": "private" if private else "public",
+            "owner_login": "mason-gh",
+            "environment": "staging",
+            "created_at_ms": 1,
+        }
+    if tag:
+        request = request.model_copy(update={"text": f"{request.text} {tag}"})
+
+    await slack_webhooks._process_slack_mention_impl(request, None)
+
+    assert "sandbox_id" not in threads.metadata
+    assert threads.metadata["visibility"] == ("private" if private else "public")
+    assert threads.metadata["owner_login"] == "mason-gh"
+    assert threads.metadata[PENDING_SLACK_FILES_KEY] == [
+        {
+            "url": "https://files.slack.com/bundle.zip",
+            "path": "/workspace/.open-swe/slack-files/bundle.zip",
+        }
+    ]
+    run = captured["run_create"]["kwargs"]
+    assert "environment" not in run["config"]["configurable"]
+    assert "workspace" not in run["config"]["configurable"]
+    if tag:
+        assert tag in str(run["input"]["messages"])
+    assert "/workspace/.open-swe/slack-files/bundle.zip" in str(run["input"]["messages"])
+
+
+@pytest.mark.parametrize(
+    ("settled", "dm", "quoted"),
+    [
+        # A conversation MDA's channel just claimed is private only as a placeholder: in a
+        # channel, its first turn quotes everyone who spoke before the mention.
+        (False, False, None),
+        (False, True, ["U123"]),
+        # A thread someone made private quotes only those who may prompt it.
+        (True, False, ["U123"]),
+    ],
+)
+async def test_a_new_conversations_first_turn_quotes_everyone_in_its_channel(
+    slack_file_mention, monkeypatch, settled, dm, quoted
+):
+    request, threads, _ = slack_file_mention
+    if dm:
+        request = request.model_copy(update={"channel_context": SlackChannelContext(is_im=True)})
+
+    async def login_for_slack(slack_user_id: str) -> str:
+        return "mason-gh" if slack_user_id == "U123" else "suraj-gh"
+
+    monkeypatch.setattr(webhook_common.User, "login_for_slack", login_for_slack)
+    threads.metadata = {
+        "visibility": "private",
+        "owner_login": "mason-gh",
+        "source": "slack",
+        **({} if settled else {webhook_common.PROVISIONAL_VISIBILITY_KEY: True}),
+    }
+    read = slack_webhooks.SlackTurnRead(
+        clean_text="do it",
+        context_user_ids=["U123", "U456"],
+        participant_user_ids=["U123", "U456"],
+    )
+
+    _, prompt = await slack_webhooks.prepare_slack_channel_run(request, None, read=read)
+
+    assert prompt is not None
+    assert prompt.promptable_user_ids == quoted
+
+
+async def test_a_slack_turn_reaches_its_thread_in_process_not_over_http(
+    slack_file_mention, monkeypatch
+):
+    """The backend serves ``/threads`` itself: going out to its public URL only adds a hop."""
+    request, threads, _ = slack_file_mention
+    threads.metadata = {
+        "visibility": "public",
+        "owner_login": "mason-gh",
+        "created_at_ms": 1,
+        "repo": {"owner": "langchain-ai", "name": "open-swe"},
+    }
+    over_http = SimpleNamespace(
+        threads=SimpleNamespace(
+            get=AsyncMock(side_effect=AssertionError("read the thread over HTTP")),
+            update=AsyncMock(side_effect=AssertionError("wrote the thread over HTTP")),
+        )
+    )
+    monkeypatch.setattr(webhook_common, "get_client", lambda **kwargs: over_http)
+
+    resolution = await webhook_common.get_slack_repo_config(
+        request.channel_id, request.thread_ts, thread_id="mapped-thread"
+    )
+    prepared, _ = await slack_webhooks.prepare_slack_channel_run(request, None)
+
+    assert resolution.explicit
+    assert prepared is not None
+    # The turn's metadata write landed in the store.
+    assert threads.metadata["source"] == "slack"
+
+
+@pytest.mark.parametrize("channel_prompt", [None, "Only investigate database reports", ""])
+async def test_a_channel_run_does_not_wait_on_the_sandbox_for_slack_files(
+    slack_file_mention, monkeypatch, channel_prompt
+):
+    request, threads, captured = slack_file_mention
+    request = request.model_copy(
+        update={
+            "channel_context": SlackChannelContext(
+                name="eng",
+                topic="description-only-routing topic",
+                purpose="description-only-routing purpose",
+                description="description-only-routing description",
+            )
+        }
+    )
+    monkeypatch.setattr(
+        slack_webhooks.INTEGRATIONS, "channel_prompt", AsyncMock(return_value=channel_prompt)
+    )
+
+    prepared, _ = await slack_webhooks.prepare_slack_channel_run(request, None)
+
+    # MDA's channel starts the run; nothing holds up its answer for a sandbox.
+    assert prepared is not None
+    if channel_prompt:
+        assert channel_prompt in str(prepared.input)
+    assert "description-only-routing" not in str(prepared.input)
+    assert "run_create" not in captured
+    assert "/workspace/.open-swe/slack-files/" not in str(prepared.input)
+    assert threads.metadata["owner_login"] == "mason-gh"
+
+
+async def test_channel_instruction_edits_and_reversions_reach_existing_thread_turns(
+    slack_file_mention, monkeypatch
+):
+    request, _, _ = slack_file_mention
+    for instructions in (
+        "Investigate database failures",
+        "Only answer release questions",
+        "Investigate database failures",
+        "",
+    ):
+        monkeypatch.setattr(
+            slack_webhooks.INTEGRATIONS,
+            "channel_prompt",
+            AsyncMock(return_value=instructions),
+        )
+        prepared, current = await slack_webhooks.prepare_slack_channel_run(
+            request,
+            None,
+            read=slack_webhooks.SlackTurnRead(
+                clean_text="continue investigating",
+                context_user_ids=["U123"],
+                participant_user_ids=["U123"],
+            ),
+        )
+        assert prepared is not None
+        assert current is not None
+        assert current.channel_prompt == instructions
+        prepared_legacy, _ = await slack_webhooks.prepare_slack_channel_run(request, None)
+        assert prepared_legacy is not None
+        if instructions:
+            assert instructions in str(prepared_legacy.input)
+
+
+@pytest.mark.parametrize("failure", ["account", "public-persistence", "private-persistence"])
+async def test_slack_files_wait_only_for_an_account_and_a_persisted_thread(
+    monkeypatch, slack_file_mention, failure
+):
+    request, threads, captured = slack_file_mention
+    if failure == "account":
+        monkeypatch.setattr(
+            slack_webhooks.LangSmithLogin,
+            "authorize_user",
+            AsyncMock(side_effect=HTTPException(401)),
+        )
+    else:
+        monkeypatch.setattr(
+            threads, "create", AsyncMock(side_effect=RuntimeError("store unavailable"))
+        )
+
+    if failure == "private-persistence":
+        request = request.model_copy(update={"channel_context": SlackChannelContext(is_im=True)})
+        with pytest.raises(RuntimeError, match="authorization metadata"):
+            await slack_webhooks._process_slack_mention_impl(request, None)
+    else:
+        await slack_webhooks._process_slack_mention_impl(request, None)
+
+    assert threads.metadata is None
+    if failure == "public-persistence":
+        assert "/workspace/.open-swe/slack-files/" not in str(
+            captured["run_create"]["kwargs"]["input"]
+        )
+    else:
+        assert "run_create" not in captured
+
+
+@pytest.mark.parametrize("explicitly_tagged", [True, False])
+@pytest.mark.parametrize("listening_channel", [True, False])
+def test_slack_followup_publishes_as_the_owner(
+    monkeypatch: pytest.MonkeyPatch, explicitly_tagged: bool, listening_channel: bool
+) -> None:
+    import importlib
+
+    from openswe.dashboard import profiles
+
+    opr = importlib.import_module("openswe.tools.open_pull_request")
+    captured: dict[str, object] = {}
+    _setup_slack_mention_fakes(monkeypatch, captured)
+    client = slack_webhooks.get_langgraph_client()
+    saved_metadata = {"visibility": "public", "owner_type": "user", "owner_login": "alice"}
+    client.threads = _FakeThreadsClient(thread={"metadata": saved_metadata})
+    monkeypatch.setattr(webhook_common, "thread_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(webhook_common.User, "login_for_slack", AsyncMock(return_value="bob"))
+    monkeypatch.setattr(
+        profiles,
+        "get_valid_access_token",
+        AsyncMock(side_effect={"alice": "alice-token", "bob": "bob-token"}.get),
+    )
+    asyncio.run(
+        slack_webhooks.process_slack_mention(
+            SlackRequest(
+                channel_id="C123",
+                thread_ts="1700000000.000100",
+                event_ts="1700000000.000300",
+                user_id="U456",
+                team_id="T123",
+                text="<@UBOT> create the PR" if explicitly_tagged else "create the PR",
+                bot_user_id="UBOT",
+                listening_channel=listening_channel,
+                treat_all_messages_as_mentions=listening_channel,
+            ),
+            webhook_common.SlackRepoResolution(
+                Repo(owner="langchain-ai", name="open-swe"), explicit=True
+            ),
+        )
+    )
+    run_create = captured["run_create"]
+    assert isinstance(run_create, dict)
+    kwargs = run_create["kwargs"]
+    assert kwargs["multitask_strategy"] == (
+        "interrupt" if explicitly_tagged or listening_channel else "enqueue"
+    )
+    trigger = ElementTree.fromstring(kwargs["input"]["messages"][-1]["content"][0]["text"])
+    assert trigger.get("explicit_bot_mention") == str(explicitly_tagged).lower()
+    assert "<@UBOT>" not in (trigger.text or "")
+    assert (
+        f"@{webhook_common.SLACK_BOT_USERNAME} create the PR" in str(kwargs["input"])
+    ) == explicitly_tagged
+    run_config = kwargs["config"]
+    assert run_config["configurable"]["slack_thread"]["team_id"] == "T123"
+    run_config["configurable"]["thread_id"] = run_create["thread_id"]
+    monkeypatch.setattr("openswe.run_config.get_config", lambda: run_config)
+    monkeypatch.setattr(webhook_common.THREADS, "get", client.threads.indexed_get)
+    monkeypatch.setattr(webhook_common.THREADS, "update", client.threads.indexed_update)
+
+    assert asyncio.run(opr._resolve_pr_author_token()) == ("alice-token", "user")
+    assert saved_metadata["owner_login"] == "alice"
+
+
+def test_process_slack_mention_unmapped_user_blocked_and_prompted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unmapped Slack user is blocked (no run) and prompted to link."""
+    captured: dict[str, object] = {}
+    _setup_slack_mention_fakes(monkeypatch, captured)
+
+    async def fake_thread_exists(thread_id: str) -> bool:
+        return False
+
+    async def fake_login_for_slack_id(slack_user_id):
+        return None
+
+    async def fake_login_for_email(email):
+        return None
+
+    async def fake_post_prompt(
+        channel_id, thread_ts, user_id, user_email, reason="unlinked", **kwargs
+    ):
+        captured["prompt"] = {"user_id": user_id, "user_email": user_email, "reason": reason}
+
+    monkeypatch.setattr(webhook_common, "thread_exists", fake_thread_exists)
+    monkeypatch.setattr(webhook_common.User, "login_for_slack", fake_login_for_slack_id)
+    monkeypatch.setattr(webhook_common.User, "login_for_email", fake_login_for_email)
+    monkeypatch.setattr(webhook_common, "post_account_link_prompt", fake_post_prompt)
+
+    asyncio.run(
+        slack_webhooks.process_slack_mention(
+            SlackRequest.model_validate(
+                {
+                    "channel_id": "C123",
+                    "thread_ts": "1700000000.000100",
+                    "event_ts": "1700000000.000200",
+                    "user_id": "U123",
+                    "text": "<@UBOT> do the thing",
+                    "bot_user_id": "UBOT",
+                }
+            ),
+            webhook_common.SlackRepoResolution(
+                Repo(owner="langchain-ai", name="open-swe"), explicit=True
+            ),
+        )
+    )
+
+    assert "run_create" not in captured
+    assert captured["prompt"] == {
+        "user_id": "U123",
+        "user_email": None,
+        "reason": "unlinked",
+    }
+
+
+def test_process_slack_mention_mapped_user_without_langsmith_prompts_revoked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A user who signed in before but whose token is now unusable is told to re-auth."""
+    captured: dict[str, object] = {}
+    _setup_slack_mention_fakes(monkeypatch, captured)
+
+    async def fake_thread_exists(thread_id: str) -> bool:
+        return False
+
+    async def fake_login_for_slack_id(slack_user_id):
+        return "mason-gh" if slack_user_id == "U123" else None
+
+    async def fake_post_prompt(
+        channel_id, thread_ts, user_id, user_email, reason="unlinked", **kwargs
+    ):
+        captured["prompt"] = {"reason": reason}
+
+    monkeypatch.setattr(webhook_common, "thread_exists", fake_thread_exists)
+    monkeypatch.setattr(webhook_common.User, "login_for_slack", fake_login_for_slack_id)
+    monkeypatch.setattr(
+        slack_webhooks.LangSmithLogin, "authorize_user", AsyncMock(side_effect=HTTPException(401))
+    )
+    monkeypatch.setattr(webhook_common, "post_account_link_prompt", fake_post_prompt)
+
+    asyncio.run(
+        slack_webhooks.process_slack_mention(
+            SlackRequest.model_validate(
+                {
+                    "channel_id": "C123",
+                    "thread_ts": "1700000000.000100",
+                    "event_ts": "1700000000.000200",
+                    "user_id": "U123",
+                    "text": "<@UBOT> do the thing",
+                    "bot_user_id": "UBOT",
+                }
+            ),
+            webhook_common.SlackRepoResolution(
+                Repo(owner="langchain-ai", name="open-swe"), explicit=True
+            ),
+        )
+    )
+
+    assert "run_create" not in captured
+    assert captured["prompt"] == {"reason": "revoked"}
+
+
+@pytest.mark.parametrize(("has_token_record", "reason"), [(False, "unlinked"), (True, "revoked")])
+def test_a_turn_built_for_mdas_slack_channel_prompts_without_a_public_decline(
+    monkeypatch: pytest.MonkeyPatch,
+    has_token_record: bool,
+    reason: str,
+) -> None:
+    """Sign-in prompts are delivered privately by the backend."""
+    captured: dict[str, object] = {}
+    _setup_slack_mention_fakes(monkeypatch, captured)
+    prompt = AsyncMock()
+    monkeypatch.setattr(webhook_common, "thread_exists", AsyncMock(return_value=False))
+    monkeypatch.setattr(
+        webhook_common.User,
+        "login_for_slack",
+        AsyncMock(return_value="mason-gh" if has_token_record else None),
+    )
+    monkeypatch.setattr(webhook_common.User, "login_for_email", AsyncMock(return_value=None))
+    monkeypatch.setattr(webhook_common, "get_valid_access_token", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        webhook_common, "has_access_token_record", AsyncMock(return_value=has_token_record)
+    )
+    monkeypatch.setattr(webhook_common, "post_account_link_prompt", prompt)
+    monkeypatch.setattr(
+        slack_webhooks.LangSmithLogin, "authorize_user", AsyncMock(side_effect=HTTPException(401))
+    )
+    monkeypatch.setattr(
+        slack_webhooks.LangSmithLogin,
+        "slack_onboarding_url",
+        lambda: "https://openswe.test/settings",
+    )
+
+    prepared, _ = asyncio.run(
+        slack_webhooks.prepare_slack_channel_run(
+            SlackRequest(
+                channel_id="C123",
+                thread_ts="1700000000.000100",
+                event_ts="1700000000.000200",
+                user_id="U123",
+                text="<@UBOT> do the thing",
+                bot_user_id="UBOT",
+                thread_id="11111111-1111-4111-8111-111111111111",
+            ),
+            webhook_common.SlackRepoResolution(
+                Repo(owner="langchain-ai", name="open-swe"), explicit=True
+            ),
+        )
+    )
+
+    assert prepared is None
+    assert "run_create" not in captured
+    prompt.assert_awaited_once()
+    assert prompt.await_args.args[:3] == ("C123", "1700000000.000100", "U123")
+    assert prompt.await_args.kwargs == {"reason": reason, "langsmith": True}
+
+
+@pytest.fixture
+def bot_run(monkeypatch, allowed_bot):
+    captured: dict[str, Any] = {}
+    _setup_slack_mention_fakes(monkeypatch, captured)
+    monkeypatch.setenv("CONFIGURED_ADMINS", "mason-gh")
+    monkeypatch.setattr(
+        webhook_common,
+        "get_valid_access_token",
+        AsyncMock(side_effect=AssertionError("Bot requested personal OAuth")),
+    )
+    monkeypatch.setattr(webhook_common, "fetch_slack_thread_messages", AsyncMock(return_value=[]))
+
+    class Threads:
+        metadata: dict[str, Any] | None = None
+
+        async def get(self, thread_id: str) -> dict[str, Any]:
+            if self.metadata is None:
+                raise _FakeNotFoundError()
+            return {"thread_id": thread_id, "metadata": dict(self.metadata)}
+
+        async def create(self, *, thread_id: str, metadata=None, **kwargs) -> None:
+            if self.metadata is None:
+                self.metadata = metadata or {}
+
+        async def update(self, *, thread_id: str, metadata: dict[str, Any]) -> None:
+            if self.metadata is None:
+                raise _FakeNotFoundError()
+            self.metadata.update(metadata)
+
+        async def indexed_get(self, thread_id: str) -> IndexedThread | None:
+            if self.metadata is None:
+                return None
+            return IndexedThread(
+                thread_id=thread_id,
+                runtime="mda",
+                metadata=dict(self.metadata),
+                status="idle",
+                created_at=datetime.now(UTC),
+                updated_at=datetime.now(UTC),
+            )
+
+        async def indexed_create(
+            self, thread_id: str, *, title: str, metadata: Mapping[str, JsonValue]
+        ) -> IndexedThread:
+            await self.create(thread_id=thread_id, metadata=dict(metadata))
+            saved = await self.indexed_get(thread_id)
+            assert saved is not None
+            return saved
+
+        async def indexed_update(
+            self, thread_id: str, metadata: Mapping[str, JsonValue]
+        ) -> IndexedThread | None:
+            if self.metadata is None:
+                return None
+            await self.update(thread_id=thread_id, metadata=dict(metadata))
+            return await self.indexed_get(thread_id)
+
+        async def update_if_current(
+            self,
+            snapshot: IndexedThread,
+            *,
+            metadata: Mapping[str, JsonValue],
+            status: ThreadStatus,
+        ) -> IndexedThread | None:
+            if self.metadata != snapshot.metadata:
+                return None
+            await self.update(thread_id=snapshot.thread_id, metadata=dict(metadata))
+            return await self.indexed_get(snapshot.thread_id)
+
+    client = slack_webhooks.get_langgraph_client()
+    client.threads = Threads()
+    store = SimpleNamespace(
+        get=client.threads.indexed_get,
+        create=client.threads.indexed_create,
+        update=client.threads.indexed_update,
+        update_if_current=client.threads.update_if_current,
+    )
+    monkeypatch.setattr(webhook_common, "THREADS", store)
+    monkeypatch.setattr(thread_reads, "THREADS", store)
+    request = SlackRequest(
+        channel_id="C123",
+        thread_ts="1700000000.000100",
+        thread_id="mapped-thread",
+        event_ts="1700000000.000200",
+        user_id="U123",
+        text="<@UBOT> Open a PR",
+        bot_user_id="UBOT",
+        team_id="T123",
+        triggering_bot_id="B123",
+        triggering_bot_app_id="A123",
+    )
+    return request, client.threads, captured
+
+
+@pytest.mark.parametrize("opening", ["new", "placeholder", "public-user", "public-system"])
+async def test_unlinked_ask_answers_without_borrowing_an_account(monkeypatch, bot_run, opening):
+    request, threads, captured = bot_run
+    request = request.model_copy(
+        update={
+            "triggering_bot_id": "",
+            "triggering_bot_app_id": "",
+            "text": "Why did this request fail?",
+            "channel_context": SlackChannelContext(
+                is_ext_shared=False, is_pending_ext_shared=False
+            ),
+        }
+    )
+    monkeypatch.setattr(INTEGRATIONS, "listens_to_channel", AsyncMock(return_value=True))
+    monkeypatch.setattr(User, "for_identity", AsyncMock(return_value=None))
+    monkeypatch.setattr(User, "login_for_slack", AsyncMock(return_value=None))
+    monkeypatch.setattr(User, "login_for_email", AsyncMock(return_value="email-owner"))
+    if opening == "placeholder":
+        threads.metadata = {
+            "visibility": "private",
+            webhook_common.PROVISIONAL_VISIBILITY_KEY: True,
+            "source": "slack",
+        }
+    elif opening.startswith("public-"):
+        threads.metadata = {
+            "visibility": "public",
+            "owner_type": "user" if opening == "public-user" else "system",
+            "created_at_ms": 1,
+            "source_context": {
+                "slack_thread": {
+                    "team_id": request.team_id,
+                    "channel_id": request.channel_id,
+                    "thread_ts": request.thread_ts,
+                }
+            },
+        }
+        if opening == "public-user":
+            threads.metadata["owner_login"] = "original-owner"
+
+    resolution = webhook_common.SlackRepoResolution(
+        Repo(owner="langchain-ai", name="langchainplus"), explicit=True
+    )
+    for event_ts in ("1700000000.000200", "1700000000.000300"):
+        await slack_webhooks._process_slack_mention_impl(
+            request.model_copy(update={"event_ts": event_ts}), resolution
+        )
+        config = captured.pop("run_create")["kwargs"]["config"]["configurable"]
+        assert not config.get("github_login")
+        assert not config.get("user_id")
+        assert not config.get("user_email")
+        assert not config.get("admin_thread")
+        assert config["repo"] == {"owner": "langchain-ai", "name": "langchainplus"}
+        assert "prompt" not in captured
+        assert threads.metadata["visibility"] == "public"
+        assert threads.metadata["owner_type"] == ("user" if opening == "public-user" else "system")
+        assert threads.metadata.get("owner_login") == (
+            "original-owner" if opening == "public-user" else None
+        )
+        assert "email-owner" not in str(threads.metadata)
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        "private",
+        "owned-placeholder",
+        "owned-person",
+        "web",
+        "dm",
+        "external",
+        "unknown",
+        "revoked",
+        "unconfigured",
+    ],
+)
+async def test_unlinked_ask_preserves_account_and_private_boundaries(
+    monkeypatch, bot_run, boundary
+):
+    request, threads, captured = bot_run
+    channel = SlackChannelContext(is_ext_shared=False, is_pending_ext_shared=False)
+    if boundary == "dm":
+        channel.is_im = True
+    elif boundary == "external":
+        channel.is_ext_shared = True
+    elif boundary == "unknown":
+        channel.is_ext_shared = None
+    request = request.model_copy(
+        update={
+            "triggering_bot_id": "",
+            "triggering_bot_app_id": "",
+            "channel_context": channel,
+            "web_only": boundary == "web",
+        }
+    )
+    monkeypatch.setattr(
+        INTEGRATIONS, "listens_to_channel", AsyncMock(return_value=boundary != "unconfigured")
+    )
+    authorization = slack_webhooks.SlackAuthorization(
+        "U123", None, None, "revoked" if boundary == "revoked" else "unlinked"
+    )
+    monkeypatch.setattr(
+        slack_webhooks.SlackAuthorization, "resolve", AsyncMock(return_value=authorization)
+    )
+    if boundary in {"private", "owned-placeholder", "owned-person"}:
+        threads.metadata = {"visibility": "private", "owner_login": "alice", "owner_type": "user"}
+        if boundary != "private":
+            threads.metadata[webhook_common.PROVISIONAL_VISIBILITY_KEY] = True
+        if boundary == "owned-person":
+            threads.metadata.pop("owner_login")
+            threads.metadata["owner_user_id"] = "11111111-1111-4111-8111-111111111111"
+        with pytest.raises(HTTPException) as exc:
+            await slack_webhooks._process_slack_mention_impl(request, None)
+        assert exc.value.status_code == 404
+    else:
+        await slack_webhooks._process_slack_mention_impl(request, None)
+        assert "prompt" in captured
+    assert "run_create" not in captured
+
+
+@pytest.mark.parametrize("failure", ["write", "race"])
+async def test_unlinked_ask_fails_closed_if_ownership_cannot_be_saved(
+    monkeypatch, bot_run, failure
+):
+    request, threads, captured = bot_run
+    request = request.model_copy(
+        update={
+            "triggering_bot_id": "",
+            "triggering_bot_app_id": "",
+            "channel_context": SlackChannelContext(
+                is_ext_shared=False, is_pending_ext_shared=False
+            ),
+        }
+    )
+    monkeypatch.setattr(INTEGRATIONS, "listens_to_channel", AsyncMock(return_value=True))
+    monkeypatch.setattr(User, "for_identity", AsyncMock(return_value=None))
+    if failure == "write":
+        monkeypatch.setattr(threads, "create", AsyncMock(side_effect=RuntimeError("offline")))
+    else:
+
+        async def competing_create(**kwargs):
+            threads.metadata = {
+                "visibility": "private",
+                "owner_type": "user",
+                "owner_login": "alice",
+            }
+
+        monkeypatch.setattr(threads, "create", competing_create)
+    with pytest.raises(RuntimeError, match="authorization metadata"):
+        await slack_webhooks._process_slack_mention_impl(request, None)
+    assert "run_create" not in captured
+
+
+@pytest.mark.parametrize("user_id", ["U123", ""])
+async def test_allowed_bot_starts_and_continues_a_system_thread(bot_run, user_id):
+    request, threads, captured = bot_run
+    request = request.model_copy(update={"user_id": user_id})
+    await slack_webhooks._process_slack_mention_impl(request, None)
+    assert threads.metadata["owner_type"] == "system"
+    assert threads.metadata["visibility"] == "public"
+    assert not threads.metadata.get("owner_login")
+    kwargs = captured.pop("run_create")["kwargs"]
+    config = kwargs["config"]["configurable"]
+    assert not config.get("github_login")
+    assert not config.get("user_email")
+    assert config["slack_thread"]["triggering_bot_id"] == "B123"
+    assert config["slack_thread"]["triggering_user_id"] == user_id
+    assert config["slack_thread"]["triggering_user_name"] == "Release bot"
+    message = ElementTree.fromstring(kwargs["input"]["messages"][-1]["content"][0]["text"])
+    assert message.attrib["sender"] == "system:slack-bot-B123"
+    assert message.attrib["kind"] == "system"
+    assert (message.text or "").strip() == f"@{webhook_common.SLACK_BOT_USERNAME} Open a PR"
+    await slack_webhooks._process_slack_mention_impl(
+        request.model_copy(update={"event_ts": "1700000000.000300"}), None
+    )
+    assert not captured["run_create"]["kwargs"]["config"]["configurable"].get("github_login")
+
+
+async def test_an_alert_bots_attachment_is_its_whole_request(monkeypatch, bot_run):
+    """Its text is empty: the request is its card, once, from the first line."""
+    request, _, captured = bot_run
+    alert = {"title": "CPU is high", "text": "<@UBOT> investigate this alert"}
+    monkeypatch.setattr(
+        webhook_common,
+        "fetch_slack_thread_messages",
+        AsyncMock(
+            return_value=[
+                {"ts": request.event_ts, "text": "", "bot_id": "B123", "attachments": [alert]}
+            ]
+        ),
+    )
+    request = request.model_copy(
+        update={"text": "CPU is high\n<@UBOT> investigate this alert", "attachments": [alert]}
+    )
+
+    await slack_webhooks._process_slack_mention_impl(request, None)
+
+    kwargs = captured.pop("run_create")["kwargs"]
+    message = ElementTree.fromstring(kwargs["input"]["messages"][-1]["content"][0]["text"])
+    assert (message.text or "").strip() == (
+        f"CPU is high\n@{webhook_common.SLACK_BOT_USERNAME} investigate this alert"
+    )
+
+
+async def test_bot_started_thread_stays_marked_after_a_person_replies(bot_run):
+    request, threads, _ = bot_run
+    await slack_webhooks._process_slack_mention_impl(request, None)
+    assert threads.metadata["trigger_kind"] == "slack_bot"
+    assert threads.metadata["triggering_bot"] == "T123:B123"
+    assert await webhook_common.upsert_agent_thread_metadata(
+        "mapped-thread", source="slack", user_email="alice@example.com", title=""
+    )
+    assert threads.metadata["trigger_kind"] == "slack_bot"
+    assert threads.metadata["triggering_bot"] == "T123:B123"
+
+
+@pytest.mark.parametrize(
+    "block", ["removed", "other-owner", "private", "other-bot", "lookup-error"]
+)
+async def test_bot_authorization_is_checked_before_execution(monkeypatch, bot_run, block):
+    request, threads, captured = bot_run
+    if block == "removed":
+        await AllowedSlackBot.remove("T123", "B123")
+    elif block == "other-owner":
+        threads.metadata = {"owner_type": "user", "owner_login": "alice", "visibility": "public"}
+    elif block in {"private", "other-bot"}:
+        await slack_webhooks._process_slack_mention_impl(request, None)
+        captured.pop("run_create")
+        if block == "private":
+            threads.metadata["visibility"] = "private"
+        else:
+            threads.metadata["source_context"]["slack_thread"]["triggering_bot_id"] = "BOTHER"
+    else:
+        monkeypatch.setattr(AllowedSlackBot, "get", AsyncMock(side_effect=RuntimeError("offline")))
+    await slack_webhooks.process_slack_mention(request, None)
+    assert "run_create" not in captured
+
+
+@pytest.mark.parametrize("owner_login", ["", "alice"])
+async def test_bot_starts_an_mda_placeholder_only_when_no_person_owns_it(bot_run, owner_login):
+    request, threads, captured = bot_run
+    threads.metadata = {
+        "visibility": "private",
+        webhook_common.PROVISIONAL_VISIBILITY_KEY: True,
+        "source": "slack",
+    }
+    if owner_login:
+        threads.metadata["owner_login"] = owner_login
+    await slack_webhooks._process_slack_mention_impl(request, None)
+    if owner_login:
+        assert "run_create" not in captured
+        assert threads.metadata["visibility"] == "private"
+        return
+    assert "run_create" in captured
+    assert threads.metadata["owner_type"] == "system"
+    assert threads.metadata["visibility"] == "public"
+    assert threads.metadata["trigger_kind"] == "slack_bot"
+    assert threads.metadata["triggering_bot"] == "T123:B123"
+
+
+async def test_a_bots_first_turn_on_an_mda_placeholder_keeps_its_slack_context(
+    monkeypatch, bot_run
+):
+    request, threads, captured = bot_run
+    threads.metadata = {
+        "visibility": "private",
+        webhook_common.PROVISIONAL_VISIBILITY_KEY: True,
+        "source": "slack",
+    }
+    earlier = {"ts": "1700000000.000100", "user": "U999", "text": "Deploy failed on staging"}
+    monkeypatch.setattr(
+        webhook_common, "fetch_slack_thread_messages", AsyncMock(return_value=[earlier])
+    )
+    await slack_webhooks._process_slack_mention_impl(request, None)
+    assert "Deploy failed on staging" in str(captured["run_create"]["kwargs"]["input"])
+
+
+@pytest.mark.parametrize("race", ["before-upsert", "during-create"])
+async def test_bot_cannot_take_over_a_concurrently_created_thread(monkeypatch, bot_run, race):
+    request, threads, captured = bot_run
+    human = {"owner_type": "user", "owner_login": "alice", "visibility": "public"}
+    if race == "before-upsert":
+        upsert = webhook_common.upsert_agent_thread_metadata
+
+        async def competing_upsert(*args, **kwargs):
+            threads.metadata = dict(human)
+            return await upsert(*args, **kwargs)
+
+        monkeypatch.setattr(webhook_common, "upsert_agent_thread_metadata", competing_upsert)
+    else:
+
+        async def competing_create(**kwargs):
+            threads.metadata = dict(human)
+
+        monkeypatch.setattr(threads, "create", competing_create)
+    with pytest.raises(RuntimeError, match="authorization metadata"):
+        await slack_webhooks._process_slack_mention_impl(request, None)
+    assert "run_create" not in captured
+    assert threads.metadata == human
+
+
+def _context_input(messages: list[dict], **kwargs: object) -> list[str]:
+    run_input = slack_webhooks._slack_context_input(
+        messages,
+        cast(dict, kwargs.get("user_names_by_id", {"U123": "Alice", "UBOT": "Open SWE"})),
+        cast(dict, kwargs.get("logins_by_user_id", {})),
+        person_ids_by_user_id=cast(dict, kwargs.get("person_ids_by_user_id", {})),
+        channel_names_by_id=cast(dict, kwargs.get("channel_names_by_id", {})),
+        channel={"id": "slack:C123", "platform": "slack"},
+        bot_user_id="UBOT",
+        event_ts="9.0",
+        source_message_ts=cast(str, kwargs.get("source_message_ts", "")),
+        context_channel_id=cast(str, kwargs.get("context_channel_id", "")),
+        request_text="do the thing",
+        request_blocks=[{"type": "text", "text": "do the thing"}],
+        dispatched_timestamps=cast(set, kwargs.get("dispatched_timestamps", set())),
+        run_described_person_ids=cast(set, kwargs.get("run_described_person_ids", set())),
+        explicit_mention=bool(kwargs.get("explicit_mention", False)),
+    )
+    return [cast(str, message["content"]) for message in run_input["messages"]]
+
+
+@pytest.mark.parametrize("explicit_mention", [True, False])
+def test_current_slack_message_preserves_ingress_mention(explicit_mention: bool) -> None:
+    contents = _context_input([], explicit_mention=explicit_mention)
+    trigger_blocks = contents[-1]
+    assert isinstance(trigger_blocks, list)
+    trigger = ElementTree.fromstring(trigger_blocks[0]["text"])
+    assert trigger.get("explicit_bot_mention") == str(explicit_mention).lower()
+    assert (trigger.text or "").strip() == "do the thing"
+
+
+@pytest.mark.parametrize("source_message_ts", ["", "1.000001"])
+def test_trigger_permalink_uses_only_source_post_timestamp(source_message_ts: str) -> None:
+    contents = _context_input([], source_message_ts=source_message_ts)
+    trigger = ElementTree.fromstring(contents[-1][0]["text"])
+    assert trigger.get("timestamp") == "9.0"
+    assert trigger.get("slack_message_ts") == (source_message_ts or None)
+
+
+@pytest.mark.parametrize("context_channel_id", ["C123", "COTHER"])
+def test_cross_channel_context_does_not_link_source_timestamps_to_destination(
+    context_channel_id: str,
+) -> None:
+    contents = _context_input(
+        [{"ts": "1.000001", "user": "U123", "text": "Earlier message"}],
+        source_message_ts="2.000002",
+        context_channel_id=context_channel_id,
+    )
+    envelopes = [
+        ElementTree.fromstring(content if isinstance(content, str) else content[0]["text"])
+        for content in contents
+        if isinstance(content, list) or content.startswith("<input-message")
+    ]
+    assert [envelope.get("slack_message_ts") for envelope in envelopes] == (
+        ["1.000001", "2.000002"] if context_channel_id == "C123" else [None, None]
+    )
+
+
+@pytest.mark.parametrize("surface", ["human", "bot", "web"])
+def test_only_direct_human_slack_input_carries_voice_origin(surface: str) -> None:
+    origin = SlackMessageOrigin(
+        channel_id="C123", thread_ts="1.0", message_ts="9.0", user_id="U123"
+    )
+    run_input = slack_webhooks._slack_context_input(
+        [{"ts": "2.0", "user": "U456", "text": "historical recording"}],
+        {"U123": "Alice", "U456": "Bob"},
+        {},
+        channel={"id": "slack:C123", "platform": "slack", "thread_id": "1.0"},
+        bot_user_id="UBOT",
+        event_ts="10.0",
+        trigger_user_id="U123",
+        request_text="voice",
+        request_blocks=[{"type": "text", "text": "voice"}],
+        message_origin=origin,
+        web_only=surface == "web",
+        trigger_system={"id": "system:bot", "display_name": "Bot"} if surface == "bot" else None,
+    )
+    delivered = messages_from_dict(messages_to_dict(convert_to_messages(run_input["messages"])))
+    origins = [
+        m.additional_kwargs[SlackMessageOrigin.KEY]
+        for m in delivered
+        if SlackMessageOrigin.KEY in m.additional_kwargs
+    ]
+    assert origins == ([origin.model_dump(exclude_defaults=True)] if surface == "human" else [])
+    assert all(SlackMessageOrigin.KEY not in m.additional_kwargs for m in delivered[:-1])
+    # The origin joins the request's recorded provenance rather than replacing it.
+    provenance = Provenance.model_validate(delivered[-1].additional_kwargs[PROVENANCE_KEY])
+    assert provenance.kind == ("system" if surface == "bot" else "human")
+
+
+def test_multiline_trigger_appends_only_forwarded_context() -> None:
+    contents = _context_input(
+        [
+            {
+                "ts": "9.0",
+                "text": "<@UBOT> do\nthe thing",
+                "user": "U123",
+                "attachments": [{"is_share": True, "author_name": "Bob", "text": "details"}],
+            }
+        ]
+    )
+    trigger_blocks = contents[-1]
+    assert isinstance(trigger_blocks, list)
+    trigger = ElementTree.fromstring(trigger_blocks[0]["text"])
+    assert (trigger.text or "").strip() == (
+        "do the thing\n[Forwarded Slack message from Bob]\ndetails"
+    )
+
+
+def test_replayed_slack_mentions_ignore_forwarded_tags() -> None:
+    contents = _context_input(
+        [
+            {"ts": "1.0", "user": "U123", "text": "<@UBOT> could this stack?"},
+            {
+                "ts": "2.0",
+                "user": "U123",
+                "text": "interesting",
+                "attachments": [{"is_share": True, "text": "<@UBOT> fix this"}],
+            },
+        ]
+    )
+    replayed = [
+        ElementTree.fromstring(content)
+        for content in contents
+        if isinstance(content, str) and content.startswith("<input-message")
+    ]
+    assert [message.get("explicit_bot_mention") for message in replayed] == ["true", "false"]
+    assert "could this stack?" in (replayed[0].text or "")
+
+
+@pytest.mark.parametrize(
+    ("held", "expected"),
+    [
+        # The thread holds the earlier ask, not the /btw that went to a thread of its own.
+        ({"1.0", "2.0"}, ["2.0", "3.0", "3.1", "4.0"]),
+        # A new thread holds nothing and reads the Slack thread from its start.
+        (set(), ["1.0", "2.0", "3.0", "3.1", "4.0"]),
+    ],
+)
+def test_context_starts_at_the_last_mention_the_thread_holds(
+    held: set[str], expected: list[str]
+) -> None:
+    messages: list[dict[str, Any]] = [
+        {"ts": "1.0", "text": "first", "user": "U1"},
+        {"ts": "2.0", "text": "<@UBOT> earlier ask", "user": "U1"},
+        {"ts": "3.0", "text": "<@UBOT> /btw how does routing work?", "user": "U2"},
+        {"ts": "3.1", "text": "It goes by channel.", "user": "UBOT", "bot_id": "B1"},
+        {"ts": "4.0", "text": "<@UBOT> now", "user": "U1"},
+    ]
+    selected, _ = webhook_common.select_slack_context_messages(
+        messages, "4.0", "UBOT", held_timestamps=held
+    )
+    assert [message["ts"] for message in selected] == expected
+
+
+def test_replay_shows_a_command_with_the_notice_that_answered_it() -> None:
+    notice = {"type": "context", "block_id": "open_swe_notice.breakout.abc", "elements": []}
+    contents = _context_input(
+        [
+            {"ts": "1.0", "user": "U123", "text": "<@UBOT> /breakout replace baby-sit"},
+            {
+                "ts": "1.1",
+                "user": "UBOT",
+                "bot_id": "B1",
+                "text": "Continued in <https://slack/p2|the breakout thread>.",
+                "blocks": [notice],
+            },
+            {"ts": "1.2", "user": "UBOT", "bot_id": "B1", "text": "on it"},
+        ],
+        user_names_by_id={"U123": "Alice", "UBOT": "Robin"},
+    )
+    replayed = [
+        ElementTree.fromstring(content)
+        for content in contents
+        if isinstance(content, str) and content.startswith("<input-message")
+    ]
+    assert [(m.get("sender"), (m.text or "").strip()) for m in replayed] == [
+        ("slack:U123", "<@UBOT|Robin> /breakout replace baby-sit"),
+        ("system:slack-notice", "Continued in <https://slack/p2|the breakout thread>."),
+    ]
+
+
+def test_slack_context_labels_mentioned_people_with_their_names() -> None:
+    contents = _context_input(
+        [
+            {"ts": "1.0", "text": "cc <@U456> and <@U000> for viz", "user": "U123"},
+            {"ts": "9.0", "text": "<@UBOT> go", "user": "U123"},
+        ],
+        user_names_by_id={"U123": "Alice", "U456": "Bob <B>"},
+    )
+
+    assert "cc &lt;@U456|Bob &amp;lt;B&amp;gt;&gt; and &lt;@U000&gt; for viz" in str(contents)
+
+
+def test_slack_context_names_unnamed_channel_mentions() -> None:
+    contents = _context_input(
+        [
+            {"ts": "1.0", "text": "see <#C456|>, <#C789|old-name>, <#C000>", "user": "U123"},
+            {"ts": "9.0", "text": "<@UBOT> go", "user": "U123"},
+        ],
+        channel_names_by_id={"C456": "eng", "C789": "new-name"},
+    )
+
+    assert "see &lt;#C456|eng&gt;, &lt;#C789|old-name&gt;, &lt;#C000&gt;" in str(contents)
+
+
+def test_breakout_preceding_text_is_prior_message_not_part_of_request() -> None:
+    run_input = slack_webhooks._slack_context_input(
+        [
+            {
+                "ts": "9.0",
+                "text": "Context for this task.\nMore details <@UBOT> /breakout fix it",
+                "user": "U123",
+                "attachments": [
+                    {
+                        "is_share": True,
+                        "author_name": "Bob",
+                        "text": "Forwarded details",
+                    }
+                ],
+            }
+        ],
+        {"U123": "Alice"},
+        {},
+        channel={"id": "slack:C123", "platform": "slack"},
+        bot_user_id="UBOT",
+        event_ts="9.0",
+        trigger_user_id="U123",
+        request_text="fix it",
+        request_blocks=[{"type": "text", "text": "fix it"}],
+        prior_message_text="Context for this task.\nMore details",
+    )
+    inputs = [
+        message["content"]
+        for message in run_input["messages"]
+        if message["role"] == "user" and 'kind="human"' in str(message["content"])
+    ]
+
+    assert len(inputs) == 2
+    assert "Context for this task.\nMore details" in inputs[0]
+    assert "/breakout" not in inputs[0]
+    assert "fix it" in inputs[1][0]["text"]
+    assert "[Forwarded Slack message from Bob]" in inputs[1][0]["text"]
+    assert "Forwarded details" in inputs[1][0]["text"]
+    assert "More details" not in inputs[1][0]["text"]
+    assert "/breakout" not in inputs[1][0]["text"]
+
+
+def test_background_event_is_not_attributed_to_the_person_it_acts_for() -> None:
+    run_input = slack_webhooks._slack_context_input(
+        [],
+        {"U123": "Mukil"},
+        {},
+        channel={"id": "slack:C123", "platform": "slack"},
+        bot_user_id="UBOT",
+        event_ts="9.0",
+        trigger_user_id="U123",
+        request_text="Pick a reviewer",
+        request_blocks=[{"type": "text", "text": "Pick a reviewer"}],
+        trigger_system={"id": "system:background-event", "display_name": "Open SWE"},
+    )
+    request = str(run_input["messages"][-1]["content"])
+
+    assert 'kind="system"' in request
+    assert "system:background-event" in request
+    assert "slack:U123" not in request
+
+
+def test_slack_context_never_replays_open_swes_own_replies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The model wrote them and already holds them; replaying shows it its own words twice.
+
+    Open SWE posts with a bot token, so its replies carry `user` *and* `bot_id`;
+    keying off `user` alone attributes them to a person instead.
+    """
+    monkeypatch.setattr(webhook_common, "SLACK_BOT_USERNAME", "Open SWE")
+    contents = _context_input(
+        [
+            {"ts": "1.0", "text": "please fix it", "user": "U123"},
+            {"ts": "1.1", "text": "on it", "user": "UBOT", "bot_id": "B1"},
+            {"ts": "9.0", "text": "<@UBOT> do the thing", "user": "U123"},
+        ]
+    )
+
+    assert not any("on it" in text for text in contents)
+    assert not any("system:open-swe" in text for text in contents)
+    assert not any('sender="slack:UBOT"' in text for text in contents)
+    assert any("please fix it" in text for text in contents)
+
+
+def test_slack_context_does_not_treat_a_lookalike_bot_as_open_swe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A third-party app may post under our own username; only the user id proves identity."""
+    monkeypatch.setattr(webhook_common, "SLACK_BOT_USERNAME", "Open SWE")
+    contents = _context_input(
+        [
+            {
+                "ts": "1.0",
+                "text": "impersonating",
+                "bot_id": "B9",
+                "username": "Open SWE",
+                "bot_profile": {"name": "Open SWE"},
+            },
+            {"ts": "9.0", "text": "<@UBOT> do the thing", "user": "U123"},
+        ]
+    )
+
+    # Rendered as an ordinary bot, so the transcript still shows it.
+    lookalike = next(text for text in contents if "impersonating" in text)
+    assert 'sender="system:slack-bot-B9"' in lookalike
+    assert 'sender="system:open-swe"' not in lookalike
+    intro = next(text for text in contents if 'id="system:slack-bot-B9"' in text)
+    assert "sender_type: bot" in intro
+
+
+def test_queued_slack_edit_names_people_and_public_channels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    _setup_slack_mention_fakes(monkeypatch, captured)
+    channels = {
+        "C9": SlackChannel(
+            id="C9",
+            name="eng",
+            payload={
+                "id": "C9",
+                "name": "eng",
+                "is_channel": True,
+                "is_private": False,
+                "is_ext_shared": False,
+                "is_pending_ext_shared": False,
+            },
+        ),
+        "C8": SlackChannel(
+            id="C8",
+            name="secret",
+            payload={"id": "C8", "name": "secret", "is_channel": True, "is_private": True},
+        ),
+    }
+
+    async def fake_thread_exists(thread_id: str) -> bool:
+        return True
+
+    async def fake_queue_message_for_thread(thread_id: str, content: object) -> bool:
+        captured["queued"] = content
+        return True
+
+    async def fake_load(channel_id: str) -> SlackChannel | None:
+        return channels.get(channel_id)
+
+    monkeypatch.setattr(webhook_common, "thread_exists", fake_thread_exists)
+    monkeypatch.setattr(slack_webhooks, "queue_message_for_thread", fake_queue_message_for_thread)
+    monkeypatch.setattr(slack_webhooks.SlackChannel, "load", fake_load)
+
+    asyncio.run(
+        slack_webhooks.process_slack_mention(
+            SlackRequest.model_validate(
+                {
+                    "channel_id": "C123",
+                    "thread_ts": "1700000000.000100",
+                    "event_ts": "1700000000.000300",
+                    "original_message_ts": "1700000000.000100",
+                    "source_message_ts": "1700000000.000100",
+                    "user_id": "U123",
+                    "text": "<@UBOT> ask <@U456> in <#C9|> not <#C8|>",
+                    "bot_user_id": "UBOT",
+                    "message_update": True,
+                    "attachments": [{"is_share": True, "text": "cc <@U777> in <#C9>"}],
+                }
+            ),
+            webhook_common.SlackRepoResolution(
+                Repo(owner="langchain-ai", name="open-swe"), explicit=True
+            ),
+        )
+    )
+
+    queued = captured["queued"]
+    assert isinstance(queued, dict)
+    delivered = convert_to_messages([queued])[0]
+    assert Provenance.model_validate(delivered.additional_kwargs[PROVENANCE_KEY]).human
+    assert delivered.additional_kwargs[SlackMessageOrigin.KEY] == {
+        "channel_id": "C123",
+        "thread_ts": "1700000000.000100",
+        "message_ts": "1700000000.000100",
+        "user_id": "U123",
+    }
+    blocks = queued["content"]
+    assert isinstance(blocks, list)
+    envelope = ElementTree.fromstring(blocks[-1]["text"])
+    assert envelope.get("slack_message_ts") == "1700000000.000100"
+    text = envelope.text or ""
+    assert "ask <@U456|Teammate> in <#C9|eng> not <#C8|>" in text
+    assert "U777" in cast(list, captured["user_ids"])
+
+
+def test_process_slack_mention_runs_an_edit_when_queueing_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A store outage must not swallow the correction outright."""
+    captured: dict[str, object] = {}
+    _setup_slack_mention_fakes(monkeypatch, captured)
+
+    async def fake_thread_exists(thread_id: str) -> bool:
+        return True
+
+    async def fake_queue_message_for_thread(thread_id: str, content: object) -> bool:
+        return False
+
+    monkeypatch.setattr(webhook_common, "thread_exists", fake_thread_exists)
+    monkeypatch.setattr(slack_webhooks, "queue_message_for_thread", fake_queue_message_for_thread)
+
+    asyncio.run(
+        slack_webhooks.process_slack_mention(
+            SlackRequest.model_validate(
+                {
+                    "channel_id": "C123",
+                    "thread_ts": "1700000000.000100",
+                    "event_ts": "1700000000.000300",
+                    "user_id": "U123",
+                    "text": "<@UBOT> actually use PR 5889",
+                    "bot_user_id": "UBOT",
+                    "message_update": True,
+                }
+            ),
+            webhook_common.SlackRepoResolution(
+                Repo(owner="langchain-ai", name="open-swe"), explicit=True
+            ),
+        )
+    )
+
+    run_create = captured["run_create"]
+    assert isinstance(run_create, dict)
+    assert run_create["kwargs"]["multitask_strategy"] == "enqueue"
+
+
+def test_slack_footer_shows_neither_model_nor_cost() -> None:
+    url = "https://app.example/agents/t1"
+    usage = RunUsageSummary(models=("model-a",), total_tokens=123, session_cost_usd=0.42)
+    footer = f"<{url}|Open in Robin>"
+    blocks = slack_utils._with_slack_web_link_context_block(
+        "Done", [{"type": "section", "text": {"type": "mrkdwn", "text": "Done"}}], url, usage
+    )
+    text = slack_utils.append_slack_web_link_footer("Done", url, usage)
+
+    assert slack_utils.format_slack_run_usage(usage) == ""
+    assert text == f"Done {footer}"
+    assert blocks is not None
+    assert blocks[-1]["elements"][0]["text"] == footer
+
+
+@pytest.mark.parametrize("first_message", [True, False])
+@pytest.mark.parametrize(
+    "text,concierge,switches",
+    [
+        ("<@UBOT> /model:perf please continue", False, True),
+        ("<@UBOT> `/model:perf` please continue", False, False),
+        ("<@UBOT> please continue /model:perf", False, True),
+        ("<@UBOT> /model:perf please continue", True, False),
+    ],
+)
+async def test_performance_directive_switches_unless_quoted(
+    monkeypatch: pytest.MonkeyPatch,
+    registry_db,
+    first_message: bool,
+    text: str,
+    concierge: bool,
+    switches: bool,
+) -> None:
+    captured: dict[str, object] = {}
+    _setup_slack_mention_fakes(monkeypatch, captured)
+    monkeypatch.setattr(webhook_common, "thread_exists", AsyncMock(return_value=not first_message))
+    monkeypatch.setattr(webhook_common, "get_thread_model_choice", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        slack_webhooks,
+        "load_thread_settings",
+        AsyncMock(
+            return_value={
+                "routing_models": {
+                    "performance": {"model_id": "openai:gpt-6.2-astra", "effort": "low"}
+                }
+            }
+        ),
+    )
+    feedback = AsyncMock(return_value=True)
+    monkeypatch.setattr(slack_webhooks, "create_langsmith_feedback", feedback)
+    notice = AsyncMock(return_value=True)
+    monkeypatch.setattr(slack_utils, "post_slack_ephemeral_message", notice)
+    receipt = AsyncMock(return_value=True)
+    monkeypatch.setattr(slack_utils, "add_slack_reaction", receipt)
+    dispatch = AsyncMock(return_value={"run_id": "run-perf"})
+    monkeypatch.setattr(slack_webhooks, "_dispatch_or_queue_slack_run", dispatch)
+    await slack_webhooks.process_slack_mention(
+        SlackRequest(
+            channel_id="C123",
+            thread_ts="1700000000.000100",
+            event_ts="1700000000.000100" if first_message else "1700000000.000200",
+            thread_id="mapped-thread",
+            user_id="U123",
+            text=text,
+            bot_user_id="UBOT",
+            concierge_mode=concierge,
+            original_message_ts="1700000000.000100" if concierge else "",
+        ),
+        repo=None,
+    )
+    if concierge:
+        receipt.assert_awaited_once_with(
+            "C123",
+            "1700000000.000100",
+            "hourglass_flowing_sand",
+        )
+    else:
+        receipt.assert_not_awaited()
+    assert dispatch.call_args.kwargs["concierge_message_ts"] == (
+        "1700000000.000100" if concierge else ""
+    )
+    configurable = dispatch.call_args.args[3]
+    # Only the command is a person's pick, never the model the thread already runs.
+    assert configurable.get("model_selection_changed", False) is switches
+    if not switches:
+        assert "agent_model_id" not in configurable
+        notice.assert_not_awaited()
+        feedback.assert_not_awaited()
+    else:
+        assert feedback.call_args.args == ("run-perf", "performance_model_switch_slack")
+        assert configurable["agent_model_id"] == "openai:gpt-6.2-astra"
+        assert configurable["model_selection"] == "explicit"
+        assert notice.call_args.args[:2] == ("C123", "U123")
+        # Slack never names the model.
+        assert notice.call_args.args[2] == "Switched to the performance model."
+        assert notice.call_args.kwargs["thread_ts"] == "1700000000.000100"

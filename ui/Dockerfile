@@ -1,0 +1,44 @@
+# Build from the repo root: docker build -f ui/Dockerfile .
+#
+# The backend this dashboard fronts is read from DASHBOARD_API_URL at runtime, so
+# one image serves any deployment. Set it in the deployment's environment.
+FROM node:26-alpine AS build
+
+RUN npm install --global pnpm@11.22.0
+WORKDIR /app
+
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml turbo.json ./
+COPY ui/package.json ui/package.json
+COPY plugins/sdk/package.json plugins/sdk/package.json
+COPY ui/patches ui/patches
+COPY desktop/patches desktop/patches
+RUN pnpm install --frozen-lockfile --filter open-swe-dashboard...
+
+COPY ui ui
+COPY plugins/sdk plugins/sdk
+
+# The build has no .git to read its commit from, so the bundle's build info takes it
+# from SOURCE_COMMIT, or from GIT_SHA where an image builder passes that instead.
+ARG SOURCE_COMMIT=
+ARG GIT_SHA=
+# Datadog RUM is baked in at build time (src/lib/datadog.ts) and stays off when these are
+# empty, as in a plain `docker build`. The open-swe-dashboard bake target sets them; the RUM
+# env tag comes from the backend at runtime, so one image serves every deployment.
+ARG VITE_DATADOG_APPLICATION_ID=
+ARG VITE_DATADOG_CLIENT_TOKEN=
+RUN SOURCE_COMMIT="${SOURCE_COMMIT:-$GIT_SHA}" \
+    VITE_DATADOG_VERSION="${SOURCE_COMMIT:-$GIT_SHA}" \
+    pnpm --config.verify-deps-before-run=false --filter open-swe-dashboard run build
+
+FROM node:26-alpine
+
+WORKDIR /app
+COPY --from=build /app/ui/.output ./.output
+
+ENV NODE_ENV=production \
+    HOST=0.0.0.0 \
+    PORT=8080
+
+USER node
+EXPOSE 8080
+CMD ["node", ".output/server/index.mjs"]

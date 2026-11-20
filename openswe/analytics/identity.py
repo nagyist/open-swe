@@ -1,0 +1,19 @@
+"""Deployment-scoped opaque analytics identities."""
+
+from typing import Literal
+from uuid import UUID
+
+from openswe.analytics.events import person_uuid, subject_uuid
+from openswe.database.analytics import workspace_id
+
+DisplayNameSource = Literal["github", "slack"]
+
+
+def opaque_id(kind: str, value: str | int | None) -> UUID | None:
+    normalized = str(value or "").strip()
+    return subject_uuid(workspace_id(), kind, normalized) if normalized else None
+
+
+def opaque_person(provider: str, immutable_id: str | int | None) -> UUID | None:
+    normalized = str(immutable_id or "").strip().lower()
+    return person_uuid(workspace_id(), provider, normalized) if normalized else None

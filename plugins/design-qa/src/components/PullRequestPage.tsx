@@ -1,0 +1,301 @@
+import { Button } from "@langchain/macaw-components/Button"
+import { Card } from "@langchain/macaw-components/Card"
+import { Link } from "@langchain/macaw-components/Link"
+import { Select } from "@langchain/macaw-components/Select"
+import type { JsonObject, PullRequest } from "@openswe/plugin-sdk"
+import { usePluginHost } from "@openswe/plugin-sdk/react"
+import { ArrowLeftIcon } from "@phosphor-icons/react/dist/ssr/ArrowLeft"
+import { ArrowSquareOutIcon } from "@phosphor-icons/react/dist/ssr/ArrowSquareOut"
+import { GithubLogoIcon } from "@phosphor-icons/react/dist/ssr/GithubLogo"
+import { useEffect, useState, type MouseEvent } from "react"
+
+import type {
+  FrontendReviewRun,
+  FrontendScenario,
+  ShotTheme,
+} from "../lib/capture"
+import {
+  chatName,
+  clip,
+  MAX_LABEL,
+  pullRequestContext,
+  scenarioContext,
+} from "../lib/ask"
+import {
+  pullRequestLabel,
+  pullRequestUrl,
+  repositoryOf,
+  type PullRequestRef,
+} from "../lib/pullRequest"
+import {
+  errorMessage,
+  isForbidden,
+  useCaptureChanges,
+  usePeople,
+  useRun,
+  useRuns,
+  useTitle,
+} from "../lib/queries"
+import { useRouter } from "../lib/router"
+import { Usage } from "../lib/usage"
+import { ReportView } from "./ReportView"
+import { Author } from "./Author"
+import { CaptureAction } from "./CaptureAction"
+import { PinButton } from "./PinButton"
+import { RobinIcon } from "./RobinIcon"
+import { ShareRepositories } from "./ShareRepositories"
+import { UpdateBanner } from "./UpdateBanner"
+
+/** One pull request's saved Design QA runs. */
+export function PullRequestPage({
+  pr,
+  runId,
+}: {
+  pr: PullRequestRef
+  runId: string | null
+}) {
+  const host = usePluginHost()
+  const { inbox, navigate } = useRouter()
+  const label = pullRequestLabel(pr)
+  useTitle(clip(label, MAX_LABEL))
+  const runs = useRuns(pr)
+  useCaptureChanges(pr)
+  useEffect(() => Usage.record(host, "pull_opened"), [host])
+  const current = runs.data?.pull
+  const selectedId = runId ?? runs.data?.runs[0]?.id
+  const detail = useRun(pr, selectedId)
+  const run = detail.data
+  // The scenario last asked about, kept in the shared context until the person
+  // asks about another or opens another run.
+  const [asked, setAsked] = useState<{
+    run: string
+    scenario: string
+    theme: ShotTheme
+  } | null>(null)
+  const askedScenario =
+    run && asked?.run === run.id
+      ? run.report?.scenarios.find(({ id }) => id === asked.scenario)
+      : undefined
+  usePullRequestChat(pr, run, current, askedScenario, asked?.theme ?? "light")
+  const author = current?.author ?? null
+  const people = usePeople([author])
+  const empty = runs.isSuccess && !selectedId
+  const title = current?.title ?? `Pull request #${pr.number}`
+  const github = pullRequestUrl(pr)
+  const openGitHub = (event: MouseEvent) => {
+    if (event.type === "auxclick" && event.button !== 1) return
+    event.preventDefault()
+    Usage.record(host, "github_opened")
+    void host.nav.openExternal(github)
+  }
+  const openReview = () => {
+    Usage.record(host, "robin_view_opened")
+    return host.nav
+      .openReview(repositoryOf(pr), pr.number)
+      .catch((error: unknown) =>
+        host.ui.toast({
+          title: "Could not open Robin's PR view",
+          description: errorMessage(error),
+          intent: "error",
+        })
+      )
+  }
+  const options = (runs.data?.runs ?? []).map(runOption)
+  if (run && !options.some((option) => option.value === run.id))
+    options.push(runOption(run))
+
+  return (
+    <main className="mx-auto flex w-full max-w-[1500px] flex-col gap-space-5 p-space-5 max-sm:p-space-3">
+      <UpdateBanner />
+      <header className="flex flex-col gap-space-3">
+        <Button
+          size="sm"
+          color="secondary"
+          variant="plain"
+          className="self-start"
+          leftDecorator={ArrowLeftIcon}
+          onClick={() => navigate(inbox)}
+        >
+          Design QA
+        </Button>
+        <div className="flex flex-wrap items-end justify-between gap-space-3">
+          <div className="min-w-0">
+            <div className="flex min-w-0 flex-wrap items-center gap-x-space-2 gap-y-space-1 text-xs text-secondary">
+              <span>
+                {label}
+                {current?.draft ? " · Draft" : ""}
+              </span>
+              {author && (
+                <>
+                  <span aria-hidden="true">·</span>
+                  <Author
+                    login={author}
+                    person={people.get(author.toLowerCase())}
+                  />
+                </>
+              )}
+            </div>
+            <h1 className="text-xl font-semibold tracking-tight text-primary">
+              <a
+                href={github}
+                target="_blank"
+                rel="noreferrer"
+                title="Open on GitHub"
+                className="rounded-sm underline-offset-4 outline-none hover:underline focus-visible:ring-2 focus-visible:ring-focus"
+                onClick={openGitHub}
+                onAuxClick={openGitHub}
+              >
+                {title}
+              </a>
+            </h1>
+          </div>
+          <div className="flex flex-wrap items-center gap-space-3">
+            <PinButton pr={pr} title={title} />
+            <Link
+              as={
+                <button
+                  type="button"
+                  className="rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-focus"
+                />
+              }
+              variant="sm"
+              leftDecorator={RobinIcon}
+              rightDecorator={ArrowSquareOutIcon}
+              aria-label="Open Robin PR view in a new tab"
+              onClick={() => void openReview()}
+            >
+              Robin PR view
+            </Link>
+            <Link
+              href={github}
+              target="_blank"
+              rel="noreferrer"
+              variant="sm"
+              leftDecorator={GithubLogoIcon}
+              rightDecorator={ArrowSquareOutIcon}
+              aria-label="Open on GitHub in a new tab"
+              onClick={openGitHub}
+              onAuxClick={openGitHub}
+            >
+              GitHub
+            </Link>
+          </div>
+        </div>
+      </header>
+      {isForbidden(runs.error) || isForbidden(detail.error) ? (
+        <ShareRepositories repository={repositoryOf(pr)} />
+      ) : runs.isError ? (
+        <ErrorCard message={errorMessage(runs.error)} />
+      ) : detail.isError ? (
+        <ErrorCard message={errorMessage(detail.error)} />
+      ) : (
+        <>
+          {runs.isPending && (
+            <p role="status" className="text-sm text-secondary">
+              Loading Design QA reviews…
+            </p>
+          )}
+          {runs.isSuccess && (
+            <CaptureAction
+              pr={pr}
+              outcome={runs.data.outcome}
+              currentHeadSha={current?.headSha}
+              hasCapture={runs.data.runs.length > 0}
+              disabled={current?.state !== "open"}
+            />
+          )}
+          {empty && (
+            <Card role="status" className="p-space-4 text-sm text-secondary">
+              No saved comparisons. Capture checks the deployed preview and the
+              configured base site, then saves matching screenshots here.
+            </Card>
+          )}
+          {options.length > 1 && (
+            <label className="flex items-center gap-space-3 text-xs text-secondary">
+              Review run
+              <Select
+                aria-label="Review run"
+                size="md"
+                triggerClassName="w-auto min-w-0 max-w-full"
+                value={selectedId}
+                onChange={(id) => {
+                  if (id) navigate({ page: "pull", pr, run: id })
+                }}
+                options={options}
+              />
+            </label>
+          )}
+          {selectedId && detail.isPending && (
+            <p role="status" className="text-sm text-secondary">
+              Loading review evidence…
+            </p>
+          )}
+          {run && (
+            <ReportView
+              key={run.id}
+              pr={pr}
+              run={run}
+              currentHeadSha={current?.headSha}
+              onAsk={(scenario, shots) =>
+                setAsked({
+                  run: run.id,
+                  scenario: scenario.id,
+                  theme: shots.theme,
+                })
+              }
+            />
+          )}
+        </>
+      )}
+    </main>
+  )
+}
+
+const runOption = (run: FrontendReviewRun) => ({
+  value: run.id,
+  label: `${new Date(run.created_at).toLocaleString()} · ${run.status} · ${run.head_sha.slice(0, 7)}`,
+})
+
+/**
+ * Once a run is readable, points the agent dock at this pull request's chat
+ * and tells the agent which run, and which scenario of it the person asked
+ * about, they have open with each message they send from it.
+ */
+function usePullRequestChat(
+  pr: PullRequestRef,
+  run: FrontendReviewRun | undefined,
+  current: PullRequest | null | undefined,
+  asked: FrontendScenario | undefined,
+  theme: ShotTheme
+) {
+  const host = usePluginHost()
+  const name = chatName(pr)
+  const repository = repositoryOf(pr)
+  const known = { title: current?.title, headSha: current?.headSha }
+  const label = clip(
+    asked
+      ? `${pullRequestLabel(pr)} · ${asked.title}${theme === "dark" ? " · Dark" : ""}`
+      : pullRequestLabel(pr),
+    MAX_LABEL
+  )
+  const context = run
+    ? JSON.stringify(
+        asked
+          ? scenarioContext(pr, run, asked, known, theme)
+          : pullRequestContext(pr, run, known)
+      )
+    : null
+  useEffect(() => {
+    if (!context) return
+    void host.agent.use({ name, repository })
+    void host.agent.share(JSON.parse(context) as JsonObject, { label })
+  }, [host, name, repository, context, label])
+}
+
+function ErrorCard({ message }: { message: string }) {
+  return (
+    <Card role="alert" className="p-space-4 text-sm text-error-secondary">
+      Could not load Design QA: {message}.
+    </Card>
+  )
+}

@@ -1,0 +1,22 @@
+{
+  "name": "open-swe-cli",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Robin command-line client: starts a cloud thread and waits for it",
+  "type": "module",
+  "scripts": {
+    "build": "bun run compile --outfile dist/robin && cp dist/robin dist/oswe",
+    "compile": "bun build --compile --minify --no-compile-autoload-dotenv src/main.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "bun test",
+    "check": "bun run typecheck && bun run test"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.2",
+    "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "open-swe-bridge-client": "workspace:*",
+    "zod": "^4.6.7"
+  }
+}

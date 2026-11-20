@@ -1,0 +1,1009 @@
+import { useRightPanelStore } from "@/features/agents/lib/rightPanelStore"
+import { productAnalytics } from "@/lib/analytics"
+import { CopyErrorButton } from "@/components/CopyErrorButton"
+import {
+  ReviewChatActionsContext,
+  ReviewExcerptChips,
+} from "@/features/reviews/components/ReviewChatActions"
+import { serializeExcerpts } from "@/features/agents/utils/codeExcerpt"
+import type { PassageReply } from "@/features/agents/utils/passageReply"
+import { EmbeddedThreadContext } from "@/features/agents/lib/embeddedThread"
+import {
+  Profiler,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react"
+import { Banner } from "@langchain/macaw-components/Banner"
+import { Button } from "@langchain/macaw-components/Button"
+import { Text } from "@langchain/macaw-components/Text"
+import { ConversationLoading } from "@/features/agents/components/ConversationLoading"
+import { LoadError, useLoadTimedOut } from "@/components/LoadError"
+
+import type {
+  AgentPullRequest,
+  AgentThread,
+  ComposerDraft,
+  ImageChunk,
+  Message,
+  ThreadFixScope,
+} from "@/features/agents/lib/types"
+import type { ModelSelection } from "@/features/agents/lib/provider/useModelOptions"
+import { AgentGitPanel } from "@/features/agents/components/AgentGitPanel"
+import { AgentThreadHeader } from "@/features/agents/components/AgentThreadHeader"
+import { LocalAccessGrantBanner } from "@/features/agents/components/LocalAccessGrantBanner"
+import { LocalAccessRequests } from "@/features/agents/components/LocalAccessRequests"
+import { SIBLING_COLUMN_MIN_WIDTH } from "@/features/agents/components/panel/RightPanelShell"
+import { AgentPromptBar } from "@/features/agents/components/AgentPromptBar"
+import { AgentComposerDock } from "@/features/agents/components/composer/AgentComposerDock"
+import { PullRequestPreviewProvider } from "@/features/agents/components/PullRequestPreview"
+import { ThreadPullRequests } from "@/features/agents/components/ThreadPullRequests"
+import {
+  readStoredPanelCollapsed,
+  writeStoredPanelCollapsed,
+} from "@/features/agents/lib/gitPanelPreferences"
+import { Messages } from "@/features/agents/components/messages"
+import { resolveContextModel } from "@/features/agents/lib/contextUsage"
+import type {
+  LoadEarlier,
+  MessagesScrollControl,
+} from "@/features/agents/components/messages"
+import { useSubmitAgentMessage } from "@/features/agents/lib/provider/useSubmitAgentMessage"
+import { useModelOptions } from "@/features/agents/lib/provider/useModelOptions"
+import { createSelectionIntent } from "@/features/agents/lib/selectionIntent"
+import {
+  agentThreadKeys,
+  useAgentSkills,
+  useRenameAgentThread,
+  useAgentThreadPullRequestStatus,
+  useAgentThreadQueuedMessages,
+} from "@/features/agents/lib/queries"
+import { useQueryClient } from "@tanstack/react-query"
+import { toast } from "sonner"
+import {
+  materializeImages,
+  pendingSenderName,
+  visiblePendingMessages,
+} from "@/features/agents/lib/queuedMessages"
+import type { QueuedTurn } from "@/features/agents/lib/transcript/reducer"
+import type {
+  ComposerSubmission,
+  RestoredDraft,
+  SubmitOptions,
+} from "@/features/agents/components/composer/ChatComposer"
+import { agentsApi } from "@/features/agents/lib/api"
+import { reportError } from "@/lib/errorReporting"
+import { useSession } from "@/lib/session"
+import { useIsMobile } from "@/lib/useIsMobile"
+import { useThreadSource } from "@/features/agents/lib/threadSource/ThreadSourceProvider"
+import { useConnectionStatus } from "@/features/agents/lib/stream/useReconnectStatus"
+import { runTranscriptCommitted } from "@/lib/perf/streaming"
+import { ReplyOptionContext } from "@/features/agents/components/chat/ReplyCard"
+import {
+  threadHydrated,
+  threadHydrationFailed,
+  useThreadTranscriptPaint,
+} from "@/lib/perf/threadLoad"
+
+/**
+ * Drafts a page around a thread has already put in its composer. The page keeps
+ * handing over its last draft, so without this every remount of the view (the
+ * dock reopening, a layout change) would put the same draft there again.
+ */
+const appliedComposerDrafts = new WeakSet<ComposerDraft>()
+
+interface AgentThreadViewProps {
+  thread: AgentThread
+  composerDraft?: ComposerDraft
+  retry: () => void
+}
+
+function plainSubmission(text: string): ComposerSubmission {
+  return { text, images: [], replies: [] }
+}
+
+/** Paths the agent has edited this thread, newest last, for `@file` mentions. */
+function editedPaths(messages: Array<Message>): Array<string> {
+  const paths = new Set<string>()
+  for (const message of messages) {
+    for (const chunk of message.chunks) {
+      if (chunk.kind !== "tool-execution" || chunk.toolKind !== "edit") continue
+      const path = chunk.input?.file_path ?? chunk.input?.path
+      if (typeof path === "string" && path) paths.add(path)
+    }
+  }
+  return [...paths]
+}
+
+export function AgentThreadView({
+  thread,
+  composerDraft,
+  retry,
+}: AgentThreadViewProps) {
+  const reviewChat = useContext(ReviewChatActionsContext)
+  const embedded = useContext(EmbeddedThreadContext)
+  const renameThread = useRenameAgentThread()
+  const sendMessage = useSubmitAgentMessage(thread.id)
+  const source = useThreadSource()
+  const isMobile = useIsMobile()
+  const skills = useAgentSkills()
+  const session = useSession()
+  const queryClient = useQueryClient()
+  // A Slack bot's thread is steered from its Slack thread, never from here.
+  const botThread = thread.triggerKind === "slack_bot"
+  const historicalSession = thread.source === "claude_code"
+  const ownsThread = Boolean(
+    thread.ownerLogin &&
+    session.data &&
+    thread.ownerLogin.toLowerCase() === session.data.login.toLowerCase()
+  )
+  const canPost =
+    !botThread &&
+    !historicalSession &&
+    (thread.threadCategory !== "automation" ||
+      thread.automationCanPost === true) &&
+    (!thread.adminThread || session.data?.is_admin === true)
+  // The review page shows its PR's status itself; don't poll it a second time here.
+  const pullRequestStatus = useAgentThreadPullRequestStatus(
+    thread.id,
+    !embedded && (thread.pullRequests?.length ?? 0) > 0
+  )
+  const pullRequestHealth = pullRequestStatus.isError
+    ? undefined
+    : pullRequestStatus.data?.pullRequests
+
+  const {
+    models,
+    defaultSelection,
+    modelSelectionEnabled,
+    isLoading: modelsLoading,
+    isError: modelsError,
+  } = useModelOptions()
+  const threadSelection = useMemo<ModelSelection | null>(() => {
+    if (!thread.model || !thread.effort) return null
+    const supported = models.some(
+      (m) => m.id === thread.model && m.efforts.includes(thread.effort ?? "")
+    )
+    if (!supported) return null
+    return { modelId: thread.model, effort: thread.effort }
+  }, [models, thread.model, thread.effort])
+  const [selection, setSelection] = useState<ModelSelection | null>(null)
+  const [autoSelected, setAutoSelected] = useState(false)
+  const [selectionIntent] = useState(createSelectionIntent)
+  const activeSelection =
+    !modelSelectionEnabled || autoSelected
+      ? null
+      : (selection ??
+        (thread.modelSelection === "auto"
+          ? null
+          : (threadSelection ?? defaultSelection)))
+  const handleSelectionChange = (next: ModelSelection | null) => {
+    setAutoSelected(next === null)
+    setSelection(next)
+    selectionIntent.select()
+  }
+  const scrollControlRef = useRef<MessagesScrollControl | null>(null)
+  const routed = source.routed
+  const login = session.data?.login
+  const displayName = session.data?.display_name || undefined
+  // A message sent from here keeps the label it showed while pending until the
+  // transcript names its sender, which waits on the run introducing them.
+  const [sentLabels, setSentLabels] = useState<ReadonlyMap<string, string>>(
+    () => new Map()
+  )
+  const senderName = pendingSenderName(source.messages, login, displayName)
+  const unlabeled = senderName
+    ? (thread.pendingMessages ?? []).filter(
+        (message) => !sentLabels.has(message.id)
+      )
+    : []
+  if (senderName && unlabeled.length > 0) {
+    setSentLabels(
+      new Map([
+        ...sentLabels,
+        ...unlabeled.map((message) => [message.id, senderName] as const),
+      ])
+    )
+  }
+  const baseMessages = useMemo(
+    () =>
+      source.messages.map((message) => {
+        const label =
+          message.author === "user" && !message.structuredSenderName
+            ? sentLabels.get(message.id)
+            : undefined
+        return label ? { ...message, structuredSenderName: label } : message
+      }),
+    [sentLabels, source.messages]
+  )
+  // Until the source has hydrated, only the thread record knows a run is live.
+  const sourceRunning =
+    source.isRunning || (source.isHydrating && thread.status === "running")
+  const isStreaming =
+    source.kind === "transcript"
+      ? sourceRunning
+      : thread.status === "running" || source.isRunning
+  // Server truth: follow-ups queued behind the live run, from the transcript.
+  const queued = source.queued
+  // Only its sender may act on a queued follow-up; the server enforces it too.
+  const isOwnQueued = useCallback(
+    (entry: QueuedTurn) => login !== undefined && entry.senderLogin === login,
+    [login]
+  )
+
+  const [restoreDraft, setRestoreDraft] = useState<RestoredDraft | null>(null)
+  const followUpBehavior = session.data?.follow_up_behavior ?? "steer"
+  const submitMessage = useCallback(
+    async (
+      { text: content, images, replies }: ComposerSubmission,
+      options?: SubmitOptions,
+      onStartError?: () => void
+    ) => {
+      if (modelsLoading) throw new Error("Could not load model settings")
+      // While a run is live the message either waits for it as a queued run of
+      // its own, or goes straight in and steers it. The preference sets the
+      // default; ⌘↵ flips it for one message.
+      const queue =
+        (followUpBehavior === "queue") !== (options?.alternate === true)
+      const enqueue = isStreaming && queue
+      const offload = content.trim() === "/offload"
+      const analyticsActorId = session.data?.user_id ?? null
+      const analyticsAction = productAnalytics.beginAction(
+        offload
+          ? "offload"
+          : enqueue
+            ? "queue"
+            : isStreaming
+              ? "steer"
+              : "new_turn",
+        analyticsActorId
+      )
+      const messageId = crypto.randomUUID()
+      // A message that goes straight into the transcript sits at the top while
+      // the reply fills in below it. A queued one stays in the queue until its
+      // run starts, and an offload sends no message at all.
+      if (offload) scrollControlRef.current?.scrollToBottom()
+      else if (!enqueue) scrollControlRef.current?.pinMessage(messageId)
+      const carriesSelection = selectionIntent.claim(
+        messageId,
+        modelSelectionEnabled && !offload && (!isStreaming || queue)
+      )
+      const restoreSelection = () => selectionIntent.restore(messageId)
+      try {
+        // The owner's private thread may ask to act on this Mac, each action approved here.
+        let localAccessBridgeId: string | undefined
+        if (
+          thread.visibility === "private" &&
+          ownsThread &&
+          window.openSweDesktop?.ensureLocalAccessBridge
+        ) {
+          try {
+            localAccessBridgeId =
+              await window.openSweDesktop.ensureLocalAccessBridge()
+          } catch (error) {
+            console.warn("Local access unavailable", error)
+            toast.warning(
+              "Local access is unavailable; continuing in the cloud."
+            )
+          }
+        }
+        await sendMessage.mutateAsync({
+          local_access_bridge_id: localAccessBridgeId,
+          content,
+          images,
+          replies,
+          client_message_id: messageId,
+          analyticsActorId,
+          analyticsAction,
+          model_id: activeSelection?.modelId ?? null,
+          effort: activeSelection?.effort ?? null,
+          model_selection_changed: carriesSelection,
+          inherit_model_selection: !modelSelectionEnabled,
+          enqueue,
+          onStartError: () => {
+            restoreSelection()
+            onStartError?.()
+          },
+        })
+      } catch (error) {
+        analyticsAction.failed(error)
+        restoreSelection()
+        throw error
+      }
+    },
+    [
+      activeSelection,
+      thread.visibility,
+      ownsThread,
+      selectionIntent,
+      followUpBehavior,
+      isStreaming,
+      modelSelectionEnabled,
+      modelsLoading,
+      sendMessage,
+      session.data?.user_id,
+    ]
+  )
+
+  // Code attached on the review page rides along as fenced excerpts the transcript renders as blocks.
+  const submitWithExcerpts = useCallback(
+    async (submission: ComposerSubmission, options?: SubmitOptions) => {
+      const excerpts = reviewChat?.excerpts ?? []
+      let restored = false
+      const restoreReplies = () => {
+        if (restored || submission.replies.length === 0) return
+        restored = true
+        setRestoreDraft((previous) => ({
+          key: (previous?.key ?? 0) + 1,
+          text: "",
+          images: [],
+          replies: submission.replies,
+        }))
+      }
+      try {
+        await submitMessage(
+          excerpts.length
+            ? {
+                ...submission,
+                text: serializeExcerpts(submission.text, excerpts),
+              }
+            : submission,
+          options,
+          restoreReplies
+        )
+        if (excerpts.length) reviewChat?.clearExcerpts?.()
+      } catch (error) {
+        restoreReplies()
+        throw error
+      }
+    },
+    [reviewChat, submitMessage]
+  )
+
+  const submitText = useCallback(
+    (content: string) => submitMessage(plainSubmission(content)),
+    [submitMessage]
+  )
+
+  const restoreQueuedSelection = selectionIntent.restore
+
+  const queuedText = (entry: QueuedTurn) =>
+    entry.message.chunks
+      .flatMap((chunk) => (chunk.kind === "text" ? [chunk.text] : []))
+      .join("\n")
+      .trim()
+  const queuedImages = (entry: QueuedTurn) =>
+    entry.message.chunks.filter((chunk) => chunk.kind === "image")
+
+  useEffect(() => {
+    if (!composerDraft || appliedComposerDrafts.has(composerDraft)) return
+    appliedComposerDrafts.add(composerDraft)
+    // oxlint-disable-next-line react/set-state-in-effect
+    setRestoreDraft((previous) => ({
+      key: (previous?.key ?? 0) + 1,
+      text: composerDraft.text,
+      images: [...(composerDraft.images ?? [])],
+      replacesSuggestion: true,
+    }))
+  }, [composerDraft])
+
+  const question = reviewChat?.question
+  const clearQuestion = reviewChat?.clearQuestion
+  useEffect(() => {
+    if (!question || !canPost) return
+    clearQuestion?.()
+    // oxlint-disable-next-line react/set-state-in-effect
+    submitWithExcerpts(plainSubmission(question)).catch((error: unknown) => {
+      console.error("Could not send the review question", error)
+      setRestoreDraft((previous) => ({
+        key: (previous?.key ?? 0) + 1,
+        text: question,
+        images: [],
+      }))
+    })
+  }, [question, canPost, clearQuestion, submitWithExcerpts])
+
+  const [addedReply, setAddedReply] = useState<{
+    key: number
+    reply: PassageReply
+  } | null>(null)
+  const addReply = (reply: PassageReply) =>
+    setAddedReply((previous) => ({ key: (previous?.key ?? 0) + 1, reply }))
+  const pageReply = reviewChat?.reply
+  const takePageReply = reviewChat?.takeReply
+  useEffect(() => {
+    if (!pageReply || !takePageReply?.(pageReply)) return
+    // oxlint-disable-next-line react/set-state-in-effect
+    setAddedReply((previous) => ({
+      key: (previous?.key ?? 0) + 1,
+      reply: pageReply,
+    }))
+  }, [pageReply, takePageReply])
+  const restoreQueuedToComposer = useCallback(
+    (
+      texts: ReadonlyArray<string>,
+      images: Array<ImageChunk>,
+      replies: Array<PassageReply>
+    ) => {
+      if (!texts.some(Boolean) && images.length === 0 && replies.length === 0)
+        return
+      setRestoreDraft((previous) => ({
+        key: (previous?.key ?? 0) + 1,
+        text: texts.filter(Boolean).join("\n\n"),
+        images,
+        replies,
+      }))
+    },
+    []
+  )
+  // The images of a queued follow-up live with its run. Fetch them before that
+  // run is withdrawn: a fetch that fails leaves the follow-up queued, intact.
+  const materializeQueuedImages = useCallback(
+    async (entry: QueuedTurn): Promise<Array<ImageChunk> | null> => {
+      const { images, failed } = await materializeImages(queuedImages(entry))
+      if (failed === 0) return images
+      toast.error(
+        failed === 1
+          ? "Couldn't load the queued message's image, so it stays queued."
+          : `Couldn't load ${failed} of the queued message's images, so it stays queued.`
+      )
+      return null
+    },
+    []
+  )
+  // A "stream"-kind source's queue only reflects a cancel via `cancelQueued`
+  // — never a lifecycle event, since the run never reached "running" —
+  // otherwise the row lingers until the next hydrate.
+  const withdrawQueued = useCallback(
+    async (entry: QueuedTurn) => {
+      if (entry.runId === null) return
+      const action = productAnalytics.beginAction("queue_cancel")
+      try {
+        if (source.kind === "stream") {
+          if (!(await source.cancelQueued(entry.turnId))) {
+            throw new Error("The queued message could not be cancelled.")
+          }
+        } else {
+          await agentsApi.cancelRun(thread.id, entry.runId)
+        }
+        action.accepted()
+      } catch (error) {
+        action.failed(error)
+        throw error
+      }
+      restoreQueuedSelection(entry.message.id)
+    },
+    [restoreQueuedSelection, source, thread.id]
+  )
+  const removeQueuedMessage = useCallback(
+    (id: string) => {
+      const entry = queued.find((candidate) => candidate.message.id === id)
+      if (!entry || entry.runId === null) return
+      void (async () => {
+        const images = await materializeQueuedImages(entry)
+        if (images === null) return
+        await withdrawQueued(entry)
+        restoreQueuedToComposer(
+          [queuedText(entry)],
+          images,
+          entry.message.replies ?? []
+        )
+      })().catch((error: unknown) =>
+        reportError({ title: "Couldn't cancel the queued message", error })
+      )
+    },
+    [materializeQueuedImages, queued, restoreQueuedToComposer, withdrawQueued]
+  )
+  // Stop cancels the queued runs along with the live one; the user's own come
+  // back to the composer instead of starting the moment the run settles. Only
+  // once the cancel is accepted: otherwise they are still queued. The image
+  // fetch runs alongside the stop, which must not wait on it; a failed fetch
+  // restores what it could and says what it lost.
+  const stopRun = useCallback(async () => {
+    const pending = queued.filter(isOwnQueued)
+    // A follow-up sent to queue moments ago may not be back from the server
+    // yet. Stop cancels its run all the same, so its draft comes back too.
+    const known = new Set(pending.map((entry) => entry.message.id))
+    const unacknowledged = (thread.pendingMessages ?? []).filter(
+      (message) => message.queued && !known.has(message.id)
+    )
+    const materialized = materializeImages([
+      ...pending.flatMap(queuedImages),
+      ...unacknowledged.flatMap((message) => message.images ?? []),
+    ])
+    if (!(await source.stop())) return
+    for (const entry of pending) restoreQueuedSelection(entry.message.id)
+    for (const message of unacknowledged) restoreQueuedSelection(message.id)
+    if (source.kind === "stream" && pending.length > 0) {
+      // Same reasoning as withdrawQueued: syncs the adapter's queue store.
+      await Promise.allSettled(
+        pending.map((entry) => source.cancelQueued(entry.turnId))
+      )
+    }
+    if (unacknowledged.length > 0) {
+      const dropped = new Set(unacknowledged.map((message) => message.id))
+      queryClient.setQueryData<AgentThread>(
+        agentThreadKeys.detail(thread.id),
+        (prev) =>
+          prev && {
+            ...prev,
+            pendingMessages: prev.pendingMessages?.filter(
+              (message) => !dropped.has(message.id)
+            ),
+          }
+      )
+    }
+    const { images, failed } = await materialized
+    restoreQueuedToComposer(
+      [
+        ...pending.map(queuedText),
+        ...unacknowledged.map((message) => message.content),
+      ],
+      images,
+      [
+        ...pending.flatMap((entry) => entry.message.replies ?? []),
+        ...unacknowledged.flatMap((message) => message.replies ?? []),
+      ]
+    )
+    if (failed > 0) {
+      toast.error(
+        failed === 1
+          ? "Couldn't load one queued image; it was not restored to the composer."
+          : `Couldn't load ${failed} queued images; they were not restored to the composer.`
+      )
+    }
+  }, [
+    isOwnQueued,
+    queryClient,
+    queued,
+    restoreQueuedSelection,
+    restoreQueuedToComposer,
+    source,
+    thread.id,
+    thread.pendingMessages,
+  ])
+  const fixPullRequest = useCallback(
+    async (pullRequest: AgentPullRequest, scope: ThreadFixScope) => {
+      const result = await agentsApi.getThreadPullRequestContext(
+        thread.id,
+        pullRequest.repoFullName,
+        pullRequest.number,
+        scope
+      )
+      await submitMessage(plainSubmission(result.prompt))
+    },
+    [submitMessage, thread.id]
+  )
+  const contextUsage = source.contextUsage
+  const usageModel = resolveContextModel(
+    models,
+    contextUsage?.model,
+    routed?.modelId,
+    thread.model
+  )
+
+  // Own the git panel's collapsed state so file links can reveal the panel.
+  const [panelCollapsed, setPanelCollapsed] = useState(() =>
+    readStoredPanelCollapsed(thread.id)
+  )
+  const handlePanelCollapsedChange = useCallback(
+    (next: boolean) => {
+      setPanelCollapsed(next)
+      writeStoredPanelCollapsed(thread.id, next)
+    },
+    [thread.id]
+  )
+  const [revealFilePath, setRevealFilePath] = useState<string | null>(null)
+  const [revealChangesKey, setRevealChangesKey] = useState(0)
+  const handleOpenFile = useCallback(
+    (filePath: string) => {
+      setRevealFilePath(filePath)
+      setRevealChangesKey((key) => key + 1)
+      handlePanelCollapsedChange(false)
+    },
+    [handlePanelCollapsedChange]
+  )
+  const activeRun = useMemo(
+    () => ({ threadId: thread.id, running: thread.status === "running" }),
+    [thread.id, thread.status]
+  )
+  const agentQueue = useAgentThreadQueuedMessages(thread.id).data
+  const inboxIds = useMemo(
+    () => new Set(agentQueue?.map((message) => message.id)),
+    [agentQueue]
+  )
+  // An optimistic row sent to queue renders as a queued row from the start,
+  // so it never flashes as a sent message before the server confirms it.
+  const pendingMessages = useMemo(
+    () =>
+      visiblePendingMessages(
+        thread.pendingMessages?.filter(
+          (message) => !message.queued && !inboxIds.has(message.id)
+        ),
+        [...baseMessages, ...queued.map((entry) => entry.message)],
+        senderName
+      ),
+    [baseMessages, inboxIds, queued, senderName, thread.pendingMessages]
+  )
+  const visibleMessages = useMemo(
+    () => [...baseMessages, ...pendingMessages],
+    [baseMessages, pendingMessages]
+  )
+  const shownMessages = useMemo(
+    () => visibleMessages.slice(source.shownFrom),
+    [source.shownFrom, visibleMessages]
+  )
+  // An optimistic row has done its job once the transcript or the queue holds
+  // its id. Dropping it then keeps a withdrawn queued turn from resurfacing it
+  // as "Sending" after the transcript hides that turn.
+  useEffect(() => {
+    const pending = thread.pendingMessages
+    if (!pending?.length) return
+    const persisted = new Set([
+      ...baseMessages.map((message) => message.id),
+      ...queued.map((entry) => entry.message.id),
+      ...inboxIds,
+    ])
+    if (!pending.some((message) => persisted.has(message.id))) return
+    queryClient.setQueryData<AgentThread>(
+      agentThreadKeys.detail(thread.id),
+      (prev) =>
+        prev && {
+          ...prev,
+          pendingMessages: prev.pendingMessages?.filter(
+            (message) => !persisted.has(message.id)
+          ),
+        }
+    )
+  }, [
+    baseMessages,
+    inboxIds,
+    queryClient,
+    queued,
+    thread.id,
+    thread.pendingMessages,
+  ])
+
+  const queuedRows = useMemo(() => {
+    const known = new Set(queued.map((entry) => entry.message.id))
+    // A steered follow-up is already on the transcript under the same id.
+    const shown = new Set([
+      ...known,
+      ...baseMessages.map((message) => message.id),
+    ])
+    return [
+      ...queued.map((entry) => ({
+        id: entry.message.id,
+        content: queuedText(entry),
+        images: queuedImages(entry),
+        replies: entry.message.replies,
+        createdAt: Date.parse(entry.requestedAt),
+        pending: entry.runId === null,
+        mine: isOwnQueued(entry),
+      })),
+      ...(thread.pendingMessages ?? [])
+        .filter(
+          (message) =>
+            message.queued &&
+            !shown.has(message.id) &&
+            !inboxIds.has(message.id)
+        )
+        .map((message) => ({
+          id: message.id,
+          content: message.content,
+          images: message.images,
+          replies: message.replies,
+          createdAt: message.createdAt,
+          pending: true,
+        })),
+      ...(agentQueue ?? [])
+        .filter((message) => !shown.has(message.id))
+        .map((message) => ({
+          id: message.id,
+          content: message.text,
+          createdAt: message.queued_at ? Date.parse(message.queued_at) : 0,
+          waitsForAgent: true,
+          sender: message.sender,
+        })),
+    ]
+  }, [
+    agentQueue,
+    baseMessages,
+    inboxIds,
+    isOwnQueued,
+    queued,
+    thread.pendingMessages,
+  ])
+
+  const hasMessages = visibleMessages.length > 0
+  const hasConversation = hasMessages || queuedRows.length > 0
+  // The only file list the UI has: whatever the agent has already touched in
+  // this thread. Those are also the paths a follow-up is most likely about.
+  const mentionPaths = useMemo(() => editedPaths(baseMessages), [baseMessages])
+  const loadEarlier = useMemo<LoadEarlier | null>(
+    () =>
+      source.hasOlder
+        ? {
+            loading: source.isLoadingOlder,
+            onLoadEarlier: source.loadOlder,
+            onLoadAll: source.loadAllOlder,
+          }
+        : null,
+    [
+      source.hasOlder,
+      source.isLoadingOlder,
+      source.loadOlder,
+      source.loadAllOlder,
+    ]
+  )
+  const isThinking = sourceRunning
+  const settingUpSandbox = source.isRunning && baseMessages.length === 0
+  const reconnect = useConnectionStatus(source.connection)
+  // The transcript hydrates once: the SDK's state fetch, or the event log's
+  // snapshot. Show a loading state during it instead of the empty state.
+  const isHydrating = source.isHydrating && !hasMessages
+  const hydrationTimedOut = useLoadTimedOut(isHydrating)
+  // A failed hydrate is indistinguishable from an empty thread in the snapshot,
+  // so say so rather than claiming the thread has no messages. `source.error`
+  // also carries run failures, hence the dedicated hydration signal.
+  const [hydrateError, setHydrateError] = useState<unknown>(null)
+  useEffect(() => {
+    let active = true
+    // oxlint-disable-next-line react/set-state-in-effect
+    setHydrateError(null)
+    source.hydration.catch((error: unknown) => {
+      if (!active) return
+      setHydrateError(error)
+      threadHydrationFailed(thread.id)
+    })
+    return () => {
+      active = false
+    }
+  }, [source.hydration, thread.id])
+  const hydrationFailed = !hasMessages && hydrateError !== null
+
+  useEffect(() => {
+    if (!source.isHydrating) threadHydrated(thread.id)
+  }, [source.isHydrating, thread.id])
+
+  useThreadTranscriptPaint(
+    thread.id,
+    isHydrating ? null : shownMessages,
+    source
+  )
+
+  return (
+    <div className="flex min-w-0 flex-1">
+      <div
+        data-chat-drop-zone
+        className="relative flex min-w-0 flex-1 flex-col"
+        style={isMobile ? undefined : { minWidth: SIBLING_COLUMN_MIN_WIDTH }}
+      >
+        {/* The page around an embedded thread is its header. */}
+        {!embedded && (
+          <AgentThreadHeader
+            key={thread.id}
+            onRename={(title) =>
+              renameThread.mutateAsync({ threadId: thread.id, title })
+            }
+            panelCollapsed={panelCollapsed}
+            thread={thread}
+          />
+        )}
+        <LocalAccessRequests threadId={thread.id} />
+        <LocalAccessGrantBanner threadId={thread.id} />
+        {thread.status === "error" && !reconnect.label && (
+          <div className="mx-auto w-full max-w-3xl shrink-0 px-space-4 pt-space-3 empty:hidden">
+            <Banner
+              key={`${thread.id}:${thread.latestRunId ?? ""}`}
+              intent="error"
+              icon={null}
+              dismissible
+              className="gap-space-4"
+            >
+              <div className="flex flex-wrap items-center justify-between gap-x-space-4 gap-y-space-2">
+                <Text as="p" variant="sm" color="secondary">
+                  The run failed. Send a message to retry.
+                </Text>
+                <div className="flex items-center gap-space-4">
+                  <CopyErrorButton
+                    error="The last run hit an error before it could finish."
+                    details={{ Thread: thread.id, Trace: thread.traceUrl }}
+                  />
+                  {thread.traceUrl && (
+                    <Button
+                      as={
+                        <a
+                          href={thread.traceUrl}
+                          target="_blank"
+                          rel="noreferrer"
+                        />
+                      }
+                      color="secondary"
+                      variant="plain"
+                      size="xs"
+                    >
+                      Open trace
+                    </Button>
+                  )}
+                </div>
+              </div>
+            </Banner>
+          </div>
+        )}
+        <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden">
+          {hydrationFailed || hydrationTimedOut ? (
+            <LoadError
+              title="Unable to load messages"
+              retry={retry}
+              context={`Thread: ${thread.id}`}
+              error={
+                hydrateError !== null
+                  ? hydrateError
+                  : "Message loading took longer than 30 seconds."
+              }
+            />
+          ) : isHydrating ? (
+            <ConversationLoading />
+          ) : (
+            <ReplyOptionContext.Provider
+              value={canPost ? submitText : undefined}
+            >
+              <PullRequestPreviewProvider
+                pullRequests={thread.pullRequests ?? []}
+                health={pullRequestHealth}
+                healthUnavailable={pullRequestStatus.isError}
+              >
+                <Profiler
+                  id="transcript"
+                  onRender={(_id, _phase, actualDuration) =>
+                    runTranscriptCommitted(thread.id, actualDuration)
+                  }
+                >
+                  <Messages
+                    messages={shownMessages}
+                    transcript={visibleMessages}
+                    threadId={thread.id}
+                    scrollKey={thread.id}
+                    showPlanArtifact={Boolean(thread.planStatus)}
+                    onOpenArtifact={
+                      !embedded
+                        ? () => {
+                            useRightPanelStore
+                              .getState()
+                              .open(
+                                { scope: "cloud", threadId: thread.id },
+                                "artifact"
+                              )
+                            handlePanelCollapsedChange(false)
+                          }
+                        : undefined
+                    }
+                    runCosts={thread.runCosts}
+                    emptyState={
+                      <div className="flex min-h-60 items-center justify-center">
+                        {hydrationFailed ? (
+                          <Banner intent="error" className="max-w-3xl">
+                            This thread&apos;s messages could not be loaded.
+                            Reload to try again.
+                          </Banner>
+                        ) : (
+                          (embedded?.emptyState ?? (
+                            <p className="text-xs text-tertiary">
+                              This thread has no messages yet.
+                            </p>
+                          ))
+                        )}
+                      </div>
+                    }
+                    onOpenFile={handleOpenFile}
+                    loadEarlier={loadEarlier}
+                    queuedMessages={queuedRows}
+                    onRemoveQueuedMessage={
+                      canPost ? removeQueuedMessage : undefined
+                    }
+                    onReply={canPost ? addReply : undefined}
+                    isStreaming={isStreaming}
+                    streamIsLoading={source.isRunning}
+                    scrollControlRef={scrollControlRef}
+                    isThinking={isThinking}
+                    isWaitingForDelegatedWork={
+                      thread.waitingForDelegatedWork && !source.isRunning
+                    }
+                    isOffloading={source.isOffloading}
+                    reconnectLabel={reconnect.label}
+                    settingUpSandbox={settingUpSandbox}
+                    pollWorkflowApprovalsWhileActive={isStreaming}
+                    contentWidthClass="max-w-3xl"
+                  />
+                </Profiler>
+              </PullRequestPreviewProvider>
+            </ReplyOptionContext.Provider>
+          )}
+          {!isHydrating && (
+            <AgentComposerDock>
+              {!embedded && (
+                <ThreadPullRequests
+                  pullRequests={thread.pullRequests ?? []}
+                  health={pullRequestHealth}
+                  healthUnavailable={pullRequestStatus.isError}
+                  onFix={fixPullRequest}
+                  fixDisabled={!canPost || sendMessage.isPending}
+                />
+              )}
+              {reviewChat && <ReviewExcerptChips />}
+              {modelsError && (
+                <Banner intent="error" className="mb-space-3 w-full">
+                  Could not load model settings. Reload to try again.
+                </Banner>
+              )}
+              <AgentPromptBar
+                key={`${session.data?.user_id}:${thread.id}`}
+                draftKey={
+                  session.data?.user_id
+                    ? `${session.data.user_id}:thread:${thread.id}`
+                    : undefined
+                }
+                placeholder={
+                  botThread
+                    ? `Started by ${thread.triggeringBot?.name ?? "a Slack bot"}. Reply in Slack to steer it`
+                    : historicalSession
+                      ? "This historical Claude Code session is read-only"
+                      : canPost
+                        ? reviewChat
+                          ? "Review with Robin"
+                          : hasConversation
+                            ? "Work with Robin"
+                            : "Send the first message"
+                        : thread.adminThread
+                          ? "Only Robin admins can send messages in this thread"
+                          : "You can't send messages in this thread"
+                }
+                autoFocus={canPost && !embedded}
+                canOffload={!isStreaming}
+                compact
+                disabled={!canPost || modelsLoading}
+                busy={isStreaming}
+                activeRun={activeRun}
+                onStop={stopRun}
+                stoppable={!historicalSession}
+                onSubmit={submitWithExcerpts}
+                followUpBehavior={followUpBehavior}
+                restoreDraft={restoreDraft}
+                addedReply={addedReply}
+                models={models}
+                modelSelectionEnabled={modelSelectionEnabled}
+                routed={routed}
+                selection={activeSelection}
+                onSelectionChange={handleSelectionChange}
+                mentionPaths={mentionPaths}
+                skills={skills.data}
+                contextUsage={{
+                  usedTokens: contextUsage?.tokens,
+                  contextWindow: usageModel?.context_window,
+                  model: usageModel?.label ?? contextUsage?.model,
+                  costUsd: thread.costUsd,
+                }}
+              />
+            </AgentComposerDock>
+          )}
+        </div>
+      </div>
+      {/* The page around it has its own context; a second panel only squeezes the chat. */}
+      {!embedded && (
+        <AgentGitPanel
+          thread={thread}
+          onComment={canPost ? submitText : undefined}
+          onReply={canPost ? addReply : undefined}
+          revealFilePath={revealFilePath}
+          revealChangesKey={revealChangesKey}
+          collapsed={panelCollapsed}
+          onCollapsedChange={handlePanelCollapsedChange}
+        />
+      )}
+    </div>
+  )
+}

@@ -1,0 +1,442 @@
+import { maybeDiffFromArgs, outputIframeDisplay } from "./toolDisplay"
+import { AIMessage, HumanMessage, ToolMessage } from "@langchain/core/messages"
+import { messageArrivalTimestamp } from "./messageTimestamps"
+import {
+  collectStructuredEntities,
+  isSilentSender,
+  parseStructuredInput,
+} from "./structuredInputMessages"
+import { humanizeToolName } from "./toolNames"
+import type { BaseMessage, ContentBlock } from "@langchain/core/messages"
+import type { AssembledToolCall } from "@langchain/react"
+
+import type { StructuredEntity } from "./structuredInputMessages"
+import type { Chunk, ImageChunk, Message, ToolExecutionChunk } from "./types"
+
+function senderNote(entity: StructuredEntity | undefined): string | undefined {
+  if (entity?.senderType === "bot") return undefined
+  if (entity?.openSweAccount === "unlinked") return "not a Robin user"
+  return undefined
+}
+
+const READ_TOOLS = new Set(["read_file", "read", "ls"])
+const EDIT_TOOLS = new Set([
+  "write_file",
+  "edit_file",
+  "str_replace",
+  "write",
+  "edit",
+  "patch",
+])
+const EXECUTE_TOOLS = new Set(["execute", "bash", "shell", "run_terminal_cmd"])
+const SEARCH_TOOLS = new Set(["glob", "grep", "web_search", "search"])
+const FETCH_TOOLS = new Set(["fetch", "fetch_url", "http_request"])
+/** Bookkeeping calls the transcript never shows. */
+export const INTERNAL_TOOLS = new Set(["confirming_completion", "no_op"])
+
+type ToolKind = ToolExecutionChunk["toolKind"]
+
+export function toolKind(name: string): ToolKind {
+  const lowered = name.toLowerCase()
+  if (lowered.startsWith("mcp_")) return "other"
+  if (lowered === "task") return "task"
+  if (lowered === "eval") return "code"
+  if (lowered === "background_execute") return "background"
+  if (lowered === "read_only_sql") return "sql"
+  if (lowered === "slack_reply") return "slack"
+  if (
+    lowered === "connect_managed_tools" ||
+    lowered === "add_managed_tools_server"
+  )
+    return "managed-tools"
+  if (lowered === "linear_comment") return "linear"
+  if (
+    EDIT_TOOLS.has(lowered) ||
+    ["edit", "write", "replace"].some((t) => lowered.includes(t))
+  ) {
+    return "edit"
+  }
+  if (EXECUTE_TOOLS.has(lowered)) return "execute"
+  if (FETCH_TOOLS.has(lowered)) return "fetch"
+  if (SEARCH_TOOLS.has(lowered)) return "search"
+  if (READ_TOOLS.has(lowered) || lowered.includes("read")) return "read"
+  if (lowered === "think") return "think"
+  return "other"
+}
+
+export function toolTitle(name: string, args: Record<string, unknown>): string {
+  if (name.toLowerCase().startsWith("mcp_")) return humanizeToolName(name)
+  const path = args.path ?? args.file_path ?? args.target_file
+  if (typeof path === "string" && path.trim()) return `${name} ${path.trim()}`
+  const command = args.command
+  if (typeof command === "string" && command.trim()) {
+    return command.trim().split("\n")[0]?.slice(0, 120) ?? ""
+  }
+  return humanizeToolName(name)
+}
+
+function parseToolArgs(raw: unknown): Record<string, unknown> {
+  if (raw && typeof raw === "object" && !Array.isArray(raw))
+    return raw as Record<string, unknown>
+  if (typeof raw === "string") {
+    try {
+      const parsed = JSON.parse(raw)
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+        ? (parsed as Record<string, unknown>)
+        : { raw }
+    } catch {
+      return { raw }
+    }
+  }
+  return {}
+}
+
+type AgentTurn = {
+  id: string
+  author: Message["author"]
+  timestamp: string
+  turnKey?: string
+  invocationIds: Array<string>
+  startedAt: string
+  timestampIsFallback?: boolean
+  chunks: Array<Chunk>
+}
+
+type MessageTimestamp = {
+  value: string
+  isFallback: boolean
+}
+
+function messageTimestamp(
+  raw: BaseMessage,
+  msgId: string,
+  resolveCreatedAt?: (messageId: string) => string | undefined
+): MessageTimestamp {
+  const msg = raw as unknown as Record<string, unknown>
+  const createdAt = msg.created_at
+  if (typeof createdAt === "string" && createdAt) {
+    return { value: createdAt, isFallback: false }
+  }
+  const responseMetadata = msg.response_metadata
+  if (responseMetadata && typeof responseMetadata === "object") {
+    const metadataCreatedAt = (responseMetadata as Record<string, unknown>)
+      .created_at
+    if (typeof metadataCreatedAt === "string" && metadataCreatedAt) {
+      return { value: metadataCreatedAt, isFallback: false }
+    }
+  }
+  const resolved = resolveCreatedAt?.(msgId)
+  if (typeof resolved === "string" && resolved) {
+    return { value: resolved, isFallback: true }
+  }
+  return { value: new Date().toISOString(), isFallback: true }
+}
+
+/**
+ * Pull reasoning ("thinking") text out of a message's standard content blocks.
+ * `@langchain/core` v1 normalizes provider-specific reasoning (Anthropic
+ * `thinking`, OpenAI reasoning, …) into `{ type: "reasoning", reasoning }`
+ * blocks via the `contentBlocks` getter, so we don't have to parse each
+ * provider's raw shape ourselves.
+ */
+function reasoningText(raw: BaseMessage): string {
+  let blocks: Array<ContentBlock.Standard>
+  try {
+    blocks = raw.contentBlocks
+  } catch {
+    return ""
+  }
+  let text = ""
+  for (const block of blocks) {
+    if (block.type !== "reasoning") continue
+    // Reasoning blocks can arrive without a summary (e.g. OpenAI reasoning
+    // models emit `{ type: "reasoning", extras: { content: [] } }` with no
+    // `reasoning` field) — skip those so we don't render a "Thought" block
+    // whose body is the literal string "undefined".
+    const reasoning: unknown = block.reasoning
+    if (typeof reasoning === "string") text += reasoning
+  }
+  return text.trim()
+}
+
+type InlineImage = { base64?: string; mimeType?: string }
+
+function dataUrlImage(url: unknown): InlineImage {
+  const match =
+    typeof url === "string"
+      ? /^data:(image\/[^;]+);base64,(.+)$/s.exec(url)
+      : null
+  return match ? { mimeType: match[1], base64: match[2] } : {}
+}
+
+/** The bytes an `image` or `image_url` content block carries inline, if any. */
+function inlineImage(block: Record<string, unknown>): InlineImage {
+  if (block.type === "image") {
+    const data = block.data ?? block.base64
+    const mimeType = block.mime_type ?? block.mimeType
+    if (typeof data === "string" && typeof mimeType === "string")
+      return { base64: data, mimeType }
+    // The standard block's data-URL form, which MDA's browser screenshots use.
+    return dataUrlImage(block.url)
+  }
+  if (block.type === "image_url") {
+    const imageUrl = block.image_url
+    return dataUrlImage(
+      imageUrl && typeof imageUrl === "object"
+        ? (imageUrl as Record<string, unknown>).url
+        : undefined
+    )
+  }
+  return {}
+}
+
+function imageChunks(content: unknown): Array<ImageChunk> {
+  if (!Array.isArray(content)) return []
+
+  const chunks: Array<ImageChunk> = []
+  for (const item of content) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue
+    const block = item as Record<string, unknown>
+    const { base64, mimeType } = inlineImage(block)
+    if (base64 && mimeType) {
+      const fileName = block.fileName ?? block.file_name
+      chunks.push({
+        kind: "image",
+        base64,
+        mimeType,
+        ...(typeof fileName === "string" && fileName ? { fileName } : {}),
+      })
+    }
+  }
+  return chunks
+}
+
+/**
+ * Map the SDK's assembled tool-call lifecycle status onto the UI status.
+ * `stream.toolCalls` exposes a fully-assembled, reactive view of each call
+ * ({@link AssembledToolCall}) so we no longer hand-match AI `tool_calls` to
+ * their `ToolMessage` results to derive status/output.
+ */
+function toolStatus(
+  assembled: AssembledToolCall | undefined,
+  toolMessage: ToolMessage | undefined
+): ToolExecutionChunk["status"] {
+  if (assembled) {
+    if (assembled.status === "finished") return "completed"
+    if (assembled.status === "error") return "error"
+    return "in_progress"
+  }
+  if (toolMessage) return toolMessage.status === "error" ? "error" : "completed"
+  return "in_progress"
+}
+
+function toolOutputText(
+  assembled: AssembledToolCall | undefined,
+  toolMessage: ToolMessage | undefined
+): string | undefined {
+  const value = assembled?.output
+  if (value != null) {
+    if (typeof value === "string") return value.trim() || undefined
+    try {
+      return JSON.stringify(value)
+    } catch {
+      return String(value)
+    }
+  }
+  const text = toolMessage?.text.trim()
+  return text || undefined
+}
+
+/**
+ * Convert the SDK's live projections into the dashboard chunk model so the
+ * transcript streams (and hydrates) directly from the SDK instead of a
+ * hand-rolled, server-mirrored adapter.
+ *
+ * - `messages` ({@link BaseMessage}[]) drives ordering, text, and reasoning.
+ * - `toolCalls` ({@link AssembledToolCall}[], i.e. `stream.toolCalls`) drives
+ *   each tool call's status and output — no `pendingTools` bookkeeping.
+ * - `toolKind` / `title` stay a pure mapping of name+args (known at call time,
+ *   already persisted) so the in-progress card renders instantly.
+ * - `diffData` is derived from the call's own args, which is all that is
+ *   available before an edit is applied (what a pending approval renders). What
+ *   a turn actually changed comes from its persisted run diff.
+ */
+export function streamMessagesToUi(
+  messages: Array<BaseMessage>,
+  toolCalls: ReadonlyArray<AssembledToolCall> = [],
+  resolveCreatedAt?: (messageId: string) => string | undefined
+): Array<Message> {
+  const toolCallsById = new Map<string, AssembledToolCall>()
+  for (const toolCall of toolCalls) {
+    const id = toolCall.id || toolCall.callId
+    if (id) toolCallsById.set(id, toolCall)
+  }
+
+  const toolMessagesById = new Map<string, ToolMessage>()
+  for (const raw of messages) {
+    if (ToolMessage.isInstance(raw) && typeof raw.tool_call_id === "string") {
+      toolMessagesById.set(raw.tool_call_id, raw)
+    }
+  }
+
+  const structuredEntities = collectStructuredEntities(
+    messages
+      .filter((message) => HumanMessage.isInstance(message))
+      .map((message) => message.text)
+  )
+  const uiMessages: Array<Message> = []
+  let agentTurn: AgentTurn | null = null
+  let turnKey: string | undefined
+
+  const flushAgentTurn = () => {
+    if (!agentTurn) return
+    uiMessages.push(agentTurn)
+    agentTurn = null
+  }
+
+  const appendAgentChunks = (
+    msgId: string,
+    timestamp: string,
+    timestampIsFallback: boolean,
+    chunks: Array<Chunk>,
+    invocationId?: string
+  ) => {
+    if (!agentTurn) {
+      agentTurn = {
+        id: msgId,
+        author: "agent",
+        timestamp,
+        turnKey,
+        invocationIds: invocationId ? [invocationId] : [],
+        startedAt: timestamp,
+        timestampIsFallback,
+        chunks: [...chunks],
+      }
+    } else {
+      agentTurn.timestamp = timestamp
+      if (invocationId && !agentTurn.invocationIds.includes(invocationId))
+        agentTurn.invocationIds.push(invocationId)
+      agentTurn.timestampIsFallback =
+        agentTurn.timestampIsFallback || timestampIsFallback
+      agentTurn.chunks.push(...chunks)
+    }
+  }
+
+  messages.forEach((raw, index) => {
+    const msgId = typeof raw.id === "string" && raw.id ? raw.id : `msg-${index}`
+    const { value: timestamp, isFallback: timestampIsFallback } =
+      messageTimestamp(raw, msgId, resolveCreatedAt)
+
+    if (HumanMessage.isInstance(raw)) {
+      if (raw.additional_kwargs.lc_source === "summarization") return
+      const content = (raw as unknown as { content?: unknown }).content
+      const chunks: Array<Chunk> = imageChunks(content)
+      const parsed = parseStructuredInput(raw.text, structuredEntities)
+      if (parsed.type === "entity") return
+      if (parsed.type === "message" && isSilentSender(parsed.sender)) return
+      const entity =
+        parsed.type === "message"
+          ? structuredEntities.get(parsed.sender)
+          : undefined
+      // Our own replies reach the transcript twice: once forwarded as thread
+      // context, once as the `slack_reply` call that sent them.
+      if (entity?.senderType === "self") return
+      const taskEvent = parsed.type === "message" ? parsed.taskEvent : undefined
+      const text = taskEvent?.content ?? parsed.content
+      const replies = parsed.type === "message" ? parsed.replies : undefined
+      if (text.trim()) chunks.push({ kind: "text", text })
+      if (!chunks.length && !taskEvent && !replies) return
+      flushAgentTurn()
+      turnKey = typeof raw.id === "string" ? raw.id : undefined
+      uiMessages.push({
+        id: msgId,
+        ...(taskEvent ? { taskEvent } : {}),
+        author:
+          parsed.type === "message" && parsed.senderKind === "system"
+            ? "system"
+            : "user",
+        timestamp,
+        timestampIsFallback,
+        chunks,
+        ...(parsed.type === "message"
+          ? {
+              structuredSenderId: parsed.sender,
+              structuredSenderKind: parsed.senderKind,
+              structuredSurface: parsed.surface,
+              ...(parsed.slackMessageUrl
+                ? { slackMessageUrl: parsed.slackMessageUrl }
+                : {}),
+              ...(replies ? { replies } : {}),
+              structuredSenderName:
+                entity?.displayName ??
+                (entity?.handle ? `@${entity.handle}` : undefined),
+              structuredSenderNote: senderNote(entity),
+              structuredSenderIsBot: entity?.senderType === "bot",
+            }
+          : {}),
+      })
+      return
+    }
+
+    if (AIMessage.isInstance(raw)) {
+      if (raw.response_metadata?.open_swe_superseded === true) return
+      if (raw.additional_kwargs.lc_source === "summarization") return
+      const chunks: Array<Chunk> = []
+      const reasoning = reasoningText(raw)
+      if (reasoning) chunks.push({ kind: "reasoning", text: reasoning })
+      const text = raw.text.trim()
+      if (text) {
+        chunks.push({
+          kind: "text",
+          text,
+          ...(timestampIsFallback ? {} : { timestamp }),
+        })
+      }
+
+      for (const toolCall of raw.tool_calls ?? []) {
+        const name = toolCall.name || "tool"
+        if (INTERNAL_TOOLS.has(name)) continue
+        const toolCallId = toolCall.id || `tool-${index}-${chunks.length}`
+        const args = parseToolArgs(toolCall.args)
+        const assembled = toolCallsById.get(toolCallId)
+        const toolMessage = toolMessagesById.get(toolCallId)
+        const chunk: ToolExecutionChunk = {
+          kind: "tool-execution",
+          toolCallId,
+          toolName: name,
+          timestamp: messageArrivalTimestamp(toolCallId),
+          title: toolTitle(name, args),
+          toolKind: toolKind(name),
+          input: args,
+          status: toolStatus(assembled, toolMessage),
+        }
+        const output = toolOutputText(assembled, toolMessage)
+        if (output) chunk.output = output
+        const display = outputIframeDisplay(toolMessage?.artifact)
+        if (display) chunk.display = display
+        const images = imageChunks(toolMessage?.content)
+        if (images.length) chunk.images = images
+        const diffData = maybeDiffFromArgs(args)
+        if (diffData) chunk.diffData = diffData
+        chunks.push(chunk)
+      }
+
+      if (chunks.length) {
+        const invocationId = raw.response_metadata?.open_swe_invocation_id
+        appendAgentChunks(
+          msgId,
+          timestamp,
+          timestampIsFallback,
+          chunks,
+          typeof invocationId === "string" ? invocationId : undefined
+        )
+      }
+    }
+
+    // `ToolMessage`s no longer produce their own chunk — their status/output is
+    // attached to the originating tool-call chunk above via `stream.toolCalls`.
+  })
+
+  flushAgentTurn()
+  return uiMessages
+}

@@ -1,0 +1,5 @@
+{{ instructions }}
+{% if other_repos %}
+
+This task also covers these repositories; if a clone is necessary and permitted, use `gh repo clone <owner>/<repo> -- --filter=blob:none`: {{ other_repos | join(", ") }}
+{% endif %}

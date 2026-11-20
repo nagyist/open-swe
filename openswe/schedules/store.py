@@ -1,0 +1,1957 @@
+"""Automations: a stored prompt that runs globally whenever one of its triggers fires.
+
+Records live in PostgreSQL (``automation`` and ``automation_trigger``); each
+schedule trigger owns one LangGraph cron, whose input names the automation.
+GitHub and Linear triggers fire from MDA's channels, which start the runs planned
+here; every inbound event is claimed once per automation in ``event_claim`` first.
+"""
+
+import json
+import logging
+import re
+import uuid
+from collections.abc import Collection, Sequence
+from datetime import UTC, datetime, timedelta
+from fnmatch import fnmatchcase
+from typing import Annotated, Any, ClassVar, Literal, cast, get_args
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from fastapi import HTTPException
+from langgraph_sdk.errors import NotFoundError
+from pydantic import (
+    BaseModel,
+    Field,
+    JsonValue,
+    StringConstraints,
+    TypeAdapter,
+    field_validator,
+)
+from runtime_api.github import (
+    FiredGitHubAutomation,
+    GitHubThreadRun,
+    GitHubTriggerEvent,
+    PullRequestBranches,
+)
+from runtime_api.linear import TEAM_KEY_PATTERN, LinearAutomationRun, PlanLinearAutomation
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncConnection
+
+from openswe import event_claims
+from openswe.dashboard.admin import is_admin
+from openswe.dashboard.options import (
+    gate_fable_model,
+    normalize_model_choice,
+)
+from openswe.dashboard.profiles import get_profile, get_valid_access_token
+from openswe.dashboard.repo_access import (
+    repo_config_for_system,
+    repo_config_for_user,
+    repo_is_private,
+    require_repo_access_for_system,
+)
+from openswe.dashboard.settings import get_settings
+from openswe.database.postgres import transaction
+from openswe.dispatch import create_durable_run
+from openswe.github.http import github_reauth_message
+from openswe.github.org_membership import OPEN_SWE_GITHUB_LOGINS
+from openswe.github.repo_names import normalize_repo_full_name
+from openswe.github.token_scope import GITHUB_TOKEN_REPOSITORIES_KEY, event_token_repositories
+from openswe.input_messages import InputMessageContext, SystemIdentity, build_run_input
+from openswe.invocation import new_invocation_id, with_invocation_id
+from openswe.jobs import queue
+from openswe.prompts import prompt
+from openswe.run_config import AutomationSlackReply, RunConfig
+from openswe.schedules.policy import AutomationPolicy
+from openswe.slack.channels import SlackChannel
+from openswe.slack.payloads import SlackChannelContext, SlackEvent, SlackEventEnvelope
+from openswe.threads.access import agent_version_metadata, resolve_run_email
+from openswe.threads.creation import create_thread
+from openswe.threads.store import THREADS
+from openswe.users import User
+from openswe.utils.thread_ops import langgraph_client
+from openswe.utils.thread_participants import participant_metadata
+from openswe.utils.time import now_iso, now_ms
+from openswe.webhooks.common import enforce_public_repo_org_gate, repo_private_from_payload
+
+logger = logging.getLogger(__name__)
+
+_AGENT_ASSISTANT_ID = "agent"
+AGENT_SCHEDULE_JOB_KIND = "agent_schedule"
+_CRON_FIELD_RANGES = ((0, 59), (0, 23), (1, 31), (1, 12), (0, 7))
+# "closed" also fires for merges.
+GitHubEvent = GitHubTriggerEvent
+SlackTriggerEvent = Literal["message.posted"]
+SLACK_EVENT_DESCRIPTIONS: dict[SlackTriggerEvent, str] = {
+    "message.posted": "a message was posted",
+}
+SlackSenders = Literal["anyone", "people", "bots"]
+_SLACK_TRIGGER_CHANNEL_RE = re.compile(r"^[CG][A-Z0-9]{8,}$")
+_SLACK_MESSAGE_MAX_CHARS = 8_000
+_BranchPattern = Annotated[
+    str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)
+]
+LinearTriggerEvent = Literal["issue.created", "issue.labeled", "issue.accepted"]
+_LINEAR_TEAM_KEY_RE = re.compile(TEAM_KEY_PATTERN)
+# Each automation run a Linear delivery starts gets a thread of its own, named by both.
+_LINEAR_AUTOMATION_THREADS = uuid.uuid5(uuid.NAMESPACE_URL, "open-swe:linear-automation")
+_GITHUB_AUTOMATION_THREADS = uuid.uuid5(uuid.NAMESPACE_URL, "open-swe:github-automation")
+_RATE_WINDOW = timedelta(hours=1)
+_DELIVERY_CLAIM_SCOPE = "automation_delivery"
+_DELIVERY_CLAIM_TTL = timedelta(hours=24)
+_NEW_CRON_GRACE = timedelta(minutes=5)
+
+
+def _normalized_repo(value: str) -> str:
+    return normalize_repo_full_name(value)
+
+
+class ScheduleTrigger(BaseModel):
+    kind: Literal["schedule"] = "schedule"
+    # Weekly, Mondays at 09:00, unless its creator picks otherwise.
+    cron: str = Field(default="0 9 * * 1", min_length=1, max_length=120)
+    timezone: str = Field(
+        default="UTC",
+        min_length=1,
+        max_length=128,
+        description="IANA time zone for the cron schedule",
+    )
+
+    @field_validator("cron")
+    @classmethod
+    def _valid_cron(cls, value: str) -> str:
+        return normalize_cron_schedule(value)
+
+    @field_validator("timezone")
+    @classmethod
+    def _valid_timezone(cls, value: str) -> str:
+        try:
+            ZoneInfo(value)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError(
+                "timezone must be a valid IANA time zone, such as America/New_York"
+            ) from exc
+        return value
+
+
+class GitHubBranchFilters(BaseModel):
+    """A GitHub trigger's globs (``fnmatch``, case-sensitive) on a pull request's branches.
+
+    A head branch matching any of ``head_branches_exclude`` fires nothing, and when
+    ``base_branches`` lists any, the base branch must match one. Issue events ignore them.
+    """
+
+    head_branches_exclude: list[_BranchPattern] = Field(default_factory=list, max_length=20)
+    base_branches: list[_BranchPattern] = Field(default_factory=list, max_length=20)
+
+    def takes(self, branches: PullRequestBranches | None) -> bool:
+        """Whether the trigger fires for a pull request between ``branches``; an event
+        that names none, such as an issue's, always passes."""
+        if branches is None:
+            return True
+        if any(fnmatchcase(branches.head, glob) for glob in self.head_branches_exclude):
+            return False
+        return not self.base_branches or any(
+            fnmatchcase(branches.base, glob) for glob in self.base_branches
+        )
+
+
+class GitHubTrigger(GitHubBranchFilters):
+    """Fires on events in one repository; its runs work in that repository."""
+
+    kind: Literal["github"] = "github"
+    repo: str = Field(min_length=3)
+    events: list[GitHubEvent] = Field(min_length=1)
+    # Whoever saved the trigger confirmed it may fire on a public repository, whose
+    # issues and pull requests anyone on the internet can write.
+    allow_public_repo: bool = False
+
+    PUBLIC_REPO_UNCONFIRMED: ClassVar[str] = (
+        "is public, so anyone on the internet can write the issues and pull requests this "
+        "automation reads. Confirm the trigger may run on a public repository "
+        "(allow_public_repo) to use it"
+    )
+
+    @field_validator("repo")
+    @classmethod
+    def _valid_repo(cls, value: str) -> str:
+        return _normalized_repo(value)
+
+    async def require_public_repo_confirmation(self) -> None:
+        """Refuse a personal automation's trigger on a public repository until whoever
+        saves it confirms that: its runs act as the automation's creator on text anyone
+        may have written.
+
+        Only a repository GitHub says is public is refused. One whose visibility can't be
+        read saves, and its events are still held back while they don't say it is private.
+        """
+        if not self.allow_public_repo and await repo_is_private(self.repo) is False:
+            raise HTTPException(422, f"{self.repo} {self.PUBLIC_REPO_UNCONFIRMED}")
+
+    def fires_confirmed(
+        self,
+        repo_full_name: str,
+        events: Collection[str],
+        branches: PullRequestBranches | None,
+    ) -> bool:
+        """Whether this trigger itself fires on a delivery in ``repo_full_name`` standing
+        for ``events`` and was confirmed for a public repository.
+
+        A merged pull request stands for both its close and its merge, so either
+        confirmed trigger fires on it. Another trigger's confirmation never counts
+        for events this one doesn't name.
+        """
+        return (
+            self.allow_public_repo
+            and self.repo.lower() == repo_full_name
+            and not set(events).isdisjoint(self.events)
+            and self.takes(branches)
+        )
+
+
+class SlackTrigger(BaseModel):
+    """Fires on messages in one Slack channel Open SWE is a member of."""
+
+    kind: Literal["slack"] = "slack"
+    channel: str = Field(min_length=9, max_length=40)
+    events: list[SlackTriggerEvent] = Field(min_length=1)
+    senders: SlackSenders = "anyone"
+    # Case-insensitive regular expression the message text must match.
+    match: str | None = Field(default=None, max_length=200)
+    max_runs_per_hour: int | None = Field(default=None, ge=1, le=100)
+
+    @field_validator("channel")
+    @classmethod
+    def _valid_channel(cls, value: str) -> str:
+        channel = value.strip().upper()
+        if not _SLACK_TRIGGER_CHANNEL_RE.fullmatch(channel):
+            raise ValueError("channel must be a Slack channel ID starting with C or G")
+        return channel
+
+    @field_validator("match")
+    @classmethod
+    def _valid_match(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return None
+        try:
+            re.compile(value)
+        except re.error as exc:
+            raise ValueError(f"match is not a valid regular expression: {exc}") from exc
+        return value
+
+
+class LinearTrigger(BaseModel):
+    """Fires on issue events in one Linear team."""
+
+    kind: Literal["linear"] = "linear"
+    team: str = Field(min_length=1, max_length=10)
+    events: list[LinearTriggerEvent] = Field(min_length=1)
+    # Issue labels, by name: an issue must carry one, or for issue.labeled, gain one.
+    labels: list[str] = Field(default_factory=list, max_length=20)
+    project: str | None = Field(default=None, max_length=200)
+    max_runs_per_hour: int | None = Field(default=None, ge=1, le=100)
+
+    @field_validator("team")
+    @classmethod
+    def _valid_team(cls, value: str) -> str:
+        team = value.strip().upper()
+        if not _LINEAR_TEAM_KEY_RE.fullmatch(team):
+            raise ValueError("team must be a Linear team key, such as ENG")
+        return team
+
+    @field_validator("labels")
+    @classmethod
+    def _valid_labels(cls, value: list[str]) -> list[str]:
+        return [label.strip() for label in value if label.strip()]
+
+    @field_validator("project")
+    @classmethod
+    def _valid_project(cls, value: str | None) -> str | None:
+        return value.strip() if value and value.strip() else None
+
+
+TriggerConfig = Annotated[
+    ScheduleTrigger | GitHubTrigger | SlackTrigger | LinearTrigger, Field(discriminator="kind")
+]
+_TRIGGERS = TypeAdapter(list[TriggerConfig])
+
+
+class ScheduleCreateBody(BaseModel):
+    prompt: str = Field(min_length=1, max_length=20_000)
+    # Every trigger, any of which fires the automation, each with its own filters.
+    triggers: list[TriggerConfig] = Field(min_length=1)
+    name: str | None = Field(default=None, max_length=120)
+    model_id: str | None = None
+    effort: str | None = None
+    admin_thread: bool = False
+    # System-owned, not its creator's: admins only, unbounded.
+    system: bool = False
+
+
+class ScheduleUpdateBody(BaseModel):
+    prompt: str | None = Field(default=None, min_length=1, max_length=20_000)
+    # Replaces every trigger.
+    triggers: list[TriggerConfig] | None = Field(default=None, min_length=1)
+    name: str | None = Field(default=None, max_length=120)
+    model_id: str | None = None
+    effort: str | None = None
+    enabled: bool | None = None
+    admin_thread: bool | None = None
+    system: bool | None = None
+
+
+def _validate_cron_value(value: str, low: int, high: int) -> None:
+    try:
+        n = int(value)
+    except ValueError as exc:
+        raise ValueError("cron fields must use numbers, *, ranges, steps, or lists") from exc
+    if n < low or n > high:
+        raise ValueError(f"cron value {n} outside allowed range {low}-{high}")
+
+
+def _validate_cron_field(field: str, low: int, high: int) -> None:
+    for segment in field.split(","):
+        if not segment:
+            raise ValueError("cron fields cannot contain empty list segments")
+        base, sep, step = segment.partition("/")
+        if sep:
+            _validate_cron_value(step, 1, high)
+        if base == "*":
+            continue
+        start, dash, end = base.partition("-")
+        if dash:
+            _validate_cron_value(start, low, high)
+            _validate_cron_value(end, low, high)
+            if int(start) > int(end):
+                raise ValueError("cron ranges must be ascending")
+        else:
+            _validate_cron_value(base, low, high)
+
+
+def normalize_cron_schedule(raw: str) -> str:
+    value = " ".join(raw.strip().split())
+    parts = value.split(" ")
+    if len(parts) != 5:
+        raise ValueError("schedule must be a five-field cron expression")
+    for part, (low, high) in zip(parts, _CRON_FIELD_RANGES, strict=True):
+        _validate_cron_field(part, low, high)
+    return value
+
+
+def _derive_name(prompt: str) -> str:
+    return prompt.strip().splitlines()[0][:80] or "Scheduled agent"
+
+
+def _schedule_summary(record: dict[str, Any], policy: AutomationPolicy) -> dict[str, Any]:
+    triggers = record.get("triggers") or []
+    schedule = next(
+        ((t.get("config") or {}).get("cron") for t in triggers if t.get("kind") == "schedule"),
+        None,
+    )
+    cron_ids = [t["cron_id"] for t in triggers if t.get("cron_id")]
+    return {
+        "id": record.get("id"),
+        "name": record.get("name"),
+        "prompt": record.get("prompt"),
+        "schedule": schedule,
+        "triggers": [{"id": t["id"], **(t.get("config") or {})} for t in triggers],
+        "scope": "system",
+        "adminThread": record.get("admin_thread") is True,
+        "model": record.get("model"),
+        "effort": record.get("effort"),
+        "enabled": bool(record.get("enabled")),
+        "cronId": cron_ids[0] if cron_ids else None,
+        "lastThreadId": record.get("last_thread_id"),
+        "lastRunId": record.get("last_run_id"),
+        "lastTriggeredAt": record.get("last_triggered_at"),
+        "lastError": record.get("last_error"),
+        "lastErrorAt": record.get("last_error_at"),
+        "createdBy": record.get("created_by"),
+        "ownerId": str(policy.owner.id) if policy.owner is not None else None,
+        "system": policy.system,
+        "updatedBy": record.get("updated_by") or record.get("created_by"),
+        "createdAt": record.get("created_at"),
+        "updatedAt": record.get("updated_at"),
+    }
+
+
+def _iso(value: object) -> str | None:
+    return value.isoformat() if isinstance(value, datetime) else None
+
+
+def _uuid(value: str) -> uuid.UUID | None:
+    try:
+        return uuid.UUID(value)
+    except ValueError, AttributeError, TypeError:
+        return None
+
+
+_SELECT_AUTOMATIONS = """
+    SELECT a.* FROM automation a
+"""
+
+
+def _match_key(trigger: TriggerConfig) -> str | None:
+    if isinstance(trigger, GitHubTrigger):
+        return trigger.repo.lower()
+    if isinstance(trigger, SlackTrigger):
+        return trigger.channel
+    if isinstance(trigger, LinearTrigger):
+        return trigger.team
+    return None
+
+
+async def _load_records(
+    conn: AsyncConnection, where: str = "", params: dict[str, object] | None = None
+) -> list[dict[str, Any]]:
+    rows = (
+        (await conn.execute(text(f"{_SELECT_AUTOMATIONS} {where}"), params or {})).mappings().all()
+    )
+    if not rows:
+        return []
+    trigger_rows = (
+        (
+            await conn.execute(
+                text(
+                    "SELECT * FROM automation_trigger WHERE automation_id = ANY(:ids) "
+                    "ORDER BY created_at, id"
+                ),
+                {"ids": [row["id"] for row in rows]},
+            )
+        )
+        .mappings()
+        .all()
+    )
+    triggers_by_automation: dict[uuid.UUID, list[dict[str, Any]]] = {}
+    for row in trigger_rows:
+        triggers_by_automation.setdefault(row["automation_id"], []).append(
+            {
+                "id": str(row["id"]),
+                "kind": row["kind"],
+                "config": dict(row["config"]),
+                "cron_id": row["cron_id"],
+            }
+        )
+    records = []
+    for row in rows:
+        records.append(
+            {
+                "id": str(row["id"]),
+                "name": row["name"],
+                "prompt": row["prompt"],
+                "admin_thread": row["admin_thread"],
+                "model": row["model"],
+                "effort": row["effort"],
+                "base_branch": row["base_branch"],
+                "branch_prefix": row["branch_prefix"],
+                "enabled": row["enabled"],
+                "system": row["system"],
+                "created_by": row["created_by"],
+                "created_by_user_id": str(row["created_by_user_id"])
+                if row.get("created_by_user_id")
+                else None,
+                "updated_by": row["updated_by"],
+                "user_email": row["user_email"],
+                "created_at": _iso(row["created_at"]),
+                "updated_at": _iso(row["updated_at"]),
+                "last_thread_id": row["last_thread_id"],
+                "last_run_id": row["last_run_id"],
+                "last_triggered_at": _iso(row["last_triggered_at"]),
+                "last_error": row["last_error"],
+                "last_error_at": _iso(row["last_error_at"]),
+                "triggers": triggers_by_automation.get(row["id"], []),
+            }
+        )
+    return records
+
+
+async def _insert_triggers(
+    conn: AsyncConnection,
+    automation_id: str,
+    triggers: Sequence[TriggerConfig],
+    trigger_ids: Sequence[uuid.UUID],
+    cron_ids: Sequence[str | None],
+) -> None:
+    for trigger, trigger_id, cron_id in zip(triggers, trigger_ids, cron_ids, strict=True):
+        await conn.execute(
+            text(
+                "INSERT INTO automation_trigger (id, automation_id, kind, config, match_key, "
+                "cron_id) VALUES (:id, :automation_id, :kind, CAST(:config AS jsonb), "
+                ":match_key, :cron_id)"
+            ),
+            {
+                "id": trigger_id,
+                "automation_id": uuid.UUID(automation_id),
+                "kind": trigger.kind,
+                "config": json.dumps(trigger.model_dump(mode="json")),
+                "match_key": _match_key(trigger),
+                "cron_id": cron_id,
+            },
+        )
+
+
+_RUN_STATE_FIELDS = (
+    "last_thread_id",
+    "last_run_id",
+    "last_triggered_at",
+    "last_error",
+    "last_error_at",
+)
+
+
+def _timestamp(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str) and value:
+        return datetime.fromisoformat(value)
+    return None
+
+
+async def _put_run_state(record: dict[str, Any], patch: dict[str, Any]) -> None:
+    """Write only run-state columns, so a launch never overwrites a concurrent edit."""
+    values = {key: value for key, value in patch.items() if key in _RUN_STATE_FIELDS}
+    if not values:
+        return
+    for key in ("last_triggered_at", "last_error_at"):
+        if key in values:
+            values[key] = _timestamp(values[key])
+    assignments = ", ".join(f"{key} = :{key}" for key in values)
+    async with transaction() as conn:
+        await conn.execute(
+            text(f"UPDATE automation SET {assignments} WHERE id = :id"),
+            {**values, "id": uuid.UUID(record["id"])},
+        )
+
+
+async def record_run_error(record: dict[str, Any], error: str) -> None:
+    """Show ``error`` on the automation, as a failed launch does."""
+    await _put_run_state(record, {"last_error": error, "last_error_at": now_iso()})
+
+
+async def get_agent_schedule(schedule_id: str) -> dict[str, Any] | None:
+    automation_id = _uuid(schedule_id)
+    if automation_id is None:
+        return None
+    async with transaction() as conn:
+        records = await _load_records(conn, "WHERE a.id = :id", {"id": automation_id})
+    return records[0] if records else None
+
+
+def _assert_schedule_exists(record: dict[str, Any] | None) -> None:
+    if not record:
+        raise HTTPException(404, "schedule not found")
+
+
+async def list_agent_schedules(
+    login: str | None, *, all_users: bool = False
+) -> list[dict[str, Any]]:
+    """The automations ``login``'s list shows: their own, plus system ones for an admin,
+    or every one in an admin's ``all_users`` view; ``None`` (a system caller) sees every
+    one."""
+    viewer = None if login is None else await AutomationPolicy.for_login(login)
+    if viewer is not None:
+        viewer.check_listing(all_users=all_users)
+    async with transaction() as conn:
+        records = await _load_records(conn, "ORDER BY a.updated_at DESC")
+    policies = await AutomationPolicy.for_records(records)
+    return [
+        _schedule_summary(record, policy)
+        for record, policy in zip(records, policies, strict=True)
+        if viewer is None or viewer.lists(policy, all_users=all_users)
+    ]
+
+
+async def _authorize_creator(login: str) -> None:
+    """Whoever saves a personal automation can run it as themselves.
+
+    A person without a linked GitHub account signs in with LangSmith alone; GitHub is
+    asked for only once it is linked, as the automation's runs then carry it.
+    """
+    from openswe.threads.identity import ThreadIdentity
+
+    identity = ThreadIdentity(login)
+    await identity.authorize()
+    if identity.github_login and not await get_valid_access_token(login):
+        raise HTTPException(401, github_reauth_message(login))
+
+
+async def _create_cron(
+    automation_id: str,
+    trigger_id: uuid.UUID,
+    cron: str,
+    created_by: str | None,
+    *,
+    by: uuid.UUID | None,
+    timezone: str = "UTC",
+) -> str:
+    job = await queue.schedule(
+        AGENT_SCHEDULE_JOB_KIND,
+        {"schedule_id": automation_id, "trigger_id": str(trigger_id)},
+        cron=cron,
+        timezone=timezone,
+        key=f"{AGENT_SCHEDULE_JOB_KIND}:{trigger_id}",
+        metadata={
+            "kind": AGENT_SCHEDULE_JOB_KIND,
+            "schedule_id": automation_id,
+            "created_by": created_by,
+            **agent_version_metadata(),
+        },
+        by=by,
+    )
+    return str(job.id)
+
+
+async def _delete_cron(cron_id: str | None) -> bool:
+    if not cron_id:
+        return True
+    try:
+        if not await queue.cancel(uuid.UUID(cron_id)):
+            # A trigger whose Agent Server cron was never moved to a job still holds it.
+            await _delete_agent_server_cron(cron_id)
+    except Exception:
+        logger.warning("Could not delete schedule job", extra={"cron_id": cron_id}, exc_info=True)
+        return False
+    return True
+
+
+async def _delete_agent_server_cron(cron_id: str) -> None:
+    try:
+        await langgraph_client().crons.delete(cron_id)
+    except NotFoundError:
+        return
+
+
+async def _delete_orphan_crons(automation_id: str, keep: set[str]) -> None:
+    """Delete jobs for ``automation_id`` that no trigger owns any more.
+
+    A job whose delete failed when its trigger was removed keeps firing; the
+    next time it does, it finds itself here and goes.
+    """
+    try:
+        jobs = await queue.find({"schedule_id": automation_id})
+    except Exception:
+        logger.warning(
+            "Could not look up orphaned automation jobs",
+            extra={"schedule_id": automation_id},
+            exc_info=True,
+        )
+        return
+    settled_before = datetime.now(UTC) - _NEW_CRON_GRACE
+    for job in jobs:
+        # An edit makes its jobs before it saves the triggers that own them.
+        if job.created_at <= settled_before and str(job.id) not in keep:
+            await _delete_cron(str(job.id))
+
+
+async def adopt_agent_server_cron(
+    cron_id: str,
+    automation_id: str,
+    trigger_id: str | None,
+    schedule: str,
+    created_by: str | None,
+) -> bool:
+    """Move the trigger an Agent Server cron fired for onto a job; ``False`` for an orphan.
+
+    A cron from before trigger ids names none; the trigger holding it is the one.
+    """
+    if trigger_id is None:
+        async with transaction() as conn:
+            held_by = await conn.scalar(
+                text(
+                    "SELECT id FROM automation_trigger "
+                    "WHERE automation_id = CAST(:automation_id AS uuid) AND cron_id = :cron_id"
+                ),
+                {"automation_id": automation_id, "cron_id": cron_id},
+            )
+        if held_by is None:
+            return False
+        trigger_id = str(held_by)
+    job_id = await _create_cron(automation_id, uuid.UUID(trigger_id), schedule, created_by, by=None)
+    async with transaction() as conn:
+        held = await conn.scalar(
+            text(
+                "UPDATE automation_trigger SET cron_id = :job_id "
+                "WHERE id = CAST(:trigger_id AS uuid) AND cron_id IN (:cron_id, :job_id) "
+                "RETURNING 1"
+            ),
+            {"job_id": job_id, "trigger_id": trigger_id, "cron_id": cron_id},
+        )
+    if held:
+        return True
+    await _delete_cron(job_id)
+    return False
+
+
+async def _create_crons(
+    automation_id: str,
+    triggers: Sequence[TriggerConfig],
+    trigger_ids: Sequence[uuid.UUID],
+    *,
+    enabled: bool,
+    created_by: str,
+    saved_by: str,
+) -> list[str | None]:
+    """One cron per schedule trigger of an enabled automation; all or nothing."""
+    saver = await User.for_login("github", saved_by)
+    cron_ids: list[str | None] = []
+    try:
+        for trigger, trigger_id in zip(triggers, trigger_ids, strict=True):
+            if enabled and isinstance(trigger, ScheduleTrigger):
+                cron_ids.append(
+                    await _create_cron(
+                        automation_id,
+                        trigger_id,
+                        trigger.cron,
+                        created_by,
+                        by=None if saver is None else saver.id,
+                        timezone=trigger.timezone,
+                    )
+                )
+            else:
+                cron_ids.append(None)
+    except Exception as exc:
+        for cron_id in cron_ids:
+            await _delete_cron(cron_id)
+        logger.exception("Failed to create schedule cron", extra={"schedule_id": automation_id})
+        raise HTTPException(502, "failed to create schedule cron") from exc
+    return cron_ids
+
+
+def _parsed_triggers(record: dict[str, Any]) -> list[TriggerConfig]:
+    return _TRIGGERS.validate_python([t["config"] for t in record.get("triggers") or []])
+
+
+async def _checked_triggers(
+    triggers: Sequence[TriggerConfig], login: str, *, use_system_credentials: bool
+) -> list[TriggerConfig]:
+    """``triggers`` once whoever configures them can reach every repository they name,
+    and Open SWE can read every Slack channel they watch."""
+    repos = {trigger.repo for trigger in triggers if isinstance(trigger, GitHubTrigger)}
+    if repos and not use_system_credentials and login.startswith("user:"):
+        raise HTTPException(422, "Link your GitHub account to run an automation on a repository")
+    for repo in repos:
+        if use_system_credentials:
+            await repo_config_for_system(repo)
+        else:
+            await repo_config_for_user(login, repo)
+    for channel in sorted({t.channel for t in triggers if isinstance(t, SlackTrigger)}):
+        await _require_watchable_slack_channel(channel)
+    return list(triggers)
+
+
+async def _require_watchable_slack_channel(channel_id: str) -> None:
+    """Refuse a channel whose messages Slack doesn't deliver to Open SWE."""
+    channel = await SlackChannel.load(channel_id, use_cache=False)
+    if channel is None:
+        raise HTTPException(422, f"Slack channel {channel_id} could not be read")
+    if not channel.context.allows_operations:
+        raise HTTPException(422, "externally shared Slack channels can't trigger automations")
+    if channel.payload.get("is_member") is not True:
+        raise HTTPException(
+            422, f"invite Robin to #{channel.name or channel_id} so it sees its messages"
+        )
+
+
+async def _refuse_public_events_for_admin(
+    triggers: Sequence[TriggerConfig], *, admin_thread: bool
+) -> None:
+    """An admin-thread automation never runs on events in a public repository.
+
+    Anyone can write the issue or pull request text such an event carries, and
+    an admin thread holds instance-admin tools.
+    """
+    if not admin_thread:
+        return
+    for repo in sorted({t.repo for t in triggers if isinstance(t, GitHubTrigger)}):
+        if await repo_is_private(repo) is not True:
+            raise HTTPException(
+                422,
+                f"admin-thread automations can't run on GitHub events in {repo}: it is public, "
+                "or its visibility could not be checked",
+            )
+
+
+def _repo_dict(full_name: str | None) -> dict[str, str] | None:
+    if not full_name or "/" not in full_name:
+        return None
+    owner, name = full_name.split("/", 1)
+    return {"owner": owner, "name": name}
+
+
+def _test_run_repo(record: dict[str, Any]) -> str | None:
+    """The repository a test run starts in: its first GitHub trigger's, which events would use."""
+    for trigger in record.get("triggers") or []:
+        repo = (trigger.get("config") or {}).get("repo")
+        if trigger.get("kind") == "github" and isinstance(repo, str) and repo:
+            return repo
+    return None
+
+
+async def create_agent_schedule(
+    login: str,
+    body: ScheduleCreateBody,
+    *,
+    email: str | None = None,
+    allow_admin_thread: bool = False,
+    use_system_credentials: bool = False,
+) -> dict[str, Any]:
+    creator = await AutomationPolicy.for_login(login)
+    policy = creator.as_system(body.system)
+    policy.check_kind(creator)
+    if body.admin_thread and (not allow_admin_thread or not creator.admin):
+        raise HTTPException(403, "admin threads are for automations made by admins")
+    if use_system_credentials:
+        profile: dict[str, Any] = {}
+        run_email = email
+    else:
+        await _authorize_creator(login)
+        profile = await get_profile(login) or {}
+        run_email = await resolve_run_email(login, profile) or email
+    triggers = await _checked_triggers(
+        body.triggers, login, use_system_credentials=use_system_credentials
+    )
+    await _refuse_public_events_for_admin(triggers, admin_thread=body.admin_thread)
+    # A system automation runs with no person's credentials, so it needs no confirmation.
+    if policy.personal:
+        for trigger in triggers:
+            if isinstance(trigger, GitHubTrigger):
+                await trigger.require_public_repo_confirmation()
+    chosen_model, chosen_effort = normalize_model_choice(body.model_id, body.effort)
+    if policy.personal:
+        # A personal automation runs on Auto, whatever model was asked for.
+        chosen_model, chosen_effort = None, None
+    automation_id = str(uuid.uuid4())
+    trigger_ids = [uuid.uuid4() for _ in triggers]
+    cron_ids = await _create_crons(
+        automation_id, triggers, trigger_ids, enabled=True, created_by=login, saved_by=login
+    )
+    try:
+        async with transaction() as conn:
+            policy.check_creation()
+            await conn.execute(
+                text(
+                    "INSERT INTO automation (id, name, prompt, admin_thread, "
+                    "model, effort, base_branch, branch_prefix, enabled, created_by, "
+                    "updated_by, user_email, created_by_user_id, system) VALUES (:id, "
+                    ":name, :prompt, :admin_thread, :model, :effort, "
+                    ":base_branch, :branch_prefix, true, :login, :login, :user_email, "
+                    ":creator_id, :system)"
+                ),
+                {
+                    "id": uuid.UUID(automation_id),
+                    "name": (body.name or _derive_name(body.prompt)).strip(),
+                    "prompt": body.prompt.strip(),
+                    "admin_thread": body.admin_thread,
+                    "model": chosen_model or "Default",
+                    "effort": chosen_effort,
+                    "base_branch": profile.get("base_branch") or "main",
+                    "branch_prefix": profile.get("branch_prefix"),
+                    "login": login,
+                    "user_email": (run_email or "").strip().lower(),
+                    "creator_id": creator.owner.id if creator.owner is not None else None,
+                    "system": policy.system,
+                },
+            )
+            await _insert_triggers(conn, automation_id, triggers, trigger_ids, cron_ids)
+    except Exception:
+        for cron_id in cron_ids:
+            await _delete_cron(cron_id)
+        raise
+    record = await get_agent_schedule(automation_id)
+    assert record is not None
+    return _schedule_summary(record, policy)
+
+
+async def update_agent_schedule(
+    schedule_id: str,
+    login: str,
+    body: ScheduleUpdateBody,
+    *,
+    email: str | None = None,
+    allow_admin_thread: bool = False,
+    use_system_credentials: bool = False,
+) -> dict[str, Any]:
+    existing = await get_agent_schedule(schedule_id)
+    _assert_schedule_exists(existing)
+    assert existing is not None
+    actor = await AutomationPolicy.for_login(login)
+    current = await AutomationPolicy.for_record(existing)
+    current.authorize(actor)
+    owner = current if body.system is None else current.as_system(body.system)
+    owner.check_kind(actor)
+    if body.admin_thread is True and not actor.admin:
+        raise HTTPException(403, "admin threads are for automations made by admins")
+    if (
+        body.admin_thread is True
+        and existing.get("admin_thread") is not True
+        and not allow_admin_thread
+    ):
+        raise HTTPException(403, "admin only")
+    # An admin thread runs with its creator's admin access, which a member never had.
+    if body.admin_thread is True and existing.get("admin_thread") is not True and not current.admin:
+        raise HTTPException(
+            422, "Admin threads need an automation created by an admin; this one's creator isn't"
+        )
+
+    columns: dict[str, object] = {"updated_by": login}
+    if body.prompt is not None:
+        columns["prompt"] = body.prompt.strip()
+    if body.name is not None:
+        columns["name"] = body.name.strip() or _derive_name(
+            str(columns.get("prompt", existing["prompt"]))
+        )
+    if body.model_id is not None or body.effort is not None:
+        model, effort = normalize_model_choice(body.model_id, body.effort)
+        if model and effort:
+            columns["model"] = model
+            columns["effort"] = effort
+    if body.enabled is not None:
+        columns["enabled"] = body.enabled
+    if body.admin_thread is not None:
+        columns["admin_thread"] = body.admin_thread
+    if owner.system != current.system:
+        columns["system"] = owner.system
+        # Made personal, it runs as its creator, who may not be an admin.
+        if owner.personal and not current.admin:
+            columns["admin_thread"] = False
+    if owner.personal:
+        columns["model"], columns["effort"] = "Default", None
+
+    current_triggers = _parsed_triggers(existing)
+    triggers = current_triggers
+    if body.triggers is not None and [t.model_dump() for t in body.triggers] != [
+        t.model_dump() for t in current_triggers
+    ]:
+        triggers = await _checked_triggers(
+            body.triggers,
+            existing["created_by"],
+            use_system_credentials=use_system_credentials,
+        )
+
+    was_admin = existing.get("admin_thread") is True
+    admin_thread = body.admin_thread if body.admin_thread is not None else was_admin
+    # Only an edit that could newly put admin runs on a repository's events is
+    # checked; pausing or renaming must keep working if GitHub can't be read,
+    # and launches skip repositories that went public since.
+    if triggers is not current_triggers or (admin_thread and not was_admin):
+        await _refuse_public_events_for_admin(triggers, admin_thread=admin_thread)
+    # Likewise only when its triggers change or it becomes personal, so pausing keeps working.
+    if owner.personal and (triggers is not current_triggers or owner.system != current.system):
+        for trigger in triggers:
+            if isinstance(trigger, GitHubTrigger):
+                await trigger.require_public_repo_confirmation()
+
+    enabled = bool(columns.get("enabled", existing.get("enabled")))
+    rebuild_triggers = triggers is not current_triggers or enabled != bool(existing.get("enabled"))
+    old_cron_ids = [t.get("cron_id") for t in existing.get("triggers") or []]
+    trigger_ids = [uuid.uuid4() for _ in triggers]
+    new_cron_ids: list[str | None] = []
+    if rebuild_triggers:
+        new_cron_ids = await _create_crons(
+            existing["id"],
+            triggers,
+            trigger_ids,
+            enabled=enabled,
+            created_by=existing["created_by"],
+            saved_by=login,
+        )
+    assignments = ", ".join(f"{key} = :{key}" for key in columns)
+    try:
+        async with transaction() as conn:
+            if owner.system != current.system:
+                # Made personal, it needs an owner.
+                owner.check_creation()
+            await conn.execute(
+                text(
+                    f"UPDATE automation SET {assignments}, updated_at = clock_timestamp() "
+                    "WHERE id = :id"
+                ),
+                {**columns, "id": uuid.UUID(existing["id"])},
+            )
+            if rebuild_triggers:
+                await conn.execute(
+                    text("DELETE FROM automation_trigger WHERE automation_id = :id"),
+                    {"id": uuid.UUID(existing["id"])},
+                )
+                await _insert_triggers(conn, existing["id"], triggers, trigger_ids, new_cron_ids)
+    except Exception:
+        for cron_id in new_cron_ids:
+            await _delete_cron(cron_id)
+        raise
+    if rebuild_triggers:
+        for cron_id in old_cron_ids:
+            await _delete_cron(cron_id)
+    updated = await get_agent_schedule(existing["id"])
+    assert updated is not None
+    return _schedule_summary(updated, owner)
+
+
+async def delete_agent_schedule(schedule_id: str, *, login: str | None = None) -> None:
+    existing = await get_agent_schedule(schedule_id)
+    _assert_schedule_exists(existing)
+    assert existing is not None
+    if login is not None:
+        (await AutomationPolicy.for_record(existing)).authorize(
+            await AutomationPolicy.for_login(login)
+        )
+    for trigger in existing.get("triggers") or []:
+        await _delete_cron(trigger.get("cron_id"))
+    async with transaction() as conn:
+        await conn.execute(
+            text("DELETE FROM automation WHERE id = :id"), {"id": uuid.UUID(existing["id"])}
+        )
+
+
+def _admin_thread_enabled(record: dict[str, Any]) -> bool:
+    """An automation runs as an admin thread only while the person who made it is an admin."""
+    email = record.get("user_email")
+    login = record.get("created_by")
+    return record.get("admin_thread") is True and is_admin(
+        email if isinstance(email, str) else None,
+        login=login if isinstance(login, str) else None,
+    )
+
+
+async def schedule_thread_metadata(cfg: RunConfig) -> dict[str, Any] | None:
+    """Metadata of an automation's thread, checked against its execution identity."""
+    if cfg.source != "schedule" or not cfg.thread_id:
+        return None
+    thread = await THREADS.get(cfg.thread_id)
+    if thread is None:
+        return None
+    metadata = dict(thread.metadata)
+    if metadata.get("owner_type") == "system" and metadata.get("visibility") == "public":
+        return metadata if not cfg.github_login and not cfg.user_email else None
+    if metadata.get("owner_type") != "user" or metadata.get("visibility") != "private":
+        return None
+    from openswe.threads.identity import ThreadIdentity
+
+    login = (
+        cfg.github_login if cfg.github_linked else (f"user:{cfg.user_id}" if cfg.user_id else None)
+    )
+    if not login:
+        return None
+    try:
+        actor = await ThreadIdentity(login).user()
+    except ValueError:
+        logger.warning("Automation run has an invalid execution identity", exc_info=True)
+        return None
+    creator_id = metadata.get("automation_creator_user_id")
+    if actor is None or str(actor.id) != creator_id or metadata.get("owner_user_id") != creator_id:
+        return None
+    return metadata
+
+
+async def authorized_schedule_run(cfg: RunConfig) -> dict[str, Any] | None:
+    """The automation whose own thread this run executes on, or ``None`` for any other run."""
+    if not cfg.schedule_id:
+        return None
+    metadata = await schedule_thread_metadata(cfg)
+    if metadata is None or metadata.get("schedule_id") != cfg.schedule_id:
+        return None
+    return await get_agent_schedule(cfg.schedule_id)
+
+
+async def authorized_admin_schedule(cfg: RunConfig) -> dict[str, Any] | None:
+    """Verify a system admin grant against its saved invocation and current schedule."""
+    if cfg.admin_thread is not True or not cfg.invocation_id:
+        return None
+    metadata = await schedule_thread_metadata(cfg)
+    if metadata is None:
+        return None
+    grant = metadata.get("system_authorization")
+    if (
+        not isinstance(grant, dict)
+        or grant.get("invocation_id") != cfg.invocation_id
+        or not isinstance(schedule_id := grant.get("schedule_id"), str)
+        or not schedule_id
+        or schedule_id != cfg.schedule_id
+    ):
+        return None
+    record = await get_agent_schedule(schedule_id)
+    return record if record and _admin_thread_enabled(record) else None
+
+
+async def _agent_run_metadata(
+    record: dict[str, Any],
+    thread_id: str,
+    repo: dict[str, str] | None,
+    *,
+    test_run: bool = False,
+    admin_thread: bool = False,
+) -> dict[str, Any]:
+    created_ms = now_ms()
+    title_prefix = "Test" if test_run else "Scheduled"
+    metadata: dict[str, Any] = {
+        "source": "schedule",
+        "origin": "schedule",
+        "thread_category": "automation",
+        "trigger_kind": "schedule_test" if test_run else "schedule",
+        "schedule_id": record["id"],
+        "automation_scope": "system",
+        "owner_type": "system",
+        "visibility": "public",
+        "schedule_name": record.get("name"),
+        "schedule_test": test_run,
+        "created_by": record.get("created_by"),
+        "title": f"{title_prefix}: {record.get('name') or 'Agent'}",
+        "base_branch": record.get("base_branch") or "main",
+        "branch_prefix": record.get("branch_prefix"),
+        "model": record.get("model") or "Default",
+        "effort": record.get("effort"),
+        "created_at_ms": created_ms,
+        "updated_at_ms": created_ms,
+    }
+    if repo:
+        metadata["repo_owner"] = repo["owner"]
+        metadata["repo_name"] = repo["name"]
+    if admin_thread:
+        metadata["admin_thread"] = True
+    # A personal automation's spend is its creator's; a system one's is no person's. Both
+    # are fixed here, so converting the automation later doesn't change who pays.
+    if record.get("system") is True:
+        metadata["automation_system"] = True
+    else:
+        creator = await User.automation_creator(record)
+        if creator is None:
+            raise HTTPException(403, "This personal automation no longer has an owner")
+        owner_login = creator.github_login or f"user:{creator.id}"
+        metadata.update(
+            automation_creator_user_id=str(creator.id),
+            owner_user_id=str(creator.id),
+            owner_login=owner_login,
+            owner_type="user",
+            visibility="private",
+            # The sidebar lists threads by participant, so the owner must be one.
+            **await participant_metadata({}, login=owner_login, email=creator.email or None),
+        )
+    return metadata
+
+
+async def _agent_run_config(
+    record: dict[str, Any],
+    thread_id: str,
+    repo: dict[str, str] | None,
+    *,
+    test_run: bool = False,
+    admin_thread: bool = False,
+) -> dict[str, Any]:
+    configurable = with_invocation_id(
+        {
+            "thread_id": thread_id,
+            "source": "schedule",
+            "schedule_id": record["id"],
+            "schedule_test": test_run,
+        },
+        new_invocation_id(),
+    )
+    if record.get("system") is not True:
+        from openswe.threads.identity import ThreadIdentity
+
+        creator = await User.automation_creator(record)
+        if creator is None:
+            raise HTTPException(403, "This personal automation no longer has an owner")
+        login = creator.github_login or f"user:{creator.id}"
+        await ThreadIdentity(login).authorize()
+        if repo:
+            await repo_config_for_user(login, f"{repo['owner']}/{repo['name']}")
+        if creator.github_login:
+            if not await get_valid_access_token(login):
+                raise HTTPException(401, "The personal automation owner must reconnect GitHub")
+            configurable["github_login"] = login
+        else:
+            configurable.update(
+                user_id=str(creator.id), github_linked=False, auth_provider="langsmith"
+            )
+        configurable["user_email"] = await resolve_run_email(login, await get_profile(login) or {})
+    if repo:
+        configurable["repo"] = repo
+    if admin_thread:
+        configurable["admin_thread"] = True
+    model, effort = normalize_model_choice(record.get("model"), record.get("effort"))
+    if model and effort:
+        model, effort = gate_fable_model(
+            model, effort, fable_enabled=(await get_settings()).fable_enabled
+        )
+        configurable["agent_model_id"] = model
+        configurable["agent_effort"] = effort
+    return {"configurable": configurable, "metadata": agent_version_metadata()}
+
+
+async def _automation_identity(record: dict[str, Any]) -> SystemIdentity:
+    """Who the run works for: the automation, and the creator it may DM its result to."""
+    identity: SystemIdentity = {
+        "id": f"system:schedule:{record['id']}",
+        "display_name": record.get("name") or "Scheduled automation",
+        "platform": "open-swe",
+    }
+    creator = record.get("created_by")
+    user = await User.for_login("github", creator) if isinstance(creator, str) and creator else None
+    if user is not None and user.slack_user_id:
+        identity["content"] = prompt(
+            "runs/automation-creator", login=creator, slack_user_id=user.slack_user_id
+        )
+    return identity
+
+
+async def _launch_agent_schedule_record(
+    record: dict[str, Any],
+    *,
+    repo: str | None,
+    test_run: bool = False,
+    prompt: str | None = None,
+    token_repositories: list[str] | None = None,
+    origin: str = "schedule",
+    slack_reply: AutomationSlackReply | None = None,
+) -> dict[str, Any]:
+    schedule_id = record["id"]
+    if not test_run and not record.get("enabled"):
+        return {"status": "disabled", "schedule_id": schedule_id}
+
+    policy = await AutomationPolicy.for_record(record)
+    if policy.personal:
+        # Auto, even for a row saved while personal automations were pinned to Fast.
+        record = {**record, "model": None, "effort": None}
+
+    if repo and policy.system:
+        try:
+            await require_repo_access_for_system(repo)
+        except HTTPException as exc:
+            await _put_run_state(
+                record,
+                {
+                    "last_error": str(exc.detail),
+                    "last_error_at": now_iso(),
+                },
+            )
+            return {
+                "status": "unauthorized",
+                "schedule_id": schedule_id,
+                "error": exc.detail,
+                "status_code": exc.status_code,
+            }
+
+    client = langgraph_client()
+    thread_id = str(uuid.uuid4())
+    admin_thread = _admin_thread_enabled(record)
+    repo_config = _repo_dict(repo)
+    try:
+        run_config = await _agent_run_config(
+            record, thread_id, repo_config, test_run=test_run, admin_thread=admin_thread
+        )
+        metadata = await _agent_run_metadata(
+            record, thread_id, repo_config, test_run=test_run, admin_thread=admin_thread
+        )
+    except HTTPException as exc:
+        await _put_run_state(record, {"last_error": str(exc.detail), "last_error_at": now_iso()})
+        return {
+            "status": "unauthorized",
+            "schedule_id": schedule_id,
+            "error": exc.detail,
+            "status_code": exc.status_code,
+        }
+    if slack_reply is not None:
+        metadata["automation_slack_reply"] = slack_reply.model_dump(mode="json")
+        run_config["configurable"]["automation_slack_reply"] = slack_reply.model_dump(mode="json")
+    if token_repositories is not None:
+        metadata[GITHUB_TOKEN_REPOSITORIES_KEY] = token_repositories
+    if admin_thread:
+        metadata["system_authorization"] = {
+            "schedule_id": schedule_id,
+            "invocation_id": run_config["configurable"]["invocation_id"],
+        }
+    await create_thread(
+        client, thread_id, title=metadata["title"], metadata=metadata, if_exists="do_nothing"
+    )
+    await client.threads.update(thread_id=thread_id, metadata=metadata)
+    input_context: InputMessageContext = {
+        "sender_id": f"system:schedule:{schedule_id}",
+        "surface": "automation",
+        "kind": "system",
+    }
+    run = await create_durable_run(
+        thread_id,
+        _AGENT_ASSISTANT_ID,
+        input=build_run_input(
+            str(record["prompt"]) if prompt is None else prompt,
+            input_context,
+            systems=[await _automation_identity(record)],
+        ),
+        source="schedule",
+        origin=origin,
+        thread_title=None,
+        config=run_config,
+        client=client,
+    )
+    run_id = run.get("run_id") if isinstance(run, dict) else getattr(run, "run_id", None)
+    # The run is durable now; bookkeeping failures must not release delivery claims.
+    log_context = {"schedule_id": schedule_id, "thread_id": thread_id, "run_id": run_id}
+    try:
+        await client.threads.update(
+            thread_id=thread_id,
+            metadata={
+                "latest_run_id": run_id,
+                "latest_run_status": "pending",
+                "updated_at_ms": now_ms(),
+            },
+        )
+    except Exception:
+        logger.exception("Failed to save dispatched automation thread metadata", extra=log_context)
+    try:
+        await _put_run_state(
+            record,
+            {
+                "last_thread_id": thread_id,
+                "last_run_id": run_id,
+                "last_triggered_at": now_iso(),
+                "last_error": None,
+                "last_error_at": None,
+            },
+        )
+    except Exception:
+        logger.exception("Failed to save dispatched automation run state", extra=log_context)
+    return {
+        "status": "started",
+        "schedule_id": schedule_id,
+        "thread_id": thread_id,
+        "run_id": run_id,
+    }
+
+
+def _github_events(event_type: str, payload: dict[str, Any]) -> set[GitHubEvent]:
+    """The trigger events one GitHub delivery stands for."""
+    action = payload.get("action")
+    if event_type == "issues" and action == "opened":
+        return {"issues.opened"}
+    if event_type != "pull_request":
+        return set()
+    if action == "opened":
+        return {"pull_request.opened"}
+    if action == "closed":
+        pull_request = payload.get("pull_request")
+        merged = isinstance(pull_request, dict) and pull_request.get("merged") is True
+        return {"pull_request.closed", "pull_request.merged"} if merged else {"pull_request.closed"}
+    return set()
+
+
+async def github_automation_rules(repo_full_name: str) -> list[dict[str, Any]]:
+    """The enabled automations with a GitHub trigger on ``repo_full_name`` (lowercased),
+    for MDA's channel to match."""
+    async with transaction() as conn:
+        return await _load_records(
+            conn,
+            "WHERE a.enabled AND a.id IN (SELECT automation_id FROM automation_trigger "
+            "WHERE kind = 'github' AND match_key = :repo)",
+            {"repo": repo_full_name},
+        )
+
+
+def github_trigger_events(
+    record: dict[str, Any], repo_full_name: str, branches: PullRequestBranches | None = None
+) -> list[GitHubEvent]:
+    """The events the automation's GitHub triggers on ``repo_full_name`` fire on, for a
+    pull request between ``branches`` when given.
+
+    Only this repository's triggers: another GitHub trigger on the same automation
+    configures events for its own repository.
+    """
+    configured = {
+        event
+        for trigger in record.get("triggers") or []
+        if trigger.get("kind") == "github"
+        and str((trigger.get("config") or {}).get("repo") or "").lower() == repo_full_name
+        and GitHubBranchFilters.model_validate(trigger.get("config") or {}).takes(branches)
+        for event in (trigger.get("config") or {}).get("events") or []
+    }
+    return sorted(configured & set(get_args(GitHubTriggerEvent)))
+
+
+async def _fired_github_automation(
+    fired: FiredGitHubAutomation, repo_full_name: str, branches: PullRequestBranches | None
+) -> dict[str, Any] | None:
+    """The automation the channel matched, when it is enabled and fires on ``fired.event``
+    in the repository for the pull request's ``branches``, so a call can't start another
+    automation or one whose trigger skips them."""
+    try:
+        automation_id = uuid.UUID(fired.automation_id)
+    except ValueError:
+        return None
+    async with transaction() as conn:
+        records = await _load_records(conn, "WHERE a.enabled AND a.id = :id", {"id": automation_id})
+    if not records or fired.event not in github_trigger_events(
+        records[0], repo_full_name, branches
+    ):
+        return None
+    return records[0]
+
+
+async def plan_github_automations(
+    event_type: str,
+    payload: dict[str, Any],
+    delivery_id: str,
+    fired: Sequence[FiredGitHubAutomation],
+) -> list[GitHubThreadRun]:
+    """The run of every automation MDA's channel matched a GitHub delivery to.
+
+    The channel matches and writes each run's prompt; each automation must be
+    enabled and fire on the event in the delivery's repository, and for a pull
+    request, have a trigger that takes its branches. Each is claimed once
+    per delivery, and its run planned on a thread of its own for that delivery. A
+    call sent again for a delivery plans the runs it already claimed again, on the
+    same threads, where the channel starts each delivery's run once.
+    """
+    events = _github_events(event_type, payload)
+    if not events:
+        return []
+    sender_value = payload.get("sender")
+    sender = sender_value.get("login") if isinstance(sender_value, dict) else None
+    if sender in OPEN_SWE_GITHUB_LOGINS:
+        # A run that opens or closes a pull request would otherwise trigger itself.
+        logger.info(
+            "Ignoring Open SWE's own GitHub event for automations",
+            extra={"github_delivery": delivery_id, "github_event": event_type},
+        )
+        return []
+    if not delivery_id:
+        logger.warning("GitHub automation delivery is missing a delivery ID")
+        return []
+    repo_value = payload.get("repository")
+    repo: dict[str, Any] = repo_value if isinstance(repo_value, dict) else {}
+    owner_value = repo.get("owner")
+    owner: dict[str, Any] = owner_value if isinstance(owner_value, dict) else {}
+    owner_login = owner.get("login")
+    repo_name = repo.get("name")
+    if (
+        not isinstance(owner_login, str)
+        or not owner_login
+        or not isinstance(repo_name, str)
+        or not repo_name
+    ):
+        logger.error(
+            "GitHub automation payload is missing repository identity",
+            extra={"github_delivery": delivery_id},
+        )
+        return []
+    full_name = f"{owner_login}/{repo_name}".lower()
+    # Pull request events on a public repository run only for org members; issue
+    # automations keep firing for any author, as before, with a narrowed token.
+    if event_type == "pull_request" and await enforce_public_repo_org_gate(payload, event_type):
+        return []
+    runs: list[GitHubThreadRun] = []
+    private = repo_private_from_payload(payload)
+    branches = (
+        PullRequestBranches.of(payload.get("pull_request"))
+        if event_type == "pull_request"
+        else None
+    )
+    for each in fired:
+        record = (
+            await _fired_github_automation(each, full_name, branches)
+            if each.event in events
+            else None
+        )
+        if record is None:
+            logger.warning(
+                "GitHub automation the channel matched doesn't fire on the delivery",
+                extra={"schedule_id": each.automation_id, "github_delivery": delivery_id},
+            )
+            continue
+        schedule_id = record["id"]
+        if (
+            record.get("system") is not True
+            and private is not True
+            and not any(
+                isinstance(trigger, GitHubTrigger)
+                and trigger.fires_confirmed(full_name, events, branches)
+                for trigger in _parsed_triggers(record)
+            )
+        ):
+            # A personal automation's run acts as its creator. Saving refuses an
+            # unconfirmed public repository, but one can go public afterwards.
+            await _put_run_state(
+                record,
+                {
+                    "last_error": f"{full_name} {GitHubTrigger.PUBLIC_REPO_UNCONFIRMED}",
+                    "last_error_at": now_iso(),
+                },
+            )
+            continue
+        if record.get("admin_thread") is True and private is not True:
+            # Saving refuses this, but a repository can go public afterwards.
+            logger.warning(
+                "Skipping an admin-thread automation for a public repository event",
+                extra={"schedule_id": schedule_id, "github_delivery": delivery_id},
+            )
+            continue
+        claim_key = f"{schedule_id}:{delivery_id}"
+        try:
+            claimed = await event_claims.claim(
+                _DELIVERY_CLAIM_SCOPE, claim_key, ttl=_DELIVERY_CLAIM_TTL
+            ) or await event_claims.held(_DELIVERY_CLAIM_SCOPE, claim_key)
+        except Exception:
+            logger.exception(
+                "Failed to claim GitHub automation delivery",
+                extra={"schedule_id": schedule_id, "github_delivery": delivery_id},
+            )
+            continue
+        if not claimed:
+            continue
+        try:
+            run = await _planned_github_automation(
+                record,
+                repo=f"{owner_login}/{repo_name}",
+                thread_id=str(
+                    uuid.uuid5(_GITHUB_AUTOMATION_THREADS, f"{schedule_id}/{delivery_id}")
+                ),
+                prompt=each.prompt,
+                # An outsider can open an issue on a public repository, so the
+                # run it starts reaches only that repository.
+                token_repositories=event_token_repositories(
+                    owner_login, repo_name, private=private
+                ),
+            )
+        except Exception:
+            logger.exception("Failed to plan GitHub automation", extra={"schedule_id": schedule_id})
+            # Released, so the channel's call sent again plans it afresh.
+            await event_claims.release(_DELIVERY_CLAIM_SCOPE, claim_key)
+            continue
+        if run is None:
+            logger.error(
+                "GitHub automation plans no run",
+                extra={"schedule_id": schedule_id, "github_delivery": delivery_id},
+            )
+            await event_claims.release(_DELIVERY_CLAIM_SCOPE, claim_key)
+            continue
+        runs.append(run)
+    return runs
+
+
+async def _planned_github_automation(
+    record: dict[str, Any],
+    *,
+    repo: str,
+    thread_id: str,
+    prompt: str,
+    token_repositories: list[str] | None,
+) -> GitHubThreadRun | None:
+    """The automation's run in ``repo``; ``None`` when its credentials cannot reach it."""
+    from openswe.github.channel import CHANNEL as GITHUB_CHANNEL
+
+    try:
+        if record.get("system") is True:
+            await require_repo_access_for_system(repo)
+        else:
+            creator = await User.automation_creator(record)
+            if creator is None:
+                raise HTTPException(403, "This personal automation no longer has an owner")
+            await repo_config_for_user(creator.github_login or f"user:{creator.id}", repo)
+    except HTTPException as exc:
+        await _put_run_state(record, {"last_error": str(exc.detail), "last_error_at": now_iso()})
+        return None
+    try:
+        planned = await _planned_channel_automation(
+            record,
+            channel=GITHUB_CHANNEL,
+            thread_id=thread_id,
+            prompt=prompt,
+            repo=_repo_dict(repo),
+            token_repositories=token_repositories,
+        )
+    except HTTPException as exc:
+        await _put_run_state(record, {"last_error": str(exc.detail), "last_error_at": now_iso()})
+        return None
+    return GitHubThreadRun(**planned)
+
+
+_SLACK_FENCE_RE = re.compile(r"<(\s*/?\s*untrusted_slack_message)", re.IGNORECASE)
+# Message subtypes that are someone posting, as opposed to edits, joins, or deletions.
+_SLACK_POST_SUBTYPES = frozenset({"", "bot_message", "file_share"})
+
+
+def _slack_message_text(event: SlackEvent) -> str:
+    """The text a message shows, with alert attachments (where bots put their content)."""
+    parts = [event.text or ""]
+    for attachment in event.attachments:
+        for field in ("pretext", "title", "text", "fallback"):
+            value = attachment.get(field)
+            if isinstance(value, str) and value.strip() and value not in parts:
+                parts.append(value)
+    return "\n".join(part for part in parts if part.strip())
+
+
+def _slack_trigger_fires(
+    config: dict[str, Any], channel: str, *, from_bot: bool, text: str
+) -> bool:
+    if config.get("channel") != channel or "message.posted" not in (config.get("events") or []):
+        return False
+    senders = config.get("senders") or "anyone"
+    if (senders == "bots" and not from_bot) or (senders == "people" and from_bot):
+        return False
+    pattern = config.get("match")
+    return not pattern or re.search(pattern, text, re.IGNORECASE) is not None
+
+
+def _slack_event_prompt(
+    record: dict[str, Any], channel: SlackChannelContext, event: SlackEvent, text: str
+) -> str:
+    author = f"bot {event.bot_id}" if event.is_from_bot else f"<@{event.resolve_user_id()}>"
+    message = text[:_SLACK_MESSAGE_MAX_CHARS]
+    return prompt(
+        "runs/slack-automation-event",
+        prompt=record["prompt"],
+        event_description=SLACK_EVENT_DESCRIPTIONS["message.posted"],
+        channel=f"#{channel.label}" if channel.label else channel.id,
+        channel_id=channel.id,
+        author=author,
+        ts=event.ts,
+        message=_SLACK_FENCE_RE.sub(r"&lt;\1", message),
+    )
+
+
+async def _claim_delivery(
+    claim_key: str, group: str, max_runs_per_hour: object, schedule_id: str
+) -> bool:
+    """Claim a delivery for one automation, within its trigger's hourly run cap."""
+    if not isinstance(max_runs_per_hour, int):
+        return await event_claims.claim(_DELIVERY_CLAIM_SCOPE, claim_key, ttl=_DELIVERY_CLAIM_TTL)
+    outcome = await event_claims.claim_within_limit(
+        _DELIVERY_CLAIM_SCOPE,
+        claim_key,
+        ttl=_DELIVERY_CLAIM_TTL,
+        group=group,
+        limit=max_runs_per_hour,
+        within=_RATE_WINDOW,
+    )
+    if outcome == "limited":
+        logger.warning(
+            "Automation trigger hit its hourly run limit",
+            extra={"schedule_id": schedule_id, "claim_group": group},
+        )
+    return outcome == "claimed"
+
+
+async def slack_channel_watched(channel_id: str) -> bool:
+    """Whether an enabled automation has a Slack trigger on ``channel_id``."""
+    try:
+        async with transaction() as conn:
+            row = await conn.execute(
+                text(
+                    "SELECT 1 FROM automation_trigger t JOIN automation a "
+                    "ON a.id = t.automation_id WHERE t.kind = 'slack' "
+                    "AND t.match_key = :channel AND a.enabled LIMIT 1"
+                ),
+                {"channel": channel_id.upper()},
+            )
+            return row.first() is not None
+    except Exception:
+        logger.exception(
+            "Could not check for Slack automations", extra={"slack_channel": channel_id}
+        )
+        return False
+
+
+async def launch_slack_automations(
+    envelope: SlackEventEnvelope, channel: SlackChannelContext, bot_user_id: str
+) -> list[dict[str, Any]]:
+    """Run every automation a posted Slack message triggers, each at most once per message."""
+    event = envelope.event
+    if (
+        event is None
+        or event.type != "message"
+        or event.subtype not in _SLACK_POST_SUBTYPES
+        or (event.thread_ts and event.thread_ts != event.ts)
+        or not event.ts
+    ):
+        return []
+    channel_id = event.resolve_channel_id().upper()
+    if not _SLACK_TRIGGER_CHANNEL_RE.fullmatch(channel_id) or not channel.allows_operations:
+        return []
+    user = event.resolve_user_id()
+    if (bot_user_id and user == bot_user_id) or (
+        event.app_id and event.app_id == envelope.api_app_id
+    ):
+        return []
+    async with transaction() as conn:
+        records = await _load_records(
+            conn,
+            "WHERE a.enabled AND a.id IN (SELECT automation_id FROM automation_trigger "
+            "WHERE kind = 'slack' AND match_key = :channel)",
+            {"channel": channel_id},
+        )
+    text = _slack_message_text(event)
+    results: list[dict[str, Any]] = []
+    for record in records:
+        schedule_id = record["id"]
+        fired = next(
+            (
+                trigger.get("config") or {}
+                for trigger in record.get("triggers") or []
+                if trigger.get("kind") == "slack"
+                and _slack_trigger_fires(
+                    trigger.get("config") or {},
+                    channel_id,
+                    from_bot=event.is_from_bot,
+                    text=text,
+                )
+            ),
+            None,
+        )
+        if fired is None:
+            continue
+        claim_prefix = f"{schedule_id}:{channel_id}:"
+        claim_key = f"{claim_prefix}{event.ts}"
+        if not await _claim_delivery(
+            claim_key, claim_prefix, fired.get("max_runs_per_hour"), schedule_id
+        ):
+            continue
+        try:
+            result = await _launch_agent_schedule_record(
+                record,
+                repo=None,
+                prompt=_slack_event_prompt(record, channel, event, text),
+                origin="slack",
+                slack_reply=AutomationSlackReply(
+                    channel_id=channel_id,
+                    thread_ts=event.ts,
+                    triggering_user_id=user
+                    if not event.is_from_bot and re.fullmatch(r"[UW][A-Z0-9]+", user)
+                    else None,
+                ),
+            )
+        except Exception:
+            logger.exception(
+                "Failed to launch Slack automation", extra={"schedule_id": schedule_id}
+            )
+            await event_claims.release(_DELIVERY_CLAIM_SCOPE, claim_key)
+            continue
+        if result.get("status") != "started":
+            logger.error(
+                "Slack automation did not start",
+                extra={"schedule_id": schedule_id, "launch_status": result.get("status")},
+            )
+            await event_claims.release(_DELIVERY_CLAIM_SCOPE, claim_key)
+        results.append(result)
+    return results
+
+
+async def linear_automation_rules(team: str) -> list[dict[str, Any]]:
+    """The enabled automations with a Linear trigger on ``team``, for MDA's channel to match."""
+    async with transaction() as conn:
+        return await _load_records(
+            conn,
+            "WHERE a.enabled AND a.id IN (SELECT automation_id FROM automation_trigger "
+            "WHERE kind = 'linear' AND match_key = :team)",
+            {"team": team},
+        )
+
+
+def linear_trigger_configs(record: dict[str, Any], team: str) -> list[dict[str, Any]]:
+    """The automation's Linear trigger configs on ``team``."""
+    return [
+        trigger.get("config") or {}
+        for trigger in record.get("triggers") or []
+        if trigger.get("kind") == "linear" and (trigger.get("config") or {}).get("team") == team
+    ]
+
+
+async def plan_linear_automation(request: PlanLinearAutomation) -> LinearAutomationRun | None:
+    """The run an automation starts for a Linear issue event MDA's channel matched it to.
+
+    The channel matches and writes the run's prompt; the backend claims the automation once per delivery, within
+    its trigger's hourly cap, and writes and signs the run, on a thread of its own the
+    channel starts it on. The automation must be enabled and have a trigger on the
+    event's team for that event, so a call can't start another automation. A repeat
+    for a delivery already claimed plans the same run again: the channel starts a
+    thread's run for a delivery once.
+    """
+    try:
+        automation_id = uuid.UUID(request.automation_id)
+    except ValueError:
+        return None
+    async with transaction() as conn:
+        records = await _load_records(conn, "WHERE a.enabled AND a.id = :id", {"id": automation_id})
+    record = records[0] if records else None
+    config = next(
+        (
+            config
+            for config in (linear_trigger_configs(record, request.team) if record else [])
+            if request.event in (config.get("events") or [])
+        ),
+        None,
+    )
+    if record is None or config is None:
+        return None
+    schedule_id = record["id"]
+    claim_prefix = f"{schedule_id}:linear:{request.team}:"
+    claim_key = f"{claim_prefix}{request.delivery_id}"
+    claimed = await _claim_delivery(
+        claim_key, claim_prefix, config.get("max_runs_per_hour"), schedule_id
+    )
+    if not claimed and not await event_claims.held(_DELIVERY_CLAIM_SCOPE, claim_key):
+        return None
+    try:
+        return await _planned_linear_automation(record, request)
+    except HTTPException as exc:
+        # The owner can't run it as themselves; shown on the automation, not retried.
+        await _put_run_state(record, {"last_error": str(exc.detail), "last_error_at": now_iso()})
+        await event_claims.release(_DELIVERY_CLAIM_SCOPE, claim_key)
+        return None
+    except Exception:
+        # Released, so the channel's call sent again plans it afresh.
+        await event_claims.release(_DELIVERY_CLAIM_SCOPE, claim_key)
+        raise
+
+
+async def _planned_linear_automation(
+    record: dict[str, Any], request: PlanLinearAutomation
+) -> LinearAutomationRun:
+    from openswe.linear.session import LINEAR_CHANNEL
+
+    return LinearAutomationRun(
+        **await _planned_channel_automation(
+            record,
+            channel=LINEAR_CHANNEL,
+            thread_id=str(
+                uuid.uuid5(_LINEAR_AUTOMATION_THREADS, f"{record['id']}/{request.delivery_id}")
+            ),
+            prompt=request.prompt,
+        )
+    )
+
+
+async def _planned_channel_automation(
+    record: dict[str, Any],
+    *,
+    channel: str,
+    thread_id: str,
+    prompt: str,
+    repo: dict[str, str] | None = None,
+    token_repositories: list[str] | None = None,
+) -> dict[str, Any]:
+    """Index ``thread_id`` as ``channel``'s and sign the automation's run on it.
+
+    What the channel starts the run with: ``thread_id``, ``input``, ``context``,
+    ``metadata`` and ``webhook``. A token scope is recorded on the thread as it is
+    indexed, so a thread whose scope couldn't be written starts nothing.
+    """
+    from openswe.dispatch import CHANNEL_METADATA_KEY, COMPLETION_WEBHOOK_URL, prepare_durable_run
+    from openswe.threads.router import (
+        adopt_channel_run,
+        channel_run_metadata,
+        channel_run_starting,
+    )
+    from openswe.threads.runtimes import RUNTIMES
+
+    schedule_id = record["id"]
+    admin_thread = _admin_thread_enabled(record)
+    metadata = await _agent_run_metadata(record, thread_id, repo, admin_thread=admin_thread)
+    existing = await THREADS.get(thread_id)
+    if existing is not None and any(
+        existing.metadata.get(key) != metadata.get(key)
+        for key in ("owner_type", "visibility", "owner_user_id", "automation_system")
+    ):
+        raise HTTPException(409, "This delivery already belongs to a different automation scope")
+    run_config = await _agent_run_config(record, thread_id, repo, admin_thread=admin_thread)
+    if token_repositories is not None:
+        metadata[GITHUB_TOKEN_REPOSITORIES_KEY] = token_repositories
+    if admin_thread:
+        metadata["system_authorization"] = {
+            "schedule_id": schedule_id,
+            "invocation_id": run_config["configurable"]["invocation_id"],
+        }
+    input_context: InputMessageContext = {
+        "sender_id": f"system:schedule:{schedule_id}",
+        "surface": "automation",
+        "kind": "system",
+    }
+    run_input = build_run_input(
+        prompt,
+        input_context,
+        systems=[await _automation_identity(record)],
+    )
+    await adopt_channel_run(thread_id, channel, metadata=metadata)
+    planned = await prepare_durable_run(
+        _AGENT_ASSISTANT_ID,
+        run_config,
+        {CHANNEL_METADATA_KEY: channel},
+        source="schedule",
+        origin=channel,
+    )
+    rewritten = await RUNTIMES.mda_runtime.run_payload(
+        thread_id,
+        {
+            "assistant_id": _AGENT_ASSISTANT_ID,
+            "config": planned,
+            "metadata": planned["metadata"],
+        },
+        thread_metadata={},
+    )
+    await channel_run_starting(thread_id)
+    await _put_run_state(
+        record,
+        {
+            "last_thread_id": thread_id,
+            "last_triggered_at": now_iso(),
+            "last_error": None,
+            "last_error_at": None,
+        },
+    )
+    return {
+        "thread_id": uuid.UUID(thread_id),
+        "input": run_input,
+        "context": rewritten["context"],
+        "metadata": channel_run_metadata(cast(dict[str, JsonValue], rewritten["metadata"])),
+        "webhook": COMPLETION_WEBHOOK_URL or None,
+    }
+
+
+async def launch_scheduled_agent_run(
+    schedule_id: str, trigger_id: str | None = None
+) -> dict[str, Any]:
+    """Run the automation a cron fired for; ``trigger_id`` names its schedule trigger.
+
+    Crons made before triggers had ids send none and count as the first schedule.
+    """
+    record = await get_agent_schedule(schedule_id)
+    if not record:
+        await _delete_orphan_crons(schedule_id, keep=set())
+        return {"status": "missing", "schedule_id": schedule_id}
+    triggers = record.get("triggers") or []
+    cron_ids = {t["cron_id"] for t in triggers if t.get("cron_id")}
+    if trigger_id is None:
+        # A cron from before trigger ids; one whose trigger was since replaced
+        # would otherwise keep firing next to the new one.
+        await _delete_orphan_crons(schedule_id, keep=cron_ids)
+    schedules = [t for t in triggers if t.get("kind") == "schedule"]
+    fired = next((t for t in schedules if t.get("id") == trigger_id), None) or (
+        schedules[0] if schedules and trigger_id is None else None
+    )
+    if fired is None:
+        await _delete_orphan_crons(schedule_id, keep=cron_ids)
+        return {"status": "trigger_mismatch", "schedule_id": schedule_id}
+    return await _launch_agent_schedule_record(record, repo=None)
+
+
+async def trigger_agent_schedule(
+    schedule_id: str, *, login: str | None = None, origin: str = "dashboard"
+) -> dict[str, Any]:
+    record = await get_agent_schedule(schedule_id)
+    _assert_schedule_exists(record)
+    assert record is not None
+    if login is not None:
+        (await AutomationPolicy.for_record(record)).authorize(
+            await AutomationPolicy.for_login(login)
+        )
+
+    result = await _launch_agent_schedule_record(
+        record, repo=_test_run_repo(record), test_run=True, origin=origin
+    )
+    status = result.get("status")
+    if status == "started":
+        return result
+    if status == "unauthorized":
+        status_code = result.get("status_code")
+        raise HTTPException(
+            status_code if isinstance(status_code, int) else 403,
+            result.get("error") or "automation repository unavailable",
+        )
+    raise HTTPException(502, result.get("error") or "failed to start automation test")

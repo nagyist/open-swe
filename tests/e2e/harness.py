@@ -1,0 +1,2243 @@
+"""HTTP app for the full-flow E2E (served as langgraph dev's http.app).
+
+Mounts, on top of the REAL ``openswe.webapp`` app:
+  - fake GitHub REST API  (/fake-gh/...)   the real open_pull_request hits this
+  - fake Slack API         (/fake-slack/...) the real slack code hits this
+  - mock UIs               (/mock/slack, /mock/github) what the user/Playwright sees
+  - control + compose      (/control/*, /mock/slack/send) the test driver
+
+Nothing here touches agent logic — it only stands in for the SaaS boundaries
+and renders their state back as a user-facing UI.
+"""
+
+import hashlib
+import hmac
+import importlib.util
+import json
+import os
+import sys
+import threading
+import time
+import uuid
+from datetime import UTC, datetime, timedelta
+from html import escape
+from pathlib import Path
+from types import ModuleType
+from typing import Annotated, Any
+from urllib.parse import quote, urlencode
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import e2e_env  # noqa: E402
+import patches  # noqa: E402
+
+patches.apply()
+
+import fakes  # noqa: E402
+import httpx2  # noqa: E402
+from cryptography.fernet import Fernet  # noqa: E402
+from e2e_env import (  # noqa: E402
+    BASE_BRANCH,
+    BASE_URL,
+    BOT_USER_ID,
+    DEMO_CHANNEL,
+    FAKE_GITHUB_API,
+    HUMAN_USER,
+    OWNER,
+    REPO,
+    REPO_ROOT,
+    REVIEW_CHANNEL,
+    SECOND_OWNER,
+    SECOND_REPO,
+    TEST_USERS,
+    UNLINKED_USER,
+)
+from fastapi import Body, HTTPException, Request  # noqa: E402
+from fastapi.responses import (  # noqa: E402
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+    Response,
+)
+from oauth_fakes import OAuthProviders  # noqa: E402
+
+# Slack-user directory the fake ``users.info`` resolves: the default sender used
+# by the automated tests plus the named manual-test users. ``U_CAROL`` is in
+# Slack and nowhere else: no ``users`` row, no GitHub identity, and an address
+# no test user shares, so she stays unresolvable.
+_SLACK_USERS: dict[str, dict[str, str]] = {
+    HUMAN_USER: {"name": "devuser", "real_name": "Dev User", "email": "dev@example.com"},
+    UNLINKED_USER: {"name": "carol", "real_name": "Carol", "email": "carol@example.com"},
+    **{
+        u["slack_id"]: {"name": u["login"], "real_name": u["name"], "email": u["email"]}
+        for u in TEST_USERS
+    },
+}
+
+_SLACK_USERS["W123BOB"] = _SLACK_USERS["U_BOB"]
+_SLACK_USERS["W123ALICE"] = _SLACK_USERS["U_ALICE"]
+
+from langgraph_sdk import get_client  # noqa: E402
+from langgraph_sdk.errors import NotFoundError  # noqa: E402
+
+from openswe.api.app import app  # noqa: E402
+from openswe.dashboard.oauth import COOKIE_NAME, issue_session  # noqa: E402
+from openswe.slack.records import lookup_slack_thread_id  # noqa: E402
+from openswe.users import User  # noqa: E402
+from openswe.utils.dashboard_ui import keep_dashboard_ui_last  # noqa: E402
+
+MDA_SERVICE_SECRET = os.environ["MDA_SERVICE_SECRET"]
+SLACK_SIGNING_SECRET = os.environ["SLACK_SIGNING_SECRET"]
+STATIC_DIR = Path(__file__).parent / "static"
+
+CURRENT_THREAD: dict[str, str | None] = {"channel": DEMO_CHANNEL, "thread_ts": None}
+LAST_SLACK_EVENT: dict[str, Any] = {"payload": None}
+
+# Message timestamps restart from a fixed base on every boot, but the store the
+# webhook dedupes against is persisted — so event ids need a per-process salt or
+# a rerun's mentions look like redeliveries of the previous run's.
+EVENT_ID_SALT = uuid.uuid4().hex[:8]
+
+fakes.seed_bare_remotes()
+
+if os.environ.get("E2E_EXIT_WHEN_ORPHANED"):
+    # Playwright closes the webServer stdin pipe when its runner exits.
+    def _exit_when_orphaned() -> None:
+        try:
+            sys.stdin.buffer.read()
+        except Exception:
+            return
+        os._exit(0)
+
+    threading.Thread(target=_exit_when_orphaned, daemon=True).start()
+
+
+# --- control + Slack compose (the test driver) -----------------------------
+# Where the inbox spec holds its run: the fake model waits on it, the spec releases it.
+INBOX_GATE = {"waiting": False, "released": False}
+
+
+@app.post("/control/reset")
+async def control_reset() -> JSONResponse:
+    await _github_changed()
+    fakes.reset()
+    INBOX_GATE.update(waiting=False, released=False)
+    CURRENT_THREAD["channel"] = DEMO_CHANNEL
+    CURRENT_THREAD["thread_ts"] = None
+    LAST_SLACK_EVENT["payload"] = None
+    await _cancel_inflight_runs()
+    await _reset_durable_pr_state()
+    from langgraph_api.cache import cache_set
+    from sqlalchemy import delete
+
+    from openswe.database import postgres
+    from openswe.threads.pins import THREAD_PINS
+    from openswe.users.records import UserRecord
+
+    async with postgres.session() as session:
+        await session.execute(delete(UserRecord).where(UserRecord.kind == THREAD_PINS.kind))
+    for owner, repo in ((OWNER, REPO), (SECOND_OWNER, SECOND_REPO)):
+        await cache_set(f"__lg_swr__:repo-settings:{owner}/{repo}".lower(), None)
+    return JSONResponse({"ok": True})
+
+
+async def _github_changed() -> None:
+    """Fire every fake pull request's topic, as GitHub's webhooks would on a real change.
+
+    The dashboard shares each pull request's status until its topics fire, and specs
+    change the fake GitHub directly (and reuse its numbers after a reset) without the
+    webhooks that would tell it.
+    """
+    from openswe.github.pull_request_key import PullRequestKey
+    from openswe.ui_invalidations.topics import Topic
+
+    for pull in fakes.PULLS:
+        await Topic.PULL_REQUESTS.invalidate(
+            key=PullRequestKey.of(pull["owner"], pull["repo"], pull["number"])
+        )
+
+
+async def _cancel_inflight_runs() -> None:
+    """Stop runs an earlier spec left going; the single dev worker would queue the next spec's run behind them."""
+    client = get_client(url=BASE_URL)
+    # Per run, not cancel_many(status=...): the inmem runtime never delivers a status-only interrupt to a running run.
+    for thread in await client.threads.search(status="busy", limit=1000):
+        thread_id = thread["thread_id"]
+        try:
+            for status in ("pending", "running"):
+                for run in await client.runs.list(thread_id, status=status, limit=100):
+                    await client.runs.cancel(thread_id, run["run_id"], wait=True)
+        except NotFoundError:
+            # Deleted since the search, so nothing of it is left running. Raising
+            # here aborted the reset before it cleared the durable PR state.
+            continue
+
+
+async def _reset_durable_pr_state() -> None:
+    """Drop the per-pull-request state that outlives the in-memory fakes.
+
+    ``fakes.reset()`` restarts pull request numbering at 1, so anything keyed by
+    ``(repo, number)`` from an earlier spec would be mistaken for this run's
+    pull request: a baby-sit watch would report "already monitored from another
+    agent thread", and a stale approval would block a fresh one.
+
+    ``repository`` stays because integration bindings reference it.
+    """
+    from openswe.baby_sit import WATCHES, stop_watch
+
+    for watch in await WATCHES.list_active():
+        await stop_watch(watch.key, thread_id=watch.thread_id)
+
+    from sqlalchemy import text
+
+    from openswe.database import postgres
+
+    async with postgres.transaction() as connection:
+        await connection.execute(text("TRUNCATE human_review_request, pull_request CASCADE"))
+
+
+@app.post("/control/prepare-sandbox-repo")
+async def control_prepare_sandbox_repo() -> JSONResponse:
+    fakes.seed_sandbox_repo()
+    return JSONResponse({"ok": True})
+
+
+@app.get("/control/state")
+async def control_state() -> JSONResponse:
+    return JSONResponse(
+        {"channel": CURRENT_THREAD["channel"], "thread_ts": CURRENT_THREAD["thread_ts"]}
+    )
+
+
+@app.get("/control/plans")
+async def control_plans(thread_id: str) -> JSONResponse:
+    """Each time the backend planned the thread's runs, by the call that needed the plan."""
+    return JSONResponse([plan["call"] for plan in fakes.PLANS if plan["thread_id"] == thread_id])
+
+
+@app.get("/control/snapshots")
+async def control_snapshots() -> JSONResponse:
+    """Snapshot captures/deletes requested through the global image lifecycle."""
+    return JSONResponse({"captured": fakes.SNAPSHOTS, "deleted": fakes.DELETED_SNAPSHOTS})
+
+
+@app.get("/control/last-system-prompt")
+async def control_last_system_prompt() -> JSONResponse:
+    """The system prompt of the most recent model call (what the agent was told)."""
+    from fake_llm import LAST_SYSTEM_PROMPT
+
+    return JSONResponse({"text": LAST_SYSTEM_PROMPT.text})
+
+
+@app.post("/control/last-system-prompt")
+async def control_record_system_prompt(request: Request) -> JSONResponse:
+    """Where the Managed Deep Agents server's fake model reports each system prompt."""
+    from fake_llm import LAST_SYSTEM_PROMPT
+
+    LAST_SYSTEM_PROMPT.text = (await request.json())["text"]
+    return JSONResponse({"ok": True})
+
+
+@app.post("/control/repo-private")
+async def control_repo_private(request: Request) -> JSONResponse:
+    body = await request.json()
+    value = bool(body.get("private", False))
+    fakes.set_repo_private(value)
+    await _github_changed()
+    return JSONResponse({"ok": True, "private": value})
+
+
+@app.post("/control/pull-request-health")
+async def control_pull_request_health(request: Request) -> JSONResponse:
+    body = await request.json()
+    number = body.get("number")
+    if not isinstance(number, int) or isinstance(number, bool):
+        raise HTTPException(400, "A pull request number is required")
+    pull = fakes.update_pull_health(number, body)
+    if pull is None:
+        raise HTTPException(404, "Pull request not found")
+    await _github_changed()
+    return JSONResponse({"ok": True, "pull_request": fakes.pull_health_json(pull)})
+
+
+_MERGE_METHOD_FLAG_BY_NAME = {
+    "squash": "allow_squash_merge",
+    "merge": "allow_merge_commit",
+    "rebase": "allow_rebase_merge",
+}
+
+
+def _split_repo(value: object) -> tuple[str, str]:
+    full_name = str(value or f"{OWNER}/{REPO}")
+    if full_name.count("/") != 1 or not all(full_name.split("/")):
+        raise HTTPException(400, "repo must be owner/name")
+    owner, name = full_name.split("/", 1)
+    return owner, name
+
+
+@app.post("/control/repo-merge-methods")
+async def control_repo_merge_methods(request: Request) -> JSONResponse:
+    """Restrict a repo's allowed merge methods (default: all three)."""
+    body = await request.json()
+    owner, name = _split_repo(body.get("repo"))
+    methods = body.get("methods")
+    if not isinstance(methods, list) or any(
+        method not in _MERGE_METHOD_FLAG_BY_NAME for method in methods
+    ):
+        raise HTTPException(400, "methods must be a list of squash/merge/rebase")
+    enabled = {_MERGE_METHOD_FLAG_BY_NAME[method] for method in methods}
+    flags = fakes.set_repo_merge_methods(
+        owner, name, {flag: flag in enabled for flag in fakes.MERGE_METHOD_FLAGS}
+    )
+    await _github_changed()
+    return JSONResponse({"ok": True, "repo": f"{owner}/{name}", **flags})
+
+
+@app.post("/control/session-upload")
+async def control_reserve_session_upload(request: Request) -> JSONResponse:
+    """Reserve an upload thread as the remote MCP's ``upload_session`` tool does.
+
+    The E2E deployment mounts no remote MCP, so a spec reserves here and then
+    posts to the returned ``upload_url`` with ``upload_token`` as the agent's curl does."""
+    from openswe.threads.session_upload import SessionUploadHeader, reserve_session_upload
+
+    body = await request.json()
+    login = str(body.pop("login"))
+    email = body.pop("email", None)
+    reservation = await reserve_session_upload(
+        SessionUploadHeader.model_validate(body), login, email=email
+    )
+    return JSONResponse(reservation.model_dump())
+
+
+@app.post("/control/pull-request")
+async def control_seed_pull_request(request: Request) -> JSONResponse:
+    """Seed an open pull request the PR search returns, without running the agent.
+
+    Anything ``/control/pull-request-health`` accepts may be set inline, so a spec
+    can pick the draft flag, conflict state, checks and reviews up front."""
+    body = await request.json()
+    owner, name = _split_repo(body.get("repo"))
+    head = str(body.get("head") or "seeded-branch")
+    files = body.get("files")
+    if isinstance(files, dict) and files:
+        fakes.push_branch(owner, name, head, {str(path): str(text) for path, text in files.items()})
+    pull = fakes.create_pull(
+        owner,
+        name,
+        head=head,
+        base=str(body.get("base") or BASE_BRANCH),
+        title=str(body.get("title") or "Seeded pull request"),
+        body=str(body.get("body") or ""),
+        draft=bool(body.get("draft", False)),
+        author=str(body.get("author") or TEST_USERS[0]["login"]),
+        created_at=body.get("created_at") if isinstance(body.get("created_at"), str) else None,
+        updated_at=body.get("updated_at") if isinstance(body.get("updated_at"), str) else None,
+    )
+    fakes.update_pull_health(pull["number"], body)
+    await _github_changed()
+    return JSONResponse(
+        {
+            "ok": True,
+            "number": pull["number"],
+            "repo": f"{owner}/{name}",
+            "head_sha": pull["head_sha"],
+            "pull_request": fakes.pull_health_json(pull),
+        }
+    )
+
+
+def _seeded_pull(body: dict[str, Any]) -> dict[str, Any]:
+    owner, name = _split_repo(body.get("repo"))
+    number = body.get("number")
+    pull = fakes.find_pull(number, owner, name) if isinstance(number, int) else None
+    if pull is None:
+        raise HTTPException(404, "No such fake pull request")
+    return pull
+
+
+@app.post("/control/walkthrough")
+async def control_seed_walkthrough(request: Request) -> JSONResponse:
+    """Store a one-chunk plan for a fake pull request's current head, as a scout would."""
+    from openswe.github.pull_requests import PullRequest
+    from openswe.sandbox_scripts.walkthrough import parse_index
+    from openswe.walkthrough.diff import DiffIndex
+    from openswe.walkthrough.plan import Plan, PlanChunk
+    from openswe.walkthrough.record import Walkthrough
+
+    body = await request.json()
+    pull = _seeded_pull(body)
+    diff = "\n".join(
+        f"diff --git a/{file['filename']} b/{file['filename']}\n"
+        f"+++ b/{file['filename']}\n{file.get('patch') or ''}"
+        for file in pull["files"]
+    )
+    index = DiffIndex.model_validate({"files": parse_index(diff.splitlines())})
+    plan = Plan(
+        head_sha=pull["head_sha"],
+        chunks=[PlanChunk(title=str(body.get("title") or "Seeded chunk"), lines=index.lines)],
+    )
+    pull_request = await PullRequest(
+        owner=pull["owner"], repo=pull["repo"], number=pull["number"]
+    ).ensure()
+    await Walkthrough.dismiss(pull["owner"], pull["repo"], pull["number"])
+    await Walkthrough.install(
+        pull_request.id,
+        plan,
+        merge_base_sha=fakes.base_sha(pull),
+        index=index,
+        replacing=None,
+    )
+    await Walkthrough.set_human_input(pull_request.id, str(body.get("human_input") or ""))
+    return JSONResponse({"ok": True})
+
+
+@app.post("/control/github-event")
+async def control_github_event(request: Request) -> JSONResponse:
+    """Deliver a GitHub event as MDA's GitHub channel does, to the backend's channel API.
+
+    The mirror of ``/mock/slack/action`` for the other side: CI and review
+    events arrive asynchronously in production, and the only faithful way to
+    test what Open SWE does about them is to make GitHub knock on the door.
+    """
+    body = await request.json()
+    event = str(body.get("event") or "")
+    payload = body.get("payload")
+    if not event or not isinstance(payload, dict):
+        raise HTTPException(400, "An event name and payload object are required")
+    return JSONResponse(
+        await _deliver_github_event(event, payload, str(body.get("delivery") or ""))
+    )
+
+
+@app.get("/control/thread-idle")
+async def control_thread_idle(thread_id: str) -> JSONResponse:
+    """How many runs an agent thread has had and whether none is queued or running."""
+    runs = await get_client(url=BASE_URL).runs.list(thread_id, limit=100)
+    return JSONResponse(
+        {
+            "runs": len(runs),
+            "idle": all(run["status"] not in {"pending", "running"} for run in runs),
+        }
+    )
+
+
+@app.get("/control/inbox-gate")
+async def control_inbox_gate(waiting: bool = False) -> JSONResponse:
+    """Whether the held run may go on; the fake model asking with ``waiting`` marks it held."""
+    if waiting:
+        INBOX_GATE["waiting"] = True
+    return JSONResponse(INBOX_GATE)
+
+
+@app.post("/control/inbox-gate")
+async def control_release_inbox_gate() -> JSONResponse:
+    INBOX_GATE["released"] = True
+    return JSONResponse(INBOX_GATE)
+
+
+@app.post("/control/monitors/sync")
+async def control_sync_monitors(thread_id: str) -> JSONResponse:
+    """Read the thread's monitors now, as the per-minute poll does, and count the events it is owed."""
+    from openswe.monitors.delivery import poll_monitors
+    from openswe.webhooks.event_matches import EventMatch
+
+    await poll_monitors(thread_id)
+    return JSONResponse({"events": len(await EventMatch.owed(thread_id))})
+
+
+@app.post("/control/collaborator-permission")
+async def control_collaborator_permission(request: Request) -> JSONResponse:
+    body = await request.json()
+    login = str(body.get("login") or "")
+    permission = str(body.get("permission") or "read")
+    if not login:
+        raise HTTPException(400, "A GitHub login is required")
+    fakes.set_collaborator_permission(login, permission)
+    return JSONResponse({"ok": True, "login": login, "permission": permission})
+
+
+@app.post("/control/team-settings")
+async def control_team_settings(request: Request) -> JSONResponse:
+    """Patch global settings without resetting unrelated defaults between specs."""
+    from openswe.dashboard.settings import (
+        SettingsUpdate,
+        get_instance_settings,
+        upsert_instance_settings,
+    )
+    from openswe.utils import ttl_cache
+
+    body = await request.json()
+    current = await get_instance_settings()
+    patched = {
+        key: body.get(key, current.get(key))
+        for key in SettingsUpdate.model_fields
+        if key in body or key in current
+    }
+    settings = await upsert_instance_settings(SettingsUpdate.model_validate(patched))
+    ttl_cache.clear()
+    return JSONResponse({"ok": True, "settings": settings})
+
+
+@app.get("/control/expedited-approvals")
+async def control_expedited_approvals(owner: str = OWNER, repo: str = REPO) -> JSONResponse:
+    """Every expedited approval row for a repository, newest last."""
+    from openswe.human_review.requests import HumanReviewRequest
+
+    approvals = [
+        request
+        for request in await HumanReviewRequest.all_for_repo(owner, repo)
+        if request.kind == "expedited"
+    ]
+    return JSONResponse(
+        [
+            {
+                "id": str(approval.id),
+                "state": approval.state,
+                "detail": approval.detail,
+                "head_sha": approval.head_sha,
+                "pr_number": approval.pull_request.number,
+                "awaiting_ready": approval.awaiting_ready,
+                "approvers": approval.approvers,
+                "votes": [
+                    {
+                        "github_login": vote.github_login,
+                        "decision": vote.decision,
+                        "github_review_id": vote.github_review_id,
+                        "github_review_sha": vote.github_review_sha,
+                    }
+                    for vote in approval.participants
+                ],
+                "pull_request_id": str(approval.pull_request_id),
+                "excluded_hunks": approval.excluded_hunks,
+            }
+            for approval in approvals
+        ]
+    )
+
+
+@app.get("/control/audit-logs")
+async def control_audit_logs(operation_name: str) -> JSONResponse:
+    """The last day's audit entries for one operation, newest first."""
+    from openswe.audit_logs.store import list_logs
+
+    now = datetime.now(UTC)
+    page = await list_logs(
+        start_time=now - timedelta(days=1),
+        end_time=now,
+        limit=50,
+        operation_name=operation_name,
+    )
+    return JSONResponse([entry.model_dump(mode="json") for entry in page.items])
+
+
+@app.get("/control/human-review-requests")
+async def control_human_review_requests(owner: str = OWNER, repo: str = REPO) -> JSONResponse:
+    """Every standard human review request for a repository, newest last."""
+    from openswe.human_review.requests import HumanReviewRequest
+
+    return JSONResponse(
+        [
+            {
+                "id": str(request.id),
+                "state": request.state,
+                "detail": request.detail,
+                "pr_number": request.pull_request.number,
+                "thread_id": request.thread_id,
+                "tldr": request.tldr,
+                "slack_channel_id": request.slack_channel_id,
+                "slack_thread_ts": request.slack_thread_ts,
+                "slack_message_ts": request.slack_message_ts,
+                "slack_broadcast": request.slack_broadcast,
+                "reviewers": [
+                    {"github_login": r.github_login, "assigned_by_agent": r.assigned_by_agent}
+                    for r in request.reviewers
+                ],
+                "picks": [p.github_login for p in request.picks],
+            }
+            for request in await HumanReviewRequest.all_for_repo(owner, repo)
+            if request.kind == "standard"
+        ]
+    )
+
+
+@app.post("/control/human-review-deadline")
+async def control_human_review_deadline(request: Request) -> JSONResponse:
+    """Fire a request's scheduled deadline now, as if ``hours`` had passed since it was posted.
+
+    The scheduler delays these by 30 minutes and 2 hours; the spec cannot wait that long.
+    """
+    from sqlalchemy import update
+
+    from openswe.database import postgres
+    from openswe.human_review.requests import HumanReviewRequest
+    from openswe.human_review.standard import run_deadline
+
+    body = await request.json()
+    request_id = str(body.get("request_id") or "")
+    step = str(body.get("step") or "")
+    hours = float(body.get("hours") or 0)
+    if hours:
+        async with postgres.session() as session:
+            await session.execute(
+                update(HumanReviewRequest)
+                .where(HumanReviewRequest.id == uuid.UUID(request_id))
+                .values(created_at=HumanReviewRequest.created_at - timedelta(hours=hours))
+            )
+    return JSONResponse(await run_deadline(request_id, step))
+
+
+@app.post("/control/user-preferences")
+async def control_user_preferences(request: Request) -> JSONResponse:
+    """Change a person's preferences, as their settings pages do."""
+    from openswe.users import User, UserPreferencesPatch
+
+    await _seed_test_user_mappings()
+    body = await request.json()
+    login = str(body.get("login") or "")
+    patch = UserPreferencesPatch.model_validate(body.get("preferences") or {})
+    preferences = await User.update_preferences(login, patch)
+    if preferences is None:
+        raise HTTPException(404, f"no user with login {login!r}")
+    return JSONResponse({"ok": True, "login": login, **preferences.model_dump()})
+
+
+@app.post("/control/repo-file")
+async def control_repo_file(request: Request) -> JSONResponse:
+    """Commit files onto the repository's base branch."""
+    body = await request.json()
+    owner, name = _split_repo(body.get("repo"))
+    files = body.get("files")
+    if not isinstance(files, dict) or not files:
+        raise HTTPException(400, "files must map paths to contents")
+    fakes.commit_to_base(owner, name, {str(path): str(text) for path, text in files.items()})
+    from langgraph_api.cache import cache_set
+
+    await cache_set(f"__lg_swr__:repo-settings:{owner}/{name}".lower(), None)
+    return JSONResponse({"ok": True})
+
+
+@app.get("/control/queued")
+async def control_queued(thread_id: str = "") -> JSONResponse:
+    """The follow-ups parked on a busy thread's message queue, oldest first.
+
+    While the agent is busy, debounced follow-ups accumulate in
+    ``thread_queued_message`` until the active run drains them together at its
+    next model call. Lets the E2E assert coalescing instead of per-message runs."""
+    from openswe.message_queue import QueuedMessage
+
+    messages = [message.content for message in await QueuedMessage.for_thread(thread_id)]
+    return JSONResponse({"queued_count": len(messages), "messages": messages})
+
+
+_MAPPINGS_SEEDED = False
+
+
+async def _seed_test_user_mappings() -> None:
+    """Give each named test user the ``users`` row a signed-in person would have.
+
+    A GitHub identity, as the OAuth callback writes, and a Slack one, as the
+    Slack link flow writes.
+    """
+    global _MAPPINGS_SEEDED
+    if _MAPPINGS_SEEDED:
+        return
+    from openswe.users import User
+
+    await User.sign_in("github", "1003", login="octocat", display_name="PR Author")
+    for user in TEST_USERS:
+        signed_in = await User.sign_in(
+            "github",
+            user["github_id"],
+            login=user["login"],
+            email=user["email"],
+            display_name=user["name"],
+        )
+        if not os.environ.get("E2E_OAUTH"):
+            signed_in = await oauth_providers.provision(signed_in, user["email"])
+        await signed_in.link(
+            "slack", user["slack_id"], login=user["login"], email=user["email"], team_id="T_E2E"
+        )
+    for login, slack_id in (("bob", "W123BOB"), ("alice", "W123ALICE")):
+        person = await User.for_login("github", login)
+        if person is not None:
+            await person.link("slack", slack_id, login=login, team_id="T_E2E")
+    _MAPPINGS_SEEDED = True
+
+
+async def _deliver_slack_event(payload: dict[str, Any], retry_num: str = "") -> httpx2.Response:
+    """POST a signed Events-API delivery to the real /webhooks/slack route."""
+    await _seed_test_user_mappings()
+    raw = json.dumps(payload).encode()
+    req_ts = str(int(time.time()))
+    base = f"v0:{req_ts}:{raw.decode()}".encode()
+    sig = "v0=" + hmac.new(SLACK_SIGNING_SECRET.encode(), base, hashlib.sha256).hexdigest()
+    headers = {
+        "X-Slack-Signature": sig,
+        "X-Slack-Request-Timestamp": req_ts,
+        "Content-Type": "application/json",
+    }
+    if retry_num:
+        headers["X-Slack-Retry-Num"] = retry_num
+        headers["X-Slack-Retry-Reason"] = "http_timeout"
+
+    transport = httpx2.ASGITransport(app=app)
+    async with httpx2.AsyncClient(transport=transport, base_url="http://harness") as client:
+        return await client.post("/webhooks/slack", content=raw, headers=headers)
+
+
+def _github_channel() -> ModuleType:
+    """``tests/github_channel.py``: delivers as MDA's GitHub channel does."""
+    path = Path(__file__).parents[1] / "github_channel.py"
+    spec = importlib.util.spec_from_file_location("e2e_github_channel", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+async def _deliver_github_event(
+    event: str, payload: dict[str, Any], delivery: str = ""
+) -> dict[str, Any]:
+    """Deliver a GitHub event as MDA's GitHub channel does, to the real channel API."""
+    delivered = await _github_channel().deliver_as_mda(
+        app, event, payload, secret=MDA_SERVICE_SECRET, delivery_id=delivery or None
+    )
+    return {
+        "work": list(delivered.work),
+        "issue_run": delivered.issue_run.model_dump(mode="json") if delivered.issue_run else None,
+    }
+
+
+async def _deliver_slack_interaction(payload: dict[str, Any]) -> httpx2.Response:
+    raw = urlencode({"payload": json.dumps(payload)}).encode()
+    req_ts = str(int(time.time()))
+    base = f"v0:{req_ts}:{raw.decode()}".encode()
+    sig = "v0=" + hmac.new(SLACK_SIGNING_SECRET.encode(), base, hashlib.sha256).hexdigest()
+    headers = {
+        "X-Slack-Signature": sig,
+        "X-Slack-Request-Timestamp": req_ts,
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    transport = httpx2.ASGITransport(app=app)
+    async with httpx2.AsyncClient(transport=transport, base_url="http://harness") as client:
+        return await client.post("/webhooks/slack/interactivity", content=raw, headers=headers)
+
+
+async def _slack_send_result(payload: dict[str, Any], resp: httpx2.Response) -> JSONResponse:
+    event = payload["event"]
+    channel = str(event["channel"])
+    thread_ts = str(event["thread_ts"])
+    thread_id = await lookup_slack_thread_id(channel, thread_ts)
+    if thread_id is None and channel.startswith("D"):
+        # A concierge-mode DM is one conversation keyed on the fixed "0" timestamp.
+        concierge_thread_id = await lookup_slack_thread_id(channel, "0")
+        if concierge_thread_id is not None:
+            thread_ts, thread_id = "0", concierge_thread_id
+    return JSONResponse(
+        {
+            "thread_ts": thread_ts,
+            "thread_id": thread_id,
+            "event_id": payload.get("event_id"),
+            "webhook_status": resp.status_code,
+            "webhook": resp.json(),
+        }
+    )
+
+
+@app.post("/control/forget-slack-events")
+async def control_forget_slack_events() -> JSONResponse:
+    """Drop the in-process record of handled Slack events.
+
+    A redelivery normally lands on a different instance than the original, which
+    only has the LangGraph store to dedupe on. Clearing the local cache lets the
+    E2E exercise that path instead of the same-process fast path."""
+    from openswe.slack.events import reset_slack_event_claims
+
+    reset_slack_event_claims()
+    return JSONResponse({"ok": True})
+
+
+@app.post("/mock/slack/send")
+async def slack_send(request: Request) -> JSONResponse:
+    """Simulate a user posting in Slack: store the message, then deliver the
+    signed Events-API webhook to the real /webhooks/slack route.
+
+    ``redeliver`` replays the previous delivery verbatim — same ``event_id``, no
+    new Slack message — which is what Slack does when it doesn't get a 2xx in
+    three seconds."""
+    form = await request.json()
+    if form.get("redeliver"):
+        payload = LAST_SLACK_EVENT.get("payload")
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="No Slack event to redeliver")
+        resp = await _deliver_slack_event(payload, str(form.get("retry_num") or "1"))
+        return await _slack_send_result(payload, resp)
+
+    text = str(form.get("text", ""))
+    mention_bot = bool(form.get("mention_bot", True))
+    channel_type = str(form.get("channel_type") or "")
+    # Sender defaults to the first test user (Alice) — the canonical owner the
+    # automated tests log in as; the mock UI passes the chosen test user.
+    user_id = str(form.get("user") or TEST_USERS[0]["slack_id"])
+    channel = str(form.get("channel") or ("D_DEMO" if channel_type == "im" else DEMO_CHANNEL))
+
+    # ``thread_ts`` replies into an existing thread (a distinct message ts under
+    # the same thread); omitting it opens a fresh thread, as the mock UI does.
+    reply_thread_ts = str(form.get("thread_ts") or "")
+    if reply_thread_ts:
+        thread_ts = reply_thread_ts
+        event_ts = fakes.add_slack_message(
+            channel, thread_ts, user=user_id, text=text, is_bot=False
+        )
+    else:
+        # A thread's opening message is its parent: Slack gives it one ts, which
+        # is both its own and the thread's.
+        event_ts = fakes.add_slack_message(channel, "", user=user_id, text=text, is_bot=False)
+        thread_ts = event_ts
+    CURRENT_THREAD["channel"] = channel
+    CURRENT_THREAD["thread_ts"] = thread_ts
+
+    event = {
+        "type": "app_mention" if mention_bot else "message",
+        "channel": channel,
+        "user": user_id,
+        "text": text,
+        "ts": event_ts,
+        "thread_ts": thread_ts,
+    }
+    if channel_type:
+        event["channel_type"] = channel_type
+    payload = {
+        "type": "event_callback",
+        "event_id": f"Ev{EVENT_ID_SALT}{event_ts}",
+        "authorizations": [{"user_id": BOT_USER_ID}],
+        "event": event,
+    }
+    LAST_SLACK_EVENT["payload"] = payload
+    return await _slack_send_result(payload, await _deliver_slack_event(payload))
+
+
+@app.post("/mock/slack/action")
+async def slack_action(request: Request) -> JSONResponse:
+    body = await request.json()
+    action = body.get("action")
+    channel_id = str(body.get("channel") or CURRENT_THREAD.get("channel") or "")
+    thread_ts = str(body.get("thread_ts") or CURRENT_THREAD.get("thread_ts") or "")
+    message_ts = str(body.get("message_ts") or "")
+    user_id = str(body.get("user") or TEST_USERS[0]["slack_id"])
+    if not isinstance(action, dict) or not channel_id or not thread_ts or not message_ts:
+        raise HTTPException(status_code=400, detail="Missing Slack action context")
+    source_message = fakes.slack_message(channel_id, thread_ts, message_ts)
+    if source_message is None:
+        raise HTTPException(status_code=404, detail="Slack message not found")
+
+    payload = {
+        "type": "block_actions",
+        "trigger_id": f"trigger-{fakes.next_slack_ts()}",
+        "user": {"id": user_id},
+        "channel": {"id": channel_id},
+        "container": {
+            "channel_id": channel_id,
+            "message_ts": message_ts,
+            "thread_ts": thread_ts,
+        },
+        "message": {
+            "ts": message_ts,
+            "thread_ts": thread_ts,
+            "text": source_message["text"],
+            "blocks": source_message["blocks"],
+        },
+        "actions": [{**action, "action_ts": fakes.next_slack_ts()}],
+    }
+    response = await _deliver_slack_interaction(payload)
+    return JSONResponse(response.json(), status_code=response.status_code)
+
+
+async def _signed_in(login: str, email: str) -> User:
+    """The ``users`` row a real sign-in would give ``login``, created like the OAuth callback does."""
+    await _seed_test_user_mappings()
+    user = await User.for_login("github", login)
+    if user is None:
+        github_id = str(int(hashlib.sha256(login.encode()).hexdigest()[:8], 16))
+        user = await User.sign_in("github", github_id, login=login, email=email)
+    if not os.environ.get("E2E_OAUTH"):
+        user = await oauth_providers.provision(user, user.email or email)
+    return user
+
+
+@app.post("/control/notifications")
+async def control_notification(request: Request) -> JSONResponse:
+    from openswe.notifications.service import AppNotification
+
+    body = await request.json()
+    await _seed_test_user_mappings()
+    user = await User.for_login("github", body.get("recipient", "bob"))
+    if user is None:
+        raise HTTPException(404)
+    await AppNotification.send(
+        user,
+        key=body["key"],
+        title=body["title"],
+        body="Open the conversation.",
+        url=body.get("url", "/agents"),
+        fallback_text=body["title"],
+    )
+    return JSONResponse({"ok": True})
+
+
+@app.post("/control/notifications/fallback")
+async def control_notification_fallback() -> JSONResponse:
+    from uuid import UUID
+
+    from sqlalchemy import text
+
+    from openswe.database import postgres
+    from openswe.notifications.service import JOB_KIND, AppNotification
+
+    async with postgres.transaction() as conn:
+        due = (
+            await conn.execute(
+                text("DELETE FROM job WHERE kind = :kind RETURNING payload"), {"kind": JOB_KIND}
+            )
+        ).scalars()
+        payloads = list(due)
+    for payload in payloads:
+        await AppNotification.deliver_fallback(UUID(payload["recipient_id"]), payload["key"])
+    return JSONResponse({"ok": True})
+
+
+@app.post("/control/login")
+async def control_login(request: Request) -> JSONResponse:
+    """Simulate a signed-in dashboard user by minting the real session cookie."""
+    form = await request.json()
+    login = str(form.get("login", "dev-user"))
+    email = str(form.get("email", "dev@example.com"))
+    user = await _signed_in(login, email)
+    token = issue_session(login=login, email=email, avatar_url=None, user_id=str(user.id))
+    resp = JSONResponse({"ok": True, "login": login, "email": email})
+    resp.set_cookie(COOKIE_NAME, token, httponly=True, samesite="lax", secure=False, path="/")
+    return resp
+
+
+@app.get("/control/login")
+async def control_login_get(login: str = "", email: str = "", next_url: str = "") -> Response:
+    """Browser login. With no ``login``, render a dropdown of the test users;
+    with ``?login=<u>`` (email resolved from the registry, or pass ``&email=``),
+    mint the session cookie and redirect into the dashboard. Use a separate
+    browser/profile per user — each has its own cookie jar."""
+    # Land on the dashboard origin (DASHBOARD_BASE_URL — the Vite HMR server in
+    # dev:mock), not this harness, so the cookie + the hot-reloading UI line up.
+    ui = os.environ.get("DASHBOARD_BASE_URL", "").rstrip("/")
+    dest = next_url or (f"{ui}/agents" if ui else "/agents")
+    if not login:
+        options = "".join(f'<option value="{u["login"]}">{u["name"]}</option>' for u in TEST_USERS)
+        return HTMLResponse(
+            f"""<!doctype html><meta charset=utf-8><title>Mock login</title>
+            <body style="font-family:system-ui;max-width:420px;margin:3rem auto;padding:0 1rem">
+            <h1 style="font-size:1.1rem">Sign in (mock)</h1>
+            <form method=get action=/control/login>
+              <select name=login style="font:inherit;padding:0.4rem">{options}</select>
+              <button style="font:inherit;padding:0.45rem 0.9rem;cursor:pointer">Sign in</button>
+            </form>
+            <p style="color:#888;font-size:0.85rem">Tip: use a separate browser or profile per
+            user so their sessions don't overwrite each other.</p>
+            </body>"""
+        )
+    if not email:
+        match = next((u for u in TEST_USERS if u["login"] == login), None)
+        email = match["email"] if match else f"{login}@example.com"
+    user = await _signed_in(login, email)
+    token = issue_session(login=login, email=email, avatar_url=None, user_id=str(user.id))
+    resp = RedirectResponse(url=dest, status_code=303)
+    resp.set_cookie(COOKIE_NAME, token, httponly=True, samesite="lax", secure=False, path="/")
+    return resp
+
+
+@app.get("/dashboard/api/auth/login")
+async def mock_github_login(redirect_to: str = "") -> Response:
+    """E2E stand-in for the dashboard OAuth start route.
+
+    The real route would redirect to github.com. Keep the dashboard-facing URL
+    intact, then hand off to the fake GitHub simulator so Playwright exercises a
+    browser login flow instead of test code pre-minting a session cookie.
+    """
+    if os.environ.get("E2E_OAUTH"):
+        return RedirectResponse(
+            "/dashboard/api/auth/langsmith/login?" + urlencode({"redirect_to": redirect_to}), 302
+        )
+    ui = os.environ.get("DASHBOARD_BASE_URL", "").rstrip("/")
+    dest = redirect_to or (f"{ui}/agents" if ui else "/agents")
+    return RedirectResponse(f"/fake-gh/login/oauth/authorize?redirect_to={quote(dest)}", 302)
+
+
+@app.get("/fake-gh/login/oauth/authorize")
+async def fake_github_authorize(redirect_to: str = "", login: str = "") -> Response:
+    """Fake GitHub OAuth consent/login page for dashboard e2e tests."""
+    ui = os.environ.get("DASHBOARD_BASE_URL", "").rstrip("/")
+    dest = redirect_to or (f"{ui}/agents" if ui else "/agents")
+    if not login:
+        options = "".join(
+            f'<option value="{escape(u["login"], quote=True)}">'
+            f"{escape(u['name'])} (@{escape(u['login'])})</option>"
+            for u in TEST_USERS
+        )
+        return HTMLResponse(
+            f"""<!doctype html><meta charset=utf-8><title>GitHub · Authorize Robin</title>
+            <body style="font-family:system-ui;max-width:420px;margin:3rem auto;padding:0 1rem">
+            <main data-testid="fake-github-login">
+              <h1 style="font-size:1.1rem">Authorize Robin</h1>
+              <p style="color:#888;font-size:0.9rem">Pick a fake GitHub account to continue.</p>
+              <form method=get action=/fake-gh/login/oauth/authorize>
+                <input type=hidden name=redirect_to value="{escape(dest, quote=True)}">
+                <label>GitHub user
+                  <select name=login style="font:inherit;padding:0.4rem">{options}</select>
+                </label>
+                <button style="font:inherit;padding:0.45rem 0.9rem;cursor:pointer">Authorize Robin</button>
+              </form>
+            </main>
+            </body>"""
+        )
+    match = next((u for u in TEST_USERS if u["login"] == login), None)
+    email = match["email"] if match else f"{login}@example.com"
+    user = await _signed_in(login, email)
+    token = issue_session(login=login, email=email, avatar_url=None, user_id=str(user.id))
+    resp = RedirectResponse(url=dest, status_code=303)
+    resp.set_cookie(COOKIE_NAME, token, httponly=True, samesite="lax", secure=False, path="/")
+    return resp
+
+
+# The real dashboard registered /dashboard/api/auth/login first (via
+# include_router), so Starlette would match it before ours. Move ours to the
+# front of the table so the mock picker shadows the real OAuth redirect.
+for _i, _route in enumerate(app.router.routes):
+    if getattr(_route, "endpoint", None) is mock_github_login:
+        app.router.routes.insert(0, app.router.routes.pop(_i))
+        break
+
+
+oauth_providers = OAuthProviders(BASE_URL)
+oauth_providers.install(app)
+os.environ["LANGSMITH_CONNECTION_URL"] = oauth_providers.issuer
+os.environ["LANGSMITH_OAUTH_CLIENT_ID"] = "e2e-langsmith"
+os.environ["LANGSMITH_OAUTH_CLIENT_SECRET"] = "e2e-langsmith-secret"
+os.environ["LANGSMITH_ENDPOINT"] = oauth_providers.issuer
+os.environ["LANGSMITH_API_KEY"] = "e2e-deployment-key"
+os.environ["TOKEN_ENCRYPTION_KEY"] = Fernet.generate_key().decode()
+
+if os.environ.get("E2E_OAUTH"):
+    from openswe.dashboard import auth_routes, github_link
+
+    os.environ["GITHUB_APP_CLIENT_ID"] = "e2e-github"
+    auth_routes.GITHUB_AUTHORIZE_URL = BASE_URL + "/fake-gh/link/authorize"
+    github_link.exchange_code = oauth_providers.exchange_github
+    github_link.fetch_github_user = oauth_providers.github_user
+
+
+@app.post("/control/account-recovery-thread")
+async def control_account_recovery_thread() -> JSONResponse:
+    from openswe.threads import index
+
+    login = "account-recovery-" + uuid.uuid4().hex
+    email = login + "@example.com"
+    os.environ["ALLOWED_GITHUB_USERS"] += "," + login
+    user = await _signed_in(login, email)
+    thread = await index.create(
+        str(uuid.uuid4()),
+        runtime="local",
+        metadata={
+            "title": "Account recovery history",
+            "owner_login": login,
+            "owner_user_id": str(user.id),
+            "visibility": "private",
+            "source": "dashboard",
+            "graph_id": "agent",
+        },
+    )
+    return JSONResponse(
+        {"thread_id": thread.thread_id, "login": login, "email": email, "user_id": str(user.id)}
+    )
+
+
+@app.post("/control/logout")
+async def control_logout() -> JSONResponse:
+    resp = JSONResponse({"ok": True})
+    resp.delete_cookie(COOKIE_NAME, path="/")
+    return resp
+
+
+# The app is served by its own Nitro server, which the specs address directly and
+# which fronts these routes in turn — the shape a deployment has. This serves only
+# the one asset the fake Slack payloads point at.
+UI_PUBLIC = REPO_ROOT / "ui" / ".output" / "public"
+
+
+def _ui_file(name: str) -> FileResponse:
+    path = UI_PUBLIC / name
+    if not path.is_file():
+        raise HTTPException(404, f"{name} not built — run `pnpm run build` at the repo root")
+    return FileResponse(path)
+
+
+@app.get("/logo-mark.png")
+async def ui_logo_mark() -> FileResponse:
+    return _ui_file("logo-mark.png")
+
+
+@app.get("/mock/users")
+async def mock_users() -> JSONResponse:
+    """The named test users that drive the Slack sender + login dropdowns."""
+    return JSONResponse(TEST_USERS)
+
+
+@app.get("/mock/slack/messages")
+async def slack_messages(
+    channel: str = "", thread_ts: str = "", current_thread: bool = False
+) -> JSONResponse:
+    selected_channel = channel or CURRENT_THREAD["channel"]
+    assert selected_channel is not None
+    selected_thread = thread_ts or (CURRENT_THREAD["thread_ts"] if current_thread else "")
+    msgs = (
+        fakes.slack_thread(selected_channel, selected_thread)
+        if selected_thread
+        else []
+        if current_thread
+        else fakes.slack_messages(selected_channel)
+    )
+    return JSONResponse(
+        [
+            {
+                "channel": selected_channel,
+                "user": m["user"],
+                "text": m["text"],
+                "is_bot": m["is_bot"],
+                "ts": m["ts"],
+                "thread_ts": m["thread_ts"],
+                "blocks": m["blocks"],
+                "reply_broadcast": m.get("reply_broadcast", False),
+            }
+            for m in msgs
+        ]
+    )
+
+
+@app.get("/mock/slack/state")
+async def slack_state(channel: str = "") -> JSONResponse:
+    current_channel = CURRENT_THREAD["channel"] or DEMO_CHANNEL
+    selected_channel = (
+        current_channel if current_channel != DEMO_CHANNEL else channel or DEMO_CHANNEL
+    )
+    channels = [{"id": DEMO_CHANNEL, "name": "demo"}]
+    channels.extend(
+        {
+            "id": message_channel,
+            "name": "direct-message"
+            if message_channel.startswith("D")
+            else message_channel.lower(),
+        }
+        for message_channel in fakes.slack_channels()
+        if message_channel != DEMO_CHANNEL
+    )
+    return JSONResponse({"selected_channel": selected_channel, "channels": channels})
+
+
+# --- mock UIs --------------------------------------------------------------
+@app.get("/mock/slack", response_class=HTMLResponse)
+async def mock_slack_page() -> str:
+    return (STATIC_DIR / "slack.html").read_text()
+
+
+@app.get("/mock/github", response_class=HTMLResponse)
+async def mock_github_page() -> str:
+    return (STATIC_DIR / "github.html").read_text()
+
+
+def _pr_html_url(pr: dict[str, Any]) -> str:
+    return f"{BASE_URL}/mock/github/{pr['owner']}/{pr['repo']}/pull/{pr['number']}"
+
+
+@app.get("/mock/github/data")
+async def mock_github_data() -> JSONResponse:
+    return JSONResponse(
+        [
+            {
+                "number": p["number"],
+                "repo": f"{p['owner']}/{p['repo']}",
+                "title": p["title"],
+                "head": p["head"],
+                "head_sha": p["head_sha"],
+                "base": p["base"],
+                "state": p["state"],
+                "draft": p["draft"],
+                "merged": p["merged"],
+                "merge_method": p["merge_method"],
+                "mergeable": p["mergeable"],
+                "mergeable_state": p["mergeable_state"],
+                "author": p["author"],
+                "body": p["body"],
+                "files": p["files"],
+                "reviews": p["reviews"],
+                "requested_reviewers": p["requested_reviewers"],
+                "review_comments": p["review_comments"],
+                "standalone_comment_posts": p["standalone_comment_posts"],
+                "issue_comments": p["issue_comments"],
+                "created_at": p["created_at"],
+                "updated_at": p["updated_at"],
+                "url": _pr_html_url(p),
+            }
+            for p in fakes.pulls()
+        ]
+    )
+
+
+@app.get("/mock/github/{owner}/{repo}/pull/{number}", response_class=HTMLResponse)
+async def mock_github_pr(owner: str, repo: str, number: int) -> HTMLResponse:  # noqa: ARG001
+    pr = fakes.find_pull(number)
+    if pr is None:
+        return HTMLResponse(f"<h1>PR #{number} not found</h1>", status_code=404)
+    files = "".join(
+        f'<li data-file="{f["filename"]}">{f["filename"]} '
+        f"<span class='stat'>+{f['additions']} −{f['deletions']}</span></li>"
+        for f in pr["files"]
+    )
+    draft = " (draft)" if pr["draft"] else ""
+    return HTMLResponse(
+        f"""<!doctype html><meta charset=utf-8>
+        <title>PR #{pr["number"]} — {pr["owner"]}/{pr["repo"]}</title>
+        <body style="font-family:system-ui;max-width:720px;margin:2rem auto">
+        <p><a href="/mock/github">← all pull requests</a></p>
+        <h1 id="pr-title">{pr["title"]}{draft}</h1>
+        <p>#{pr["number"]} · <span id="pr-state">{pr["state"]}</span> ·
+           <code id="pr-head">{pr["head"]}</code> → <code>{pr["base"]}</code> ·
+           by <span id="pr-author">{pr["author"]}</span></p>
+        <h3>Description</h3><pre id="pr-body">{pr["body"]}</pre>
+        <h3>Files changed ({len(pr["files"])})</h3>
+        <ul id="pr-files">{files}</ul>
+        </body>"""
+    )
+
+
+# --- fake GitHub REST API (open_pull_request hits this) --------------------
+# The backend calls these over HTTP from this same process, and they run git,
+# so they are sync handlers FastAPI runs off the event loop.
+_JsonBody = Annotated[dict[str, Any], Body()]
+
+
+@app.get("/fake-gh/user/installations")
+async def gh_user_installations() -> JSONResponse:
+    return JSONResponse(
+        {
+            "total_count": 1,
+            "installations": [{"id": 42, "account": {"login": "fakeorg", "type": "Organization"}}],
+        }
+    )
+
+
+@app.get("/fake-gh/user/installations/{installation_id}/repositories")
+async def gh_user_installation_repositories(installation_id: int) -> JSONResponse:
+    if installation_id != 42:
+        raise HTTPException(404, "No such installation")
+    return JSONResponse(
+        {
+            "total_count": 2,
+            "repositories": [
+                {"full_name": "fakeorg/demo", "private": False, "archived": False},
+                {"full_name": "anotherorg/companion", "private": False, "archived": False},
+            ],
+        }
+    )
+
+
+@app.get("/fake-gh/installation/repositories")
+async def gh_installation_repositories() -> JSONResponse:
+    return JSONResponse(
+        {
+            "repositories": [
+                {"full_name": "fakeorg/demo"},
+                {"full_name": "anotherorg/companion"},
+            ]
+        }
+    )
+
+
+def _gh_pr_json(pr: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "number": pr["number"],
+        "node_id": fakes.pull_node_id(pr),
+        "html_url": _pr_html_url(pr),
+        "state": pr["state"],
+        "draft": pr["draft"],
+        "merged": pr["merged"],
+        "mergeable": pr["mergeable"],
+        "mergeable_state": pr["mergeable_state"],
+        "title": pr["title"],
+        "body": pr["body"],
+        "user": {
+            "login": pr["author"],
+            "avatar_url": f"{BASE_URL}/logo-mark.png",
+        },
+        "merged_at": pr.get("merged_at"),
+        "head": {
+            "ref": pr["head"],
+            "sha": pr["head_sha"],
+            "repo": {"full_name": f"{pr['owner']}/{pr['repo']}"},
+        },
+        "base": {
+            "ref": pr["base"],
+            "sha": fakes.base_sha(pr),
+            "repo": {
+                "private": fakes.repo_private(),
+                "allow_squash_merge": True,
+                "allow_merge_commit": False,
+                "allow_rebase_merge": False,
+            },
+        },
+        "additions": pr["additions"],
+        "deletions": pr["deletions"],
+        "changed_files": len(pr["files"]),
+        "created_at": pr["created_at"],
+        "updated_at": pr["updated_at"],
+    }
+
+
+def _gh_search_item_json(pr: dict[str, Any]) -> dict[str, Any]:
+    repo_url = f"{FAKE_GITHUB_API}/repos/{pr['owner']}/{pr['repo']}"
+    return {
+        "number": pr["number"],
+        "title": pr["title"],
+        "repository_url": repo_url,
+        "pull_request": {"url": f"{repo_url}/pulls/{pr['number']}"},
+        "user": {"login": pr["author"]},
+        "state": pr["state"],
+        "draft": pr["draft"],
+        "created_at": pr["created_at"],
+        "updated_at": pr["updated_at"],
+    }
+
+
+def _token_login(request: Request) -> str:
+    """The login behind a per-user OAuth token, or ``""`` for the App token."""
+    authorization = request.headers.get("Authorization", "")
+    token = authorization.removeprefix("Bearer ").strip()
+    prefix = "dummy-user-oauth-token:"
+    return token.removeprefix(prefix) if token.startswith(prefix) else ""
+
+
+@app.get("/fake-gh/installation/repositories")
+async def gh_list_installation_repositories() -> JSONResponse:
+    repositories = [
+        {"full_name": f"{OWNER}/{REPO}"},
+        {"full_name": f"{SECOND_OWNER}/{SECOND_REPO}"},
+    ]
+    return JSONResponse({"total_count": len(repositories), "repositories": repositories})
+
+
+@app.get("/fake-gh/repos/{owner}/{repo}")
+def gh_get_repo(owner: str, repo: str) -> JSONResponse:
+    return JSONResponse(
+        {
+            "full_name": f"{owner}/{repo}",
+            "private": fakes.repo_private(),
+            **fakes.repo_merge_methods(owner, repo),
+        }
+    )
+
+
+@app.get("/fake-gh/repos/{owner}/{repo}/labels")
+def gh_list_repo_labels(owner: str, repo: str) -> JSONResponse:  # noqa: ARG001
+    return JSONResponse([])
+
+
+@app.get("/fake-gh/repos/{owner}/{repo}/issues/{number}/labels")
+def gh_list_issue_labels(owner: str, repo: str, number: int) -> JSONResponse:
+    if fakes.find_pull(number, owner, repo) is None:
+        return JSONResponse({"message": "Not Found"}, status_code=404)
+    return JSONResponse([])
+
+
+@app.get("/fake-gh/search/issues")
+def gh_search_issues(
+    q: str = "",
+    per_page: int = 100,
+    page: int = 1,
+    sort: str = "updated",
+    order: str = "desc",
+) -> JSONResponse:
+    """Search authored or awaiting-review PRs for the dashboard."""
+    terms = q.split()
+    author = next(
+        (term.removeprefix("author:") for term in terms if term.startswith("author:")), ""
+    )
+    reviewer = next(
+        (
+            term.removeprefix("review-requested:")
+            for term in terms
+            if term.startswith("review-requested:")
+        ),
+        "",
+    )
+    repositories = {
+        term.removeprefix("repo:").lower() for term in terms if term.startswith("repo:")
+    }
+    open_only = "is:open" in terms
+    matches = [
+        pull
+        for pull in fakes.pulls()
+        if (not author or pull["author"].lower() == author.lower())
+        and (
+            not reviewer
+            or reviewer.lower() in {login.lower() for login in pull["requested_reviewers"]}
+        )
+        and (not repositories or f"{pull['owner']}/{pull['repo']}".lower() in repositories)
+        and ("draft:true" not in terms or pull["draft"])
+        and (not open_only or (pull["state"] == "open" and not pull["merged"]))
+    ]
+    field = "created_at" if sort == "created" else "updated_at"
+    matches.sort(key=lambda pull: (pull[field], pull["number"]), reverse=order != "asc")
+    size = max(min(per_page, 100), 1)
+    window = matches[max(page - 1, 0) * size :][:size]
+    return JSONResponse(
+        {
+            "total_count": len(matches),
+            "incomplete_results": False,
+            "items": [_gh_search_item_json(pull) for pull in window],
+        }
+    )
+
+
+@app.get("/fake-gh/repos/{owner}/{repo}/branches/{branch:path}")
+def gh_get_branch(owner: str, repo: str, branch: str) -> JSONResponse:  # noqa: ARG001
+    if not fakes.branch_exists(owner, repo, branch):
+        return JSONResponse({"message": "Branch not found"}, status_code=404)
+    return JSONResponse({"name": branch, "commit": {"sha": "deadbeef"}})
+
+
+@app.get("/fake-gh/repos/{owner}/{repo}/rules/branches/{branch:path}")
+def gh_get_branch_rules(owner: str, repo: str, branch: str) -> JSONResponse:
+    required_checks: set[str] = {
+        check[context_key]
+        for pull in fakes.pulls()
+        if (pull["owner"], pull["repo"], pull["base"]) == (owner, repo, branch)
+        for checks, context_key in ((pull["check_runs"], "name"), (pull["statuses"], "context"))
+        for check in checks
+        if check.get("required")
+    }
+    return JSONResponse(
+        [
+            {
+                "type": "required_status_checks",
+                "parameters": {
+                    "required_status_checks": [
+                        {"context": name} for name in sorted(required_checks)
+                    ]
+                },
+            }
+        ]
+        if required_checks
+        else []
+    )
+
+
+@app.get("/fake-gh/repos/{owner}/{repo}/pulls")
+def gh_list_pulls(owner: str, repo: str) -> JSONResponse:  # noqa: ARG001
+    return JSONResponse([])
+
+
+@app.post("/fake-gh/repos/{owner}/{repo}/pulls")
+def gh_create_pull(owner: str, repo: str, request: Request, body: _JsonBody) -> JSONResponse:
+    """Open a pull request authored by the person whose token opened it, as GitHub does."""
+    pr = fakes.create_pull(
+        owner,
+        repo,
+        head=body.get("head", ""),
+        base=body.get("base", "main"),
+        title=body.get("title", ""),
+        body=body.get("body", ""),
+        draft=bool(body.get("draft", True)),
+        author=_token_login(request) or "open-swe[bot]",
+    )
+    return JSONResponse(_gh_pr_json(pr), status_code=201)
+
+
+@app.get("/fake-gh/repos/{owner}/{repo}/pulls/{number}")
+def gh_get_pull(owner: str, repo: str, number: int, request: Request) -> Response:
+    pr = fakes.find_pull(number, owner, repo)
+    if pr is None:
+        return JSONResponse({"message": "Not Found"}, status_code=404)
+    if "vnd.github.diff" in request.headers.get("Accept", ""):
+        return Response(fakes.pull_diff(pr), media_type="text/plain")
+    return JSONResponse(_gh_pr_json(pr))
+
+
+@app.get("/fake-gh/repos/{owner}/{repo}/pulls/{number}/commits")
+def gh_list_pull_commits(owner: str, repo: str, number: int) -> JSONResponse:
+    if fakes.find_pull(number, owner, repo) is None:
+        return JSONResponse({"message": "Not Found"}, status_code=404)
+    return JSONResponse([])
+
+
+@app.get("/fake-gh/repos/{owner}/{repo}/pulls/{number}/comments")
+def gh_list_pull_comments(
+    owner: str, repo: str, number: int, request: Request, page: int = 1
+) -> JSONResponse:
+    pr = fakes.find_pull(number, owner, repo)
+    if pr is None:
+        return JSONResponse({"message": "Not Found"}, status_code=404)
+    visible = fakes.visible_review_comments(pr, _token_login(request))
+    return JSONResponse(list(reversed(visible)) if page == 1 else [])
+
+
+@app.post("/fake-gh/repos/{owner}/{repo}/pulls/{number}/comments")
+def gh_create_pull_comment(owner: str, repo: str, number: int, body: _JsonBody) -> JSONResponse:
+    """A standalone inline comment. Recorded so a spec can prove nothing posts one."""
+    pr = fakes.find_pull(number, owner, repo)
+    if pr is None:
+        return JSONResponse({"message": "Not Found"}, status_code=404)
+    pr["standalone_comment_posts"].append(body)
+    return JSONResponse({"message": "Standalone comments are not used"}, status_code=422)
+
+
+@app.delete("/fake-gh/repos/{owner}/{repo}/pulls/comments/{comment_id}")
+def gh_delete_pull_comment(owner: str, repo: str, comment_id: int, request: Request) -> Response:
+    if not fakes.delete_review_comment(owner, repo, comment_id, author=_token_login(request)):
+        return JSONResponse({"message": "Not Found"}, status_code=404)
+    return Response(status_code=204)
+
+
+@app.post("/fake-gh/repos/{owner}/{repo}/pulls/{number}/reviews/{review_id}/events")
+def gh_submit_pending_review(
+    owner: str, repo: str, number: int, review_id: int, request: Request, body: _JsonBody
+) -> JSONResponse:
+    status, payload = fakes.submit_pending_review(
+        number,
+        owner,
+        repo,
+        review_id,
+        author=_token_login(request),
+        event=str(body.get("event") or ""),
+        body=str(body.get("body") or ""),
+    )
+    return JSONResponse(payload, status_code=status)
+
+
+@app.delete("/fake-gh/repos/{owner}/{repo}/pulls/{number}/reviews/{review_id}")
+def gh_delete_pending_review(
+    owner: str, repo: str, number: int, review_id: int, request: Request
+) -> JSONResponse:
+    status, payload = fakes.delete_pending_review(
+        number, owner, repo, review_id, author=_token_login(request)
+    )
+    return JSONResponse(payload, status_code=status)
+
+
+@app.get("/fake-gh/repos/{owner}/{repo}/issues/{number}/comments")
+def gh_list_issue_comments(owner: str, repo: str, number: int, page: int = 1) -> JSONResponse:
+    pr = fakes.find_pull(number, owner, repo)
+    if pr is None:
+        return JSONResponse({"message": "Not Found"}, status_code=404)
+    return JSONResponse(pr["issue_comments"] if page == 1 else [])
+
+
+@app.get("/fake-gh/repos/{owner}/{repo}/compare/{basehead:path}")
+def gh_compare(owner: str, repo: str, basehead: str) -> JSONResponse:
+    base, _, head = basehead.partition("...")
+    merge_base = fakes.merge_base(owner, repo, base, head)
+    if merge_base is None:
+        return JSONResponse({"message": "Not Found"}, status_code=404)
+    return JSONResponse(
+        {
+            "merge_base_commit": {"sha": merge_base},
+            "files": fakes.compare_files(owner, repo, base, head),
+        }
+    )
+
+
+@app.get("/fake-gh/repos/{owner}/{repo}/commits")
+def gh_list_commits(owner: str, repo: str, path: str = "", sha: str = BASE_BRANCH) -> JSONResponse:
+    """Commits touching ``path``; an author is a GitHub user only when a test user owns the email."""
+    logins = {user["email"]: user["login"] for user in TEST_USERS}
+    return JSONResponse(
+        [
+            {"author": {"login": logins[email], "type": "User"} if email in logins else None}
+            for email in fakes.commit_author_emails(owner, repo, path, sha)
+        ]
+    )
+
+
+@app.get("/fake-gh/repos/{owner}/{repo}/contents/{path:path}")
+def gh_get_contents(owner: str, repo: str, path: str, ref: str = BASE_BRANCH) -> Response:
+    content = fakes.file_at_ref(owner, repo, path, ref)
+    if content is None:
+        return JSONResponse({"message": "Not Found"}, status_code=404)
+    return Response(content, media_type="application/vnd.github.raw+json")
+
+
+@app.patch("/fake-gh/repos/{owner}/{repo}/pulls/{number}")
+def gh_update_pull(owner: str, repo: str, number: int, body: _JsonBody) -> JSONResponse:
+    pr = fakes.find_pull(number, owner, repo)
+    if pr is None:
+        return JSONResponse({"message": "Not Found"}, status_code=404)
+    state = body.get("state")
+    if state is not None:
+        if state not in {"open", "closed"}:
+            return JSONResponse({"message": "Invalid value for state"}, status_code=422)
+        fakes.update_pull_health(number, {"state": state})
+    for field in ("title", "body"):
+        if isinstance(body.get(field), str):
+            pr[field] = body[field]
+    pr["updated_at"] = fakes.github_timestamp()
+    return JSONResponse(_gh_pr_json(pr))
+
+
+@app.get("/fake-gh/repos/{owner}/{repo}/pulls/{number}/files")
+def gh_list_pull_files(
+    owner: str, repo: str, number: int, page: int = 1, per_page: int = 30
+) -> JSONResponse:
+    """One page of the pull's files; like GitHub, at most 3000 of them in all."""
+    pr = fakes.find_pull(number, owner, repo)
+    if pr is None:
+        return JSONResponse({"message": "Not Found"}, status_code=404)
+    size = max(min(per_page, 100), 1)
+    start = max(page - 1, 0) * size
+    return JSONResponse(pr["files"][:3000][start : start + size])
+
+
+@app.post("/fake-gh/repos/{owner}/{repo}/pulls/{number}/reviews")
+def gh_submit_pull_review(
+    owner: str, repo: str, number: int, request: Request, body: _JsonBody
+) -> JSONResponse:
+    """Submit a review as the person whose token was used, as GitHub does."""
+    author = _token_login(request)
+    if not author:
+        return JSONResponse({"message": "Resource not accessible by integration"}, status_code=403)
+    review = fakes.submit_review(
+        number,
+        owner,
+        repo,
+        author=author,
+        state=str(body.get("event") or "PENDING"),
+        commit_id=str(body.get("commit_id") or ""),
+        body=str(body.get("body") or ""),
+        comments=[c for c in body.get("comments") or [] if isinstance(c, dict)],
+    )
+    if review is None:
+        return JSONResponse({"message": "Not Found"}, status_code=404)
+    if "_error" in review:
+        return JSONResponse({"message": review["_error"]}, status_code=422)
+    return JSONResponse(review, status_code=200)
+
+
+@app.post("/fake-gh/repos/{owner}/{repo}/issues/{number}/comments")
+def gh_create_issue_comment(
+    owner: str, repo: str, number: int, request: Request, body: _JsonBody
+) -> JSONResponse:
+    pr = fakes.find_pull(number, owner, repo)
+    if pr is None:
+        return JSONResponse({"message": "Not Found"}, status_code=404)
+    comment = fakes.add_issue_comment(
+        pr, author=_token_login(request), body=str(body.get("body") or "")
+    )
+    return JSONResponse(comment, status_code=201)
+
+
+@app.post("/fake-gh/repos/{owner}/{repo}/pulls/{number}/requested_reviewers")
+def gh_request_reviewers(owner: str, repo: str, number: int, body: _JsonBody) -> JSONResponse:
+    pr = fakes.find_pull(number, owner, repo)
+    if pr is None:
+        return JSONResponse({"message": "Not Found"}, status_code=404)
+    for login in body.get("reviewers") or []:
+        if login == pr["author"]:
+            return JSONResponse(
+                {"message": "Review cannot be requested from pull request author."},
+                status_code=422,
+            )
+        if login not in pr["requested_reviewers"]:
+            pr["requested_reviewers"].append(login)
+    return JSONResponse(_gh_pr_json(pr), status_code=201)
+
+
+@app.delete("/fake-gh/repos/{owner}/{repo}/pulls/{number}/requested_reviewers")
+def gh_remove_requested_reviewers(
+    owner: str, repo: str, number: int, body: _JsonBody
+) -> JSONResponse:
+    pr = fakes.find_pull(number, owner, repo)
+    if pr is None:
+        return JSONResponse({"message": "Not Found"}, status_code=404)
+    removed = set(body.get("reviewers") or [])
+    pr["requested_reviewers"] = [
+        login for login in pr["requested_reviewers"] if login not in removed
+    ]
+    return JSONResponse(_gh_pr_json(pr))
+
+
+@app.put("/fake-gh/repos/{owner}/{repo}/pulls/{number}/merge")
+def gh_merge_pull(owner: str, repo: str, number: int, body: _JsonBody) -> JSONResponse:
+    status, payload = fakes.merge_pull(
+        number,
+        owner,
+        repo,
+        sha=str(body.get("sha") or ""),
+        merge_method=str(body.get("merge_method") or "merge"),
+    )
+    return JSONResponse(payload, status_code=status)
+
+
+# Seeded reviews carry only ``{author, state}``, so the list has to be
+# normalised: the dashboard's review-decision read needs a login and an id.
+@app.get("/fake-gh/repos/{owner}/{repo}/pulls/{number}/reviews")
+def gh_list_pull_reviews(
+    owner: str, repo: str, number: int, request: Request, page: int = 1
+) -> JSONResponse:
+    """Submitted reviews, plus a pending one only for its author, as GitHub does."""
+    pr = fakes.find_pull(number, owner, repo)
+    if pr is None:
+        return JSONResponse({"message": "Not Found"}, status_code=404)
+    if page > 1:
+        return JSONResponse([])
+    viewer = _token_login(request)
+    return JSONResponse(
+        [
+            fakes.review_rest_json(review, index)
+            for index, review in enumerate(pr["reviews"])
+            if review.get("state") != "PENDING" or review.get("author") == viewer
+        ]
+    )
+
+
+@app.get("/fake-gh/repos/{owner}/{repo}/collaborators/{username}/permission")
+def gh_collaborator_permission(owner: str, repo: str, username: str) -> JSONResponse:  # noqa: ARG001
+    return JSONResponse(
+        {"permission": fakes.collaborator_permission(username), "user": {"login": username}}
+    )
+
+
+@app.get("/fake-gh/repos/{owner}/{repo}/commits/{sha}/check-runs")
+def gh_get_check_runs(owner: str, repo: str, sha: str) -> JSONResponse:
+    pr = fakes.find_pull_by_sha(owner, repo, sha)
+    if pr is None:
+        return JSONResponse({"message": "Not Found"}, status_code=404)
+    return JSONResponse({"total_count": len(pr["check_runs"]), "check_runs": pr["check_runs"]})
+
+
+@app.get("/fake-gh/repos/{owner}/{repo}/commits/{sha}/status")
+def gh_get_commit_status(owner: str, repo: str, sha: str) -> JSONResponse:
+    pr = fakes.find_pull_by_sha(owner, repo, sha)
+    if pr is None:
+        return JSONResponse({"message": "Not Found"}, status_code=404)
+    return JSONResponse({"state": "pending", "sha": sha, "statuses": pr["statuses"]})
+
+
+@app.post("/fake-gh/graphql")
+def gh_graphql(request: Request, body: _JsonBody) -> JSONResponse:
+    variables = body.get("variables", {})
+    query = body.get("query", "")
+    if "MarkPullRequestReady" in query:
+        node_id = variables.get("pullRequestId")
+        ready = fakes.mark_pull_ready(node_id) if isinstance(node_id, str) else None
+        if ready is None:
+            return JSONResponse({"errors": [{"message": "Could not resolve to a node"}]})
+        return JSONResponse(
+            {"data": {"markPullRequestReadyForReview": {"pullRequest": {"isDraft": False}}}}
+        )
+    viewer = _token_login(request)
+    if "QueuedPullRequests" in query:
+        data: dict[str, object] = {}
+        for key, number in variables.items():
+            if not key.startswith("number"):
+                continue
+            suffix = key.removeprefix("number")
+            pr = fakes.find_pull(number, variables[f"owner{suffix}"], variables[f"repo{suffix}"])
+            if pr is None:
+                data[f"pull{suffix}"] = None
+                continue
+            reviews = [
+                {"state": review["state"]}
+                for index, raw in enumerate(pr["reviews"])
+                if (review := fakes.review_rest_json(raw, index))["user"]["login"].lower()
+                == variables["reviewer"].lower()
+                and review["state"] in {"APPROVED", "CHANGES_REQUESTED", "DISMISSED"}
+            ]
+            data[f"pull{suffix}"] = {
+                "pullRequest": {
+                    "state": "MERGED" if pr["merged"] else pr["state"].upper(),
+                    "isDraft": pr["draft"],
+                    "title": pr["title"],
+                    "createdAt": pr["created_at"],
+                    "updatedAt": pr["updated_at"],
+                    "author": {"login": pr["author"]} if pr["author"] else None,
+                    "reviews": {"nodes": reviews[-1:]},
+                }
+            }
+        return JSONResponse({"data": data})
+    mutation_input = variables.get("input")
+    if "addPullRequestReviewThread" in query and isinstance(mutation_input, dict):
+        comment = fakes.add_review_thread(viewer, mutation_input)
+        if comment is None:
+            return JSONResponse({"errors": [{"message": "Could not resolve to a pending review"}]})
+        thread = {"id": f"PRRT_node_{comment['id']}"}
+        return JSONResponse({"data": {"addPullRequestReviewThread": {"thread": thread}}})
+    if "updatePullRequestReviewComment" in query and isinstance(mutation_input, dict):
+        updated = fakes.update_review_comment_body(
+            viewer,
+            str(mutation_input.get("pullRequestReviewCommentId") or ""),
+            str(mutation_input.get("body") or ""),
+        )
+        if updated is None:
+            return JSONResponse({"errors": [{"message": "Could not resolve to a comment"}]})
+        payload = {"pullRequestReviewComment": {"id": updated["node_id"]}}
+        return JSONResponse({"data": {"updatePullRequestReviewComment": payload}})
+    owner = variables.get("owner")
+    repo = variables.get("repo")
+    expression = variables.get("expression")
+    if "...on Tree" in query and isinstance(expression, str):
+        ref, _, path = expression.partition(":")
+        files = fakes.files_in_dir(str(owner), str(repo), path, ref)
+        tree = (
+            None
+            if files is None
+            else {
+                "entries": [
+                    {"path": name, "type": "blob", "object": {"text": text}}
+                    for name, text in files.items()
+                ]
+            }
+        )
+        return JSONResponse({"data": {"repository": {"object": tree}}})
+    if "query CommitCI(" in query:
+        oid = variables.get("oid")
+        found = fakes.find_pull_by_sha(str(owner), str(repo), oid) if isinstance(oid, str) else None
+        if found is None:
+            return JSONResponse({"errors": [{"type": "NOT_FOUND", "message": "No commit"}]})
+        return JSONResponse({"data": {"repository": {"object": fakes.commit_ci_graphql(found)}}})
+    number = variables.get("number")
+    if not isinstance(owner, str) or not isinstance(repo, str) or not isinstance(number, int):
+        return JSONResponse({"errors": [{"message": "Invalid variables"}]}, status_code=400)
+    pr = fakes.find_pull(number, owner, repo)
+    if pr is None:
+        return JSONResponse({"errors": [{"message": "Pull request not found"}]})
+    if "PullRequestTitleAndBody" in query:
+        title_and_body = {"title": pr["title"], "body": pr["body"]}
+        return JSONResponse({"data": {"repository": {"pullRequest": title_and_body}}})
+    if "PullRequestTips" in query:
+        tips = {"baseRefOid": fakes.base_sha(pr), "headRefOid": pr["head_sha"]}
+        return JSONResponse({"data": {"repository": {"pullRequest": tips}}})
+    if "PullRequestAllReviewThreads" in query or "PullRequestReviewThreadRoots" in query:
+        threads = {
+            "nodes": fakes.review_threads_graphql(pr, viewer),
+            "pageInfo": {"hasNextPage": False, "endCursor": None},
+        }
+        return JSONResponse({"data": {"repository": {"pullRequest": {"reviewThreads": threads}}}})
+    if "PullRequestThreadCount" in query:
+        return JSONResponse(
+            {
+                "data": {
+                    "repository": {
+                        "pullRequest": {
+                            "reviewThreads": fakes.review_thread_count_graphql(pr["review_threads"])
+                        }
+                    }
+                }
+            }
+        )
+    review_threads = {
+        "nodes": [fakes.review_thread_graphql(thread) for thread in pr["review_threads"]],
+        "pageInfo": {"hasNextPage": False, "endCursor": None},
+    }
+    pull_request: dict[str, Any] = {"reviewThreads": review_threads}
+    if "PullRequestStatus" in query:
+        reviews: list[dict[str, object]] = []
+        for index, raw in enumerate(pr["reviews"]):
+            review = fakes.review_rest_json(raw, index)
+            user = review["user"]
+            reviews.append(
+                {
+                    "fullDatabaseId": str(review["id"]),
+                    "state": review["state"],
+                    "author": {
+                        "__typename": "Bot" if user["login"].endswith("[bot]") else "User",
+                        "login": user["login"].removesuffix("[bot]"),
+                        "databaseId": user["id"],
+                        "avatarUrl": user["avatar_url"],
+                    },
+                }
+            )
+        pull_request.update(
+            {
+                "title": pr["title"],
+                "state": "MERGED" if pr["merged"] else pr["state"].upper(),
+                "isDraft": pr["draft"],
+                "createdAt": pr["created_at"],
+                "updatedAt": pr["updated_at"],
+                "additions": pr["additions"],
+                "deletions": pr["deletions"],
+                "author": {"__typename": "User", "login": pr["author"]},
+                "mergeable": (
+                    "UNKNOWN"
+                    if pr["mergeable"] is None
+                    else "MERGEABLE"
+                    if pr["mergeable"]
+                    else "CONFLICTING"
+                ),
+                "mergeStateStatus": pr["mergeable_state"].upper(),
+                "autoMergeRequest": None,
+                "headRefName": pr["head"],
+                "headRefOid": pr["head_sha"],
+                "baseRefName": pr["base"],
+                "reviewDecision": pr["review_decision"],
+                "reviews": {
+                    "nodes": reviews,
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                },
+                "commits": {"nodes": [{"commit": fakes.commit_ci_graphql(pr)}]},
+            }
+        )
+    if "PullRequestFixReviews" in query:
+        pull_request.update(
+            {
+                "reviewDecision": pr["review_decision"],
+                "mergeStateStatus": "DIRTY" if not pr["mergeable"] else "CLEAN",
+                "latestOpinionatedReviews": {
+                    "nodes": [
+                        {
+                            "author": {"login": review.get("author")},
+                            "state": review.get("state"),
+                            "body": review.get("body", ""),
+                            "url": review.get("url"),
+                        }
+                        for review in pr["reviews"]
+                    ]
+                },
+            }
+        )
+    if "query PullRequestCI(" in query:
+        pull_request = {
+            "state": "MERGED" if pr.get("merged") else str(pr.get("state", "open")).upper(),
+            "headRefOid": pr["head_sha"],
+            "headRefName": pr["head"],
+            "baseRefName": pr["base"],
+            "commits": {"nodes": [{"commit": fakes.commit_ci_graphql(pr)}]},
+        }
+    if "PullRequestFixChecks" in query:
+        pull_request = {
+            "commits": {
+                "nodes": [
+                    {
+                        "commit": {
+                            "oid": pr["head_sha"],
+                            "statusCheckRollup": {
+                                "contexts": {
+                                    "nodes": [
+                                        *[fakes.check_graphql(check) for check in pr["check_runs"]],
+                                        *[
+                                            fakes.status_graphql(status)
+                                            for status in pr["statuses"]
+                                        ],
+                                    ],
+                                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                                }
+                            },
+                        }
+                    }
+                ]
+            }
+        }
+    return JSONResponse({"data": {"repository": {"pullRequest": pull_request}}})
+
+
+# --- fake Slack API (real slack code hits this) ----------------------------
+def _ok(extra: dict[str, Any] | None = None) -> JSONResponse:
+    return JSONResponse({"ok": True, **(extra or {})})
+
+
+@app.post("/fake-slack/chat.postMessage")
+async def slack_post_message(request: Request) -> JSONResponse:
+    body = await request.json()
+    ts = fakes.add_slack_message(
+        body.get("channel", ""),
+        body.get("thread_ts", ""),
+        user=BOT_USER_ID,
+        text=body.get("text", ""),
+        blocks=body.get("blocks"),
+        is_bot=True,
+        reply_broadcast=bool(body.get("reply_broadcast")),
+    )
+    message: dict[str, Any] = {"ts": ts}
+    thread_ts = body.get("thread_ts") or ""
+    if thread_ts:
+        message["thread_ts"] = thread_ts
+    return _ok({"ts": ts, "message": message})
+
+
+@app.post("/fake-slack/chat.update")
+async def slack_update_message(request: Request) -> JSONResponse:
+    body = await request.json()
+    message = fakes.update_slack_message(
+        str(body.get("channel") or ""),
+        str(body.get("ts") or ""),
+        text=str(body.get("text") or ""),
+        blocks=body.get("blocks"),
+    )
+    if message is None:
+        return JSONResponse({"ok": False, "error": "message_not_found"})
+    return _ok({"ts": message["ts"], "message": message})
+
+
+async def _slack_form(request: Request) -> dict[str, Any]:
+    """The SDK sends these methods' ``params=`` in the query string or a form, not as JSON."""
+    if request.headers.get("content-type", "").startswith("application/json"):
+        return {**request.query_params, **(await request.json())}
+    return {**request.query_params, **dict(await request.form())}
+
+
+@app.post("/fake-slack/chat.delete")
+async def slack_delete_message(request: Request) -> JSONResponse:
+    body = await _slack_form(request)
+    if not fakes.delete_slack_message(str(body.get("channel") or ""), str(body.get("ts") or "")):
+        return JSONResponse({"ok": False, "error": "message_not_found"})
+    return _ok()
+
+
+@app.post("/fake-slack/conversations.open")
+async def slack_conversations_open(request: Request) -> JSONResponse:
+    body = await _slack_form(request)
+    user = str(body.get("users") or "")
+    user = {"W123BOB": "U_BOB", "W123ALICE": "U_ALICE"}.get(user, user)
+    return _ok({"channel": {"id": f"D_{user.removeprefix('U_')}"}})
+
+
+@app.post("/fake-slack/views.open")
+async def slack_views_open(request: Request) -> JSONResponse:
+    body = await _slack_form(request)
+    view = body.get("view")
+    if isinstance(view, str):
+        view = json.loads(view)
+    if not isinstance(view, dict) or not body.get("trigger_id"):
+        return JSONResponse({"ok": False, "error": "invalid_arguments"})
+    opened = {**view, "id": f"V{fakes.next_slack_ts().replace('.', '')}"}
+    fakes.VIEWS.append(opened)
+    return _ok({"view": opened})
+
+
+@app.get("/mock/slack/views")
+async def mock_slack_views() -> JSONResponse:
+    return JSONResponse(fakes.VIEWS)
+
+
+@app.post("/mock/slack/view-submit")
+async def mock_slack_view_submit(request: Request) -> JSONResponse:
+    """Submit an opened modal as ``user`` with ``values``, the way Slack delivers it."""
+    body = await request.json()
+    view = next((item for item in fakes.VIEWS if item["id"] == body.get("view_id")), None)
+    if view is None:
+        raise HTTPException(status_code=404, detail="View not found")
+    payload = {
+        "type": "view_submission",
+        "user": {"id": str(body.get("user") or "")},
+        "view": {
+            "id": view["id"],
+            "callback_id": view.get("callback_id", ""),
+            "private_metadata": view.get("private_metadata", ""),
+            "state": {"values": body.get("values") or {}},
+        },
+    }
+    response = await _deliver_slack_interaction(payload)
+    return JSONResponse(
+        response.json() if response.content else {}, status_code=response.status_code
+    )
+
+
+@app.post("/fake-slack/chat.postEphemeral")
+async def slack_post_ephemeral(request: Request) -> JSONResponse:
+    body = await request.json()
+    ts = fakes.add_ephemeral(
+        str(body.get("channel") or ""), str(body.get("user") or ""), str(body.get("text") or "")
+    )
+    return _ok({"message_ts": ts})
+
+
+@app.get("/mock/slack/ephemerals")
+async def mock_slack_ephemerals() -> JSONResponse:
+    return JSONResponse(fakes.EPHEMERALS)
+
+
+@app.post("/fake-slack/reactions.add")
+async def slack_reactions_add(request: Request) -> JSONResponse:
+    await request.body()
+    return _ok()
+
+
+@app.get("/fake-slack/users.list")
+async def slack_users_list() -> JSONResponse:
+    return _ok(
+        {
+            "members": [
+                {
+                    "id": user_id,
+                    "name": info["name"],
+                    "profile": {"display_name": info["real_name"], "real_name": info["real_name"]},
+                }
+                for user_id, info in _SLACK_USERS.items()
+                if "_" not in user_id
+            ]
+        }
+    )
+
+
+@app.get("/fake-slack/users.info")
+async def slack_users_info(user: str = "") -> JSONResponse:
+    info = _SLACK_USERS.get(
+        user, {"name": "devuser", "real_name": "Dev User", "email": "dev@example.com"}
+    )
+    return _ok(
+        {
+            "user": {
+                "id": user,
+                "name": info["name"],
+                "real_name": info["real_name"],
+                "profile": {
+                    "email": info["email"],
+                    "display_name": info["real_name"],
+                    "real_name": info["real_name"],
+                },
+            }
+        }
+    )
+
+
+_CHANNEL_NAMES = {REVIEW_CHANNEL: "reviews"}
+
+
+@app.get("/fake-slack/conversations.info")
+async def slack_conversations_info(channel: str = "") -> JSONResponse:
+    name = _CHANNEL_NAMES.get(channel, "demo")
+    data: dict[str, Any] = {
+        "id": channel,
+        "name": name,
+        "name_normalized": name,
+        "is_channel": not channel.startswith("D"),
+        "is_private": False,
+        "is_im": channel.startswith("D"),
+        "is_mpim": False,
+        "is_ext_shared": False,
+        "is_pending_ext_shared": False,
+        "topic": {"value": "Demo channel topic"},
+        "purpose": {"value": "Demo channel purpose"},
+    }
+    return _ok({"channel": data})
+
+
+@app.get("/fake-slack/conversations.replies")
+async def slack_conversations_replies(channel: str = "", ts: str = "") -> JSONResponse:
+    msgs = fakes.slack_thread(channel, ts)
+    return _ok(
+        {
+            "messages": [
+                {
+                    "type": "message",
+                    "user": m["user"],
+                    "text": m["text"],
+                    "ts": m["ts"],
+                    "thread_ts": m["thread_ts"],
+                    **({"bot_id": m["bot_id"], "subtype": "bot_message"} if m["is_bot"] else {}),
+                }
+                for m in msgs
+            ]
+        }
+    )
+
+
+@app.get("/fake-slack/conversations.history")
+async def slack_conversations_history(channel: str = "") -> JSONResponse:
+    return _ok(
+        {
+            "messages": [
+                {
+                    "type": "message",
+                    "user": message["user"],
+                    "text": message["text"],
+                    "ts": message["ts"],
+                    **(
+                        {"bot_id": message["bot_id"], "subtype": "bot_message"}
+                        if message["is_bot"]
+                        else {}
+                    ),
+                }
+                for message in reversed(fakes.slack_messages(channel))
+            ]
+        }
+    )
+
+
+@app.get("/fake-slack/chat.getPermalink")
+async def slack_get_permalink(channel: str = "", message_ts: str = "") -> JSONResponse:  # noqa: ARG001
+    return _ok({"permalink": f"{BASE_URL}/mock/slack"})
+
+
+# Slack's three-step external upload. Without it the expedited-review card's
+# diff image silently fails to upload and the card degrades to its text
+# fallback, so the suite would test a rendering nobody sees.
+SLACK_FILES: dict[str, bytes] = {}
+SLACK_FILES_COMPLETED: set[str] = set()
+
+
+@app.api_route("/fake-slack/files.getUploadURLExternal", methods=["GET", "POST"])
+async def slack_get_upload_url(filename: str = "") -> JSONResponse:
+    file_id = f"F{uuid.uuid4().hex[:10].upper()}"
+    SLACK_FILES[file_id] = b""
+    return _ok({"upload_url": f"{BASE_URL}/fake-slack/upload/{file_id}", "file_id": file_id})
+
+
+@app.post("/fake-slack/upload/{file_id}")
+async def slack_upload_bytes(file_id: str, request: Request) -> JSONResponse:
+    SLACK_FILES[file_id] = await request.body()
+    return JSONResponse({"ok": True})
+
+
+@app.post("/fake-slack/files.completeUploadExternal")
+async def slack_complete_upload(request: Request) -> JSONResponse:
+    # The SDK sends this one as query parameters, with ``files`` as a JSON string.
+    raw: object = request.query_params.get("files")
+    if raw is None:
+        try:
+            body: object = await request.json()
+        except ValueError:
+            body = dict(await request.form())
+        raw = body.get("files") if isinstance(body, dict) else None
+    if isinstance(raw, str):
+        raw = json.loads(raw)
+    items = [item for item in raw if isinstance(item, dict)] if isinstance(raw, list) else []
+    SLACK_FILES_COMPLETED.update(str(item.get("id")) for item in items)
+    return _ok({"files": [{"id": item.get("id"), "title": item.get("title")} for item in items]})
+
+
+@app.api_route("/fake-slack/files.info", methods=["GET", "POST"])
+async def slack_file_info(request: Request) -> JSONResponse:
+    """Report a completed upload as processed, which is when Slack lets a block cite it."""
+    file_id = request.query_params.get("file") or str((await request.form()).get("file") or "")
+    if file_id not in SLACK_FILES:
+        return JSONResponse({"ok": False, "error": "file_not_found"})
+    ready = file_id in SLACK_FILES_COMPLETED and bool(SLACK_FILES[file_id])
+    return _ok({"file": {"id": file_id, "mimetype": "image/png" if ready else ""}})
+
+
+@app.get("/control/slack-files")
+async def control_slack_files() -> JSONResponse:
+    return JSONResponse([{"id": k, "bytes": len(v)} for k, v in SLACK_FILES.items()])
+
+
+@app.get("/mock/slack/files/{file_id}")
+async def mock_slack_file(file_id: str) -> Response:
+    content = SLACK_FILES.get(file_id)
+    if not content:
+        return Response(status_code=404)
+    return Response(content, media_type="image/png")
+
+
+# A dashboard build under ui/.output puts the UI catch-all on the app before the
+# mock pages above were registered; keep it behind them.
+keep_dashboard_ui_last(app)
+
+# Quietly reference imports used only for env side effects.
+_ = (e2e_env, HUMAN_USER)

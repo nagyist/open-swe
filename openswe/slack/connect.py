@@ -1,0 +1,212 @@
+"""Sign in with Slack endpoints that link a verified Slack identity to a person."""
+
+import hmac
+import logging
+from typing import Any
+
+from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import RedirectResponse, Response
+
+from openswe.dashboard.deps import SESSION_DEP
+from openswe.dashboard.oauth import (
+    STATE_TTL_SECONDS,
+    DesktopConnectExchange,
+    cookie_security,
+    decode_state,
+    desktop_callback_url,
+    desktop_handoff_from_state,
+    frontend_base_url,
+    hash_state_nonce,
+    issue_connect_handoff,
+    issue_state,
+    new_state_nonce,
+    redeem_connect_handoff,
+    require_session,
+    sanitize_redirect_to,
+    valid_handoff_challenge,
+)
+from openswe.dashboard.principal import DashboardPrincipal
+from openswe.slack.oauth import (
+    SLACK_STATE_COOKIE_NAME,
+    SlackIdentity,
+    build_authorize_url,
+    exchange_slack_code,
+    fetch_slack_identity,
+    slack_base_url,
+    slack_oauth_configured,
+    verify_team,
+)
+from openswe.slack.recovery import SlackRecovery
+from openswe.users import AccountConflict
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(tags=["slack"])
+
+
+def _set_slack_state_cookie(response: Response, nonce: str) -> None:
+    secure, _ = cookie_security()
+    response.set_cookie(
+        key=SLACK_STATE_COOKIE_NAME,
+        value=nonce,
+        max_age=STATE_TTL_SECONDS,
+        httponly=True,
+        secure=secure,
+        samesite="lax",
+        path="/dashboard/api/slack",
+    )
+
+
+def _clear_slack_state_cookie(response: Response) -> None:
+    secure, _ = cookie_security()
+    response.delete_cookie(
+        SLACK_STATE_COOKIE_NAME, path="/dashboard/api/slack", samesite="lax", secure=secure
+    )
+
+
+@router.get("/slack/login")
+async def slack_login(
+    redirect_to: str | None = None,
+    desktop_handoff: str | None = None,
+    desktop_port: int | None = Query(default=None, ge=1024, le=65535),
+    _session: dict[str, Any] = SESSION_DEP,
+) -> RedirectResponse:
+    """Start the Sign in with Slack flow to link the current Robin account."""
+    if not slack_oauth_configured():
+        raise HTTPException(500, "Slack OAuth is not configured")
+    redirect_uri = f"{slack_base_url()}/dashboard/api/slack/callback"
+    user = await DashboardPrincipal.from_session(_session).user()
+    if user is None:
+        raise HTTPException(401, "Robin account not found — sign in with LangSmith again")
+    nonce = new_state_nonce()
+    state = issue_state(
+        redirect_to=sanitize_redirect_to(redirect_to)
+        if redirect_to
+        else f"{frontend_base_url()}/my-settings/connections",
+        nonce_hash=hash_state_nonce(nonce),
+        handoff_challenge=valid_handoff_challenge(desktop_handoff),
+        handoff_port=desktop_port,
+        linking_user_id=str(user.id),
+    )
+    response = RedirectResponse(
+        build_authorize_url(redirect_uri=redirect_uri, state=state), status_code=302
+    )
+    _set_slack_state_cookie(response, nonce)
+    return response
+
+
+@router.get("/slack/callback")
+async def slack_callback(
+    request: Request,
+    code: str,
+    state: str,
+) -> RedirectResponse:
+    """Link the verified Slack identity to the signed-in Robin person."""
+    state_payload = decode_state(state)
+    handoff = desktop_handoff_from_state(state_payload)
+
+    if handoff is not None:
+        # Hand the verified identity back over the loopback port, for the app
+        # to redeem under the session it holds.
+        challenge, port = handoff
+        identity = await _verified_slack_identity(code)
+        handoff_code = issue_connect_handoff(
+            provider="slack",
+            challenge=challenge,
+            claims={
+                "slack_user_id": identity.user_id,
+                "email": identity.email,
+                "team_id": identity.team_id,
+            },
+        )
+        response = RedirectResponse(desktop_callback_url(port, handoff_code), status_code=302)
+        _clear_slack_state_cookie(response)
+        return response
+
+    session = await require_session(request)
+    nonce_hash = state_payload.get("nonce_hash")
+    cookie_nonce = request.cookies.get(SLACK_STATE_COOKIE_NAME)
+    if (
+        not isinstance(nonce_hash, str)
+        or not cookie_nonce
+        or not hmac.compare_digest(hash_state_nonce(cookie_nonce), nonce_hash)
+    ):
+        raise HTTPException(400, "oauth state mismatch — please retry")
+
+    user = await DashboardPrincipal.from_session(session).user()
+    if user is None or state_payload.get("linking_user_id") != str(user.id):
+        raise HTTPException(400, "Robin account changed — please restart Slack sign-in")
+    identity = await _verified_slack_identity(code)
+    try:
+        await _link_slack_identity(
+            session,
+            slack_user_id=identity.user_id,
+            email=identity.email or "",
+            team_id=identity.team_id,
+        )
+    except HTTPException as exc:
+        if exc.status_code != 409 or not isinstance(exc.detail, dict):
+            raise
+        response = RedirectResponse(
+            await SlackRecovery.redirect(exc.detail["recovery_token"]), status_code=302
+        )
+        _clear_slack_state_cookie(response)
+        return response
+
+    redirect_to = sanitize_redirect_to(state_payload.get("redirect_to")) or frontend_base_url()
+    response = RedirectResponse(redirect_to, status_code=302)
+    _clear_slack_state_cookie(response)
+    return response
+
+
+async def _verified_slack_identity(code: str) -> SlackIdentity:
+    """Resolve an authorization code to a Slack identity with a verified email."""
+    redirect_uri = f"{slack_base_url()}/dashboard/api/slack/callback"
+    identity = await fetch_slack_identity(await exchange_slack_code(code, redirect_uri))
+    verify_team(identity)
+    if not identity.email or not identity.email_verified:
+        raise HTTPException(400, "your Slack account has no verified email to link")
+    return identity
+
+
+async def _link_slack_identity(
+    session: dict[str, Any], *, slack_user_id: str, email: str, team_id: str
+) -> None:
+    """Attach the Slack account to the person the session belongs to."""
+    principal = DashboardPrincipal.from_session(session)
+    user = await principal.user()
+    if user is None:
+        raise HTTPException(401, "Robin account not found — sign in with LangSmith again")
+    try:
+        await user.link("slack", slack_user_id, email=email, team_id=team_id)
+    except AccountConflict as exc:
+        raise HTTPException(
+            409,
+            {
+                "code": "slack_account_conflict",
+                "message": "Your Slack is connected to an older Robin account.",
+                "recovery_token": await SlackRecovery(user.id, slack_user_id).issue(),
+            },
+        ) from exc
+
+
+@router.post("/slack/desktop/exchange")
+async def slack_desktop_exchange(
+    body: DesktopConnectExchange,
+    session: dict[str, Any] = SESSION_DEP,
+) -> dict[str, Any]:
+    """Finish a desktop Slack link with the app's own session."""
+    claims = redeem_connect_handoff(provider="slack", code=body.code, verifier=body.verifier)
+    slack_user_id = claims.get("slack_user_id")
+    email = claims.get("email")
+    team_id = claims.get("team_id")
+    if not isinstance(slack_user_id, str) or not isinstance(email, str):
+        raise HTTPException(400, "malformed handoff code")
+
+    await _link_slack_identity(
+        session,
+        slack_user_id=slack_user_id,
+        email=email,
+        team_id=team_id if isinstance(team_id, str) else "",
+    )
+    return {"connected": True}

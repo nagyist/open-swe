@@ -1,0 +1,2095 @@
+"""Shared GitHub HTTP helper with sane timeouts, retries, and rate-limit handling.
+
+Existing reviewer publish calls use ``github_request`` instead of raw
+``httpx2.AsyncClient`` calls. App authentication and repository access checks
+use the typed async SDK in ``openswe.github.sdk``. This helper centralises:
+
+- **Timeouts**: httpx2 defaults to 5 s which is too aggressive for paginated
+  GitHub/GraphQL fetches.  The default here is 30 s read / 10 s connect.
+- **Retries**: exponential backoff with jitter for retryable HTTP status codes
+  and transport errors, gated by method idempotency to prevent duplicate writes.
+  See ``github_request`` for the full retry matrix.
+- **Rate-limit awareness**: respects ``Retry-After`` headers and backs off on
+  GitHub secondary rate limits; a spent hourly quota is not retried unless it
+  resets within the longest backoff. Once GitHub says an App installation's quota
+  is spent, ``openswe.github.quota_gate`` refuses that installation's requests
+  itself until the reset, without asking GitHub.
+- **Conditional reads**: ``github_client`` revalidates repeated GETs with their
+  ETag (``openswe.github.revalidation``), and GitHub doesn't count a 304 against
+  the quota.
+"""
+
+import asyncio
+import base64
+import hashlib
+import io
+import json
+import logging
+import math
+import random
+import re
+import time
+import zipfile
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Mapping, Sequence
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from functools import partial
+from pathlib import PurePosixPath
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, Self
+from urllib.parse import quote, unquote, urlparse
+
+import httpx2
+from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter
+from pydantic.alias_generators import to_camel
+
+from openswe.github.metering import MeteredTransport
+from openswe.github.queue import (
+    Artifact,
+    CommitComparison,
+    GitReference,
+    NativeQueueSnapshot,
+    ValidationJob,
+    ValidationRun,
+    ValidationRuns,
+    WorkflowRun,
+)
+from openswe.github.revalidation import GITHUB_TRANSPORT
+from openswe.utils.dashboard_links import dashboard_api_base_url, dashboard_base_url
+from openswe.utils.url_safety import request_with_safe_redirects
+
+if TYPE_CHECKING:
+    from openswe.github.pull_request_status import PullRequestClient
+    from openswe.merge_queue.git import CandidateGit
+
+logger = logging.getLogger(__name__)
+
+GITHUB_API_BASE = "https://api.github.com"
+GITHUB_GRAPHQL = "https://api.github.com/graphql"
+GITHUB_HEADERS_VERSION = "2022-11-28"
+
+DEFAULT_TIMEOUT = httpx2.Timeout(30.0, connect=10.0, pool=5.0)
+DEFAULT_MAX_RETRIES = 3
+_PAGE_SIZE = 100
+_PAGE_CONCURRENCY = 10
+_TEAM_MAX_PAGES = 10
+_FILES_PER_QUERY = 100
+_HISTORIES_PER_QUERY = 10
+
+
+class _HistoryUser(BaseModel):
+    login: str
+
+
+class _HistoryAuthor(BaseModel):
+    user: _HistoryUser | None
+
+
+class _HistoryCommit(BaseModel):
+    author: _HistoryAuthor
+
+
+class _History(BaseModel):
+    nodes: list[_HistoryCommit]
+
+
+# A commit's latest check runs and its latest status per context, as ``CommitCI`` reads them.
+COMMIT_CI_FRAGMENT = """
+fragment CommitCI on Commit {
+  oid
+  status { contexts { context state targetUrl createdAt } }
+  checkSuites(first: 100) {
+    pageInfo { hasNextPage }
+    nodes {
+      databaseId
+      app { databaseId slug }
+      workflowRun { event workflow { databaseId } }
+      checkRuns(first: 100, filterBy: {checkType: LATEST}) {
+        pageInfo { hasNextPage }
+        nodes { databaseId name status conclusion detailsUrl url completedAt }
+      }
+    }
+  }
+}
+"""
+_COMMIT_CI_QUERY = (
+    """
+query CommitCI($owner: String!, $repo: String!, $oid: GitObjectID!) {
+  repository(owner: $owner, name: $repo) {
+    object(oid: $oid) { ...CommitCI }
+  }
+}
+"""
+    + COMMIT_CI_FRAGMENT
+)
+# GraphQL's commit status states, as REST spells them; EXPECTED is a context not yet reported.
+_STATUS_STATES = {
+    "SUCCESS": "success",
+    "FAILURE": "failure",
+    "ERROR": "error",
+    "PENDING": "pending",
+    "EXPECTED": "pending",
+}
+
+
+class GraphqlNode(BaseModel):
+    """A node of a GitHub GraphQL answer, its camelCase fields read into snake_case."""
+
+    model_config = ConfigDict(alias_generator=to_camel)
+
+
+class GraphqlPageInfo(GraphqlNode):
+    has_next_page: bool
+    end_cursor: str | None = None
+
+
+class _CICheckRun(GraphqlNode):
+    database_id: int
+    name: str
+    status: str
+    conclusion: str | None = None
+    details_url: str | None = None
+    url: str | None = None
+    completed_at: datetime | None = None
+
+
+class _CICheckRuns(GraphqlNode):
+    page_info: GraphqlPageInfo
+    nodes: list[_CICheckRun | None]
+
+
+class GraphqlCheckApp(GraphqlNode):
+    database_id: int | None = None
+    slug: str | None = None
+
+    def rest(self) -> dict[str, object]:
+        """The app as REST names it on a check run."""
+        return {"id": self.database_id, "slug": self.slug}
+
+
+class _CIWorkflow(GraphqlNode):
+    database_id: int
+
+
+class _CIWorkflowRun(GraphqlNode):
+    event: str
+    workflow: _CIWorkflow
+
+
+class _CICheckSuite(GraphqlNode):
+    database_id: int
+    app: GraphqlCheckApp | None = None
+    workflow_run: _CIWorkflowRun | None = None
+    check_runs: _CICheckRuns | None
+
+
+class _CICheckSuites(GraphqlNode):
+    page_info: GraphqlPageInfo
+    nodes: list[_CICheckSuite | None]
+
+    @property
+    def complete(self) -> bool:
+        """Whether this one page holds every suite and run, none of them or their app
+        withheld: a required check can be pinned to the app that reports it."""
+        return not self.page_info.has_next_page and all(
+            suite is not None
+            and suite.app is not None
+            and suite.check_runs is not None
+            and not suite.check_runs.page_info.has_next_page
+            and None not in suite.check_runs.nodes
+            for suite in self.nodes
+        )
+
+
+class _CIStatusContext(GraphqlNode):
+    context: str
+    state: str
+    target_url: str | None = None
+    created_at: datetime | None = None
+
+
+class _CIStatus(GraphqlNode):
+    contexts: list[_CIStatusContext]
+
+
+class _CICommit(GraphqlNode):
+    oid: str
+    status: _CIStatus | None = None
+    check_suites: _CICheckSuites | None
+
+
+_THREAD_PARTICIPANT_MAX_REQUESTS = 100
+_THREAD_PARTICIPANTS_QUERY = """
+query ThreadParticipants(
+  $owner: String!, $repo: String!, $number: Int!,
+  $commentsCursor: String, $reviewsCursor: String,
+  $commentsActive: Boolean!, $reviewsActive: Boolean!
+) {
+  repository(owner: $owner, name: $repo) {
+    issueOrPullRequest(number: $number) {
+      __typename
+      ... on Issue {
+        author { login __typename }
+        comments(first: 100, after: $commentsCursor) @include(if: $commentsActive) {
+          ...ParticipantComments
+        }
+      }
+      ... on PullRequest {
+        author { login __typename }
+        comments(first: 100, after: $commentsCursor) @include(if: $commentsActive) {
+          ...ParticipantComments
+        }
+        reviews(first: 20, after: $reviewsCursor) @include(if: $reviewsActive) {
+          pageInfo { hasNextPage endCursor }
+          nodes {
+            id
+            author { login __typename }
+            comments(first: 50) {
+              pageInfo { hasNextPage endCursor }
+              nodes { author { login __typename } }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+fragment ParticipantComments on IssueCommentConnection {
+  pageInfo { hasNextPage endCursor }
+  nodes { author { login __typename } }
+}
+"""
+_REVIEW_PARTICIPANTS_QUERY = """
+query ReviewParticipants($id: ID!, $cursor: String!) {
+  node(id: $id) {
+    ... on PullRequestReview {
+      comments(first: 100, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes { author { login __typename } }
+      }
+    }
+  }
+}
+"""
+
+_ALWAYS_RETRYABLE_STATUS = frozenset({429, 503})
+_IDEMPOTENT_RETRYABLE_STATUS = frozenset({502, 504})
+_SECONDARY_RATE_LIMIT_MARKERS = ("secondary rate limit", "rate limit")
+_RETRYABLE_TRANSPORT_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "PUT", "DELETE"})
+
+_BASE_BACKOFF = 1.0
+_BACKOFF_MULTIPLIER = 2.0
+_MAX_BACKOFF = 60.0
+_JITTER_FACTOR = 0.25
+
+
+def github_headers(token: str) -> dict[str, str]:
+    """Standard GitHub API headers for a bearer token."""
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": GITHUB_HEADERS_VERSION,
+    }
+
+
+class _Retry:
+    """Whether ``github_request`` asks GitHub again, and how long it waits first."""
+
+    @classmethod
+    def after_response(cls, response: httpx2.Response, method: str, attempt: int) -> float | None:
+        """Seconds to wait before asking again, or ``None`` when asking again can't help."""
+        if response.status_code in (403, 429) and (reset := cls._quota_reset_in(response)):
+            # The token's hourly quota is spent and GitHub refuses everything until it
+            # resets; asking sooner only adds refusals.
+            return reset if reset <= _MAX_BACKOFF else None
+        if (
+            response.status_code in _ALWAYS_RETRYABLE_STATUS
+            or (
+                response.status_code in _IDEMPOTENT_RETRYABLE_STATUS
+                and method.upper() in _RETRYABLE_TRANSPORT_METHODS
+            )
+            or cls._secondary_rate_limited(response)
+        ):
+            retry_after = cls._retry_after(response)
+            return cls.after_error(attempt) if retry_after is None else retry_after
+        return None
+
+    @staticmethod
+    def after_error(attempt: int) -> float:
+        """Exponential backoff with jitter."""
+        base = _BASE_BACKOFF * (_BACKOFF_MULTIPLIER**attempt)
+        jitter = base * random.uniform(-_JITTER_FACTOR, _JITTER_FACTOR)
+        return min(base + jitter, _MAX_BACKOFF)
+
+    @staticmethod
+    def _quota_reset_in(response: httpx2.Response) -> float | None:
+        """Seconds until the primary quota resets, when ``response`` says it is spent.
+
+        A secondary limit names its own wait in ``Retry-After`` and is not this.
+        """
+        if (
+            response.headers.get("Retry-After") is not None
+            or response.headers.get("X-RateLimit-Remaining") != "0"
+        ):
+            return None
+        try:
+            reset = float(response.headers.get("X-RateLimit-Reset", ""))
+        except ValueError:
+            return None
+        return max(reset - time.time(), 0.0) or None
+
+    @classmethod
+    def rate_limited(cls, response: httpx2.Response) -> bool:
+        """Whether GitHub refused ``response``'s request for its primary or a secondary limit."""
+        return (
+            response.status_code in (403, 429)
+            and response.headers.get("X-RateLimit-Remaining") == "0"
+        ) or cls._secondary_rate_limited(response)
+
+    @staticmethod
+    def _secondary_rate_limited(response: httpx2.Response) -> bool:
+        if response.status_code != 403:
+            return False
+        body = (response.text or "").lower()
+        return any(marker in body for marker in _SECONDARY_RATE_LIMIT_MARKERS)
+
+    @staticmethod
+    def _retry_after(response: httpx2.Response) -> float | None:
+        try:
+            return min(float(response.headers["Retry-After"]), _MAX_BACKOFF)
+        except KeyError, ValueError:
+            return None
+
+
+@asynccontextmanager
+async def github_client(
+    *,
+    token: str | None = None,
+    timeout: httpx2.Timeout | float | None = None,
+    headers: dict[str, str] | None = None,
+    installation_id: int | None = None,
+) -> AsyncIterator[httpx2.AsyncClient]:
+    """Yield an ``httpx2.AsyncClient`` with sane GitHub defaults.
+
+    The token (when provided) is baked into the default headers so callers
+    don't need to pass headers on every request.  A custom ``timeout`` can
+    override the default 30 s / 10 s-connect timeout.
+    """
+    merged_headers: dict[str, str] = {}
+    if token:
+        merged_headers.update(github_headers(token))
+    if headers:
+        merged_headers.update(headers)
+    hooks: dict[str, list[Callable[[httpx2.Request], Awaitable[None]]]] | None = (
+        {"request": [partial(MeteredTransport.tag_installation, installation_id)]}
+        if installation_id is not None
+        else None
+    )
+    async with httpx2.AsyncClient(
+        headers=merged_headers or None,
+        timeout=timeout or DEFAULT_TIMEOUT,
+        transport=GITHUB_TRANSPORT,
+        event_hooks=hooks,
+    ) as client:
+        yield client
+
+
+async def github_request(
+    client: httpx2.AsyncClient,
+    method: str,
+    url: str,
+    *,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    retry_rate_limits: bool = True,
+    **kwargs: Any,
+) -> httpx2.Response:
+    """Execute a single GitHub API request with retries and rate-limit handling.
+
+    Returns the ``httpx2.Response`` for non-retryable status codes and for
+    retryable status codes that have exhausted retries (caller should call
+    ``raise_for_status()``).
+
+    Retry matrix:
+
+    | Condition                         | Idempotent (GET, PUT, DELETE…) | Non-idempotent (POST, PATCH) |
+    |-----------------------------------|--------------------------------|------------------------------|
+    | Transport error (timeout/reset)   | Retry with backoff             | Raise immediately            |
+    | 429 / 503 / secondary rate limit  | Retry with backoff             | Retry with backoff           |
+    | 502 / 504 (ambiguous gateway)     | Retry with backoff             | Raise immediately            |
+    | Hourly quota spent (403/429)      | Wait for its reset if under 60 s, else return the refusal     |
+
+    429 and 503 are safe to retry for any method: the server explicitly did
+    not process the request.  502/504 are ambiguous — the upstream may have
+    processed the write before the gateway returned an error — so they are
+    only retried for idempotent methods.  Transport errors are only retried
+    for idempotent methods for the same reason.
+    """
+    method_upper = method.upper()
+    retry_transport = method_upper in _RETRYABLE_TRANSPORT_METHODS
+    last_exc: Exception | None = None
+    for attempt in range(max_retries + 1):
+        try:
+            response = await client.request(method_upper, url, **kwargs)
+        except (httpx2.TimeoutException, httpx2.TransportError) as exc:
+            last_exc = exc
+            if retry_transport and attempt < max_retries:
+                delay = _Retry.after_error(attempt)
+                logger.warning(
+                    "GitHub API %s %s raised %s, retrying in %.1fs (attempt %d/%d)",
+                    method,
+                    url,
+                    type(exc).__name__,
+                    delay,
+                    attempt + 1,
+                    max_retries,
+                )
+                await asyncio.sleep(delay)
+                continue
+            raise
+
+        delay = (
+            _Retry.after_response(response, method, attempt)
+            if retry_rate_limits
+            or not (response.status_code == 429 or _Retry.rate_limited(response))
+            else None
+        )
+        if delay is not None:
+            if attempt < max_retries:
+                logger.warning(
+                    "GitHub API %s %s returned %d, retrying in %.1fs (attempt %d/%d)",
+                    method,
+                    url,
+                    response.status_code,
+                    delay,
+                    attempt + 1,
+                    max_retries,
+                )
+                await asyncio.sleep(delay)
+                continue
+            logger.warning(
+                "GitHub API %s %s returned %d after %d retries, giving up",
+                method,
+                url,
+                response.status_code,
+                max_retries,
+            )
+        return response
+
+    raise last_exc or httpx2.HTTPError("Max retries exceeded")
+
+
+def github_reauth_message(login: str | None = None) -> str:
+    person = f" for {login}" if login else ""
+    url = f"{dashboard_base_url() or dashboard_api_base_url()}/my-settings/connections"
+    return (
+        f"GitHub token unavailable{person}. Link GitHub again in Robin's connections "
+        f"settings: {url}. Then retry the action."
+    )
+
+
+class GitHubSignInRequired(Exception):
+    """The person has no usable GitHub authorization and must sign in again."""
+
+    def __init__(self, login: str) -> None:
+        super().__init__(github_reauth_message(login))
+        self.login = login
+
+
+class GitHubAppUnavailable(Exception):
+    """No GitHub App installation token can be minted for the request."""
+
+    def __init__(self, message: str, *, retryable: bool = False, gone: bool = False) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+        # GitHub no longer knows the installation, as after the App is reinstalled.
+        self.gone = gone
+
+
+class RepoFileUnreadableError(RuntimeError):
+    """A repository file could not be read reliably."""
+
+
+class UnsafeRepoPath(ValueError):
+    """A path or ref that could step out of the repository its REST URL names."""
+
+    def __init__(self, value: str) -> None:
+        super().__init__(f"{value[:200]!r} is not a path inside the repository")
+
+
+class GitHubClient:
+    """GitHub's REST and GraphQL APIs over one HTTP client, with ``github_request``'s retries.
+
+    Open one as the person or the App it acts for: ``as_user`` or ``as_app``.
+    Every call raises ``GitHubError`` when GitHub refuses it, another
+    ``httpx2.HTTPError`` when it cannot be reached, and ``ValueError`` when it
+    answers with something other than the expected shape.
+    """
+
+    def __init__(self, http: httpx2.AsyncClient, *, login: str | None = None) -> None:
+        """``login`` is the person whose OAuth token ``http`` carries, if it is one."""
+        self.http = http
+        self.login = login
+        self._refresh: asyncio.Future[str] | None = None
+
+    @classmethod
+    @asynccontextmanager
+    async def connect(
+        cls, *, token: str | None = None, timeout: httpx2.Timeout | float | None = None
+    ) -> AsyncIterator[Self]:
+        async with github_client(token=token, timeout=timeout) as http:
+            yield cls(http)
+
+    @classmethod
+    @asynccontextmanager
+    async def as_user(
+        cls, login: str, *, timeout: httpx2.Timeout | float | None = None
+    ) -> AsyncIterator[Self]:
+        """Acts with ``login``'s own GitHub permissions; a rejected token is refreshed once.
+
+        Raises ``GitHubSignInRequired`` when ``login`` has no usable authorization,
+        including when GitHub still rejects the refreshed token.
+        """
+        # profiles imports this module.
+        from openswe.dashboard.profiles import get_valid_access_token
+
+        token = await get_valid_access_token(login)
+        if not token:
+            raise GitHubSignInRequired(login)
+        async with github_client(token=token, timeout=timeout) as http:
+            yield cls(http, login=login)
+
+    async def _refreshed_token(self, login: str) -> str:
+        """One refresh per client, shared by every request that GitHub rejected."""
+        # profiles imports this module.
+        from openswe.dashboard.profiles import get_valid_access_token
+
+        async def refresh() -> str:
+            if token := await get_valid_access_token(login, force_refresh=True):
+                return token
+            raise GitHubSignInRequired(login)
+
+        if self._refresh is None:
+            self._refresh = asyncio.ensure_future(refresh())
+        return await asyncio.shield(self._refresh)
+
+    @classmethod
+    @asynccontextmanager
+    async def as_app(
+        cls,
+        owner: str | None = None,
+        repo: str | None = None,
+        *,
+        installation_id: int | None = None,
+        permissions: Mapping[str, str] | None = None,
+        timeout: httpx2.Timeout | float | None = None,
+    ) -> AsyncIterator[Self]:
+        """Acts as the Open SWE GitHub App: ``installation_id``, else its installation on
+        ``owner/repo``, else on the ``owner`` organization, else the default installation.
+
+        ``permissions`` narrows the token to them, and to ``repo`` alone when one is named.
+        Raises ``GitHubAppUnavailable`` when no installation token can be minted.
+        """
+        explicit_installation = installation_id is not None
+        # app imports this module.
+        from openswe.github.app import (
+            GITHUB_APP_INSTALLATION_ID,
+            INSTALLATIONS,
+            get_github_app_installation_id_for_org,
+            get_github_app_installation_id_for_repo,
+            get_github_app_installation_token,
+        )
+
+        token: str | None = None
+        for retry in (False, True):
+            if owner is not None and (installation_id is None or retry):
+                installation_id = await (
+                    get_github_app_installation_id_for_org(owner)
+                    if repo is None
+                    else get_github_app_installation_id_for_repo(owner, repo)
+                )
+                if installation_id is None:
+                    where = owner if repo is None else f"{owner}/{repo}"
+                    raise GitHubAppUnavailable(f"no GitHub App installation on {where}")
+            try:
+                token = await get_github_app_installation_token(
+                    installation_id=installation_id,
+                    repositories=[repo] if permissions is not None and repo is not None else None,
+                    permissions=permissions,
+                    raise_errors=True,
+                )
+                break
+            except GitHubAppUnavailable as exc:
+                # A kept installation is gone after a reinstall; ask GitHub again once.
+                if retry or not exc.gone or explicit_installation or not owner:
+                    raise
+                await INSTALLATIONS.forget(owner, repo)
+        if not token:
+            raise GitHubAppUnavailable("GitHub App token unavailable")
+        # Metering names this installation only on requests whose token is an installation's.
+        resolved_installation = str(installation_id or GITHUB_APP_INSTALLATION_ID).strip()
+        async with github_client(
+            token=token,
+            timeout=timeout,
+            installation_id=int(resolved_installation)
+            if resolved_installation.isdecimal()
+            else None,
+        ) as http:
+            yield cls(http)
+
+    def repo(self, owner: str, name: str) -> RepoClient:
+        return RepoClient(self, owner, name)
+
+    async def org_membership_state(self, org: str, login: str) -> str | None:
+        """``login``'s membership state in ``org`` (``active``, ``pending``); ``None`` if none."""
+        try:
+            payload = await self.get(
+                f"orgs/{quote(org, safe='')}/memberships/{quote(login, safe='')}"
+            )
+        except GitHubError as exc:
+            if exc.response.status_code == 404:
+                return None
+            raise
+        state = payload.get("state") if isinstance(payload, dict) else None
+        return state if isinstance(state, str) else None
+
+    async def team_members(self, org: str, team_slug: str) -> list[str]:
+        """Logins of the people in ``org/team_slug``, child teams included."""
+        members = await self.pages(
+            f"orgs/{quote(org, safe='')}/teams/{quote(team_slug, safe='')}/members",
+            max_pages=_TEAM_MAX_PAGES,
+        )
+        return [
+            login
+            for member in members
+            if member.get("type", "User") == "User"
+            and isinstance(login := member.get("login"), str)
+        ]
+
+    async def rate_limits(self) -> dict[str, Quota]:
+        """Each quota this client's token spends, by resource (``core``, ``graphql``, …).
+
+        GitHub doesn't count this read against any of them.
+        """
+        return _RATE_LIMITS.validate_python(await self.get("rate_limit")).resources
+
+    async def viewer_login(self) -> str:
+        """The login of the account this client's token acts as."""
+        payload = await self.get("user")
+        login = payload.get("login") if isinstance(payload, dict) else None
+        if not isinstance(login, str) or not login:
+            raise ValueError("GitHub answered the authenticated user without a login")
+        return login
+
+    async def request(self, method: str, path: str, **kwargs: Any) -> httpx2.Response:
+        """``path`` is relative to the REST API root, or an absolute URL."""
+        url = path if "://" in path else f"{GITHUB_API_BASE}/{path}"
+        response = await github_request(self.http, method, url, **kwargs)
+        if response.status_code == 401 and self.login is not None:
+            self.http.headers.update(github_headers(await self._refreshed_token(self.login)))
+            response = await github_request(self.http, method, url, **kwargs)
+            if response.status_code == 401:
+                raise GitHubSignInRequired(self.login)
+        if not response.is_success:
+            raise GitHubError(response)
+        return response
+
+    async def get(
+        self, path: str, params: Mapping[str, str] | None = None, *, retry_rate_limits: bool = True
+    ) -> object:
+        return (
+            await self.request("GET", path, params=params, retry_rate_limits=retry_rate_limits)
+        ).json()
+
+    async def post(self, path: str, json: Mapping[str, object]) -> object:
+        return _json_or_none(await self.request("POST", path, json=dict(json)))
+
+    async def patch(self, path: str, json: Mapping[str, object]) -> object:
+        return _json_or_none(await self.request("PATCH", path, json=dict(json)))
+
+    async def delete(self, path: str, json: Mapping[str, object] | None = None) -> None:
+        await self.request("DELETE", path, **({} if json is None else {"json": dict(json)}))
+
+    async def pages(
+        self,
+        path: str,
+        *,
+        key: str | None = None,
+        params: Mapping[str, str] | None = None,
+        max_pages: int | None = None,
+        total: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Every item of a paginated list; ``key`` names the list inside each page's object.
+
+        ``total`` is how many items the list should hold: the pages that many fill
+        are read concurrently, and GitHub's next-page link decides whether reading goes on.
+        A list whose pages report a ``total_count`` reads the rest of its pages
+        concurrently once the first page says how many there are.
+        """
+
+        async def read(page: int) -> tuple[list[object], int | None, bool]:
+            response = await self.request(
+                "GET",
+                path,
+                params={**(params or {}), "per_page": str(_PAGE_SIZE), "page": str(page)},
+            )
+            payload = response.json()
+            batch = (
+                payload if key is None else payload.get(key) if isinstance(payload, dict) else None
+            )
+            if not isinstance(batch, list):
+                raise ValueError(f"GitHub answered {path} without a list")
+            reported = payload.get("total_count") if isinstance(payload, dict) else None
+            return batch, reported if isinstance(reported, int) else None, "next" in response.links
+
+        semaphore = asyncio.Semaphore(_PAGE_CONCURRENCY)
+
+        async def bounded(page: int) -> tuple[list[object], int | None, bool]:
+            async with semaphore:
+                return await read(page)
+
+        def page_count(items: int) -> int:
+            count = max(1, -(-items // _PAGE_SIZE))
+            return count if max_pages is None else min(count, max_pages)
+
+        if total:
+            with MeteredTransport.attributed():
+                batches = await asyncio.gather(
+                    *(bounded(page) for page in range(1, page_count(total) + 1))
+                )
+        else:
+            first = await read(1)
+            batches = [first]
+            reported = first[1]
+            if reported is not None and first[2]:
+                with MeteredTransport.attributed():
+                    batches += await asyncio.gather(
+                        *(bounded(page) for page in range(2, page_count(reported) + 1))
+                    )
+        page = len(batches)
+        while batches[-1][2] and page != max_pages:
+            page += 1
+            batches.append(await read(page))
+        return [item for batch, _, _ in batches for item in batch if isinstance(item, dict)]
+
+    async def graphql(
+        self, query: str, variables: Mapping[str, object], *, partial: bool = False
+    ) -> Mapping[str, Any]:
+        """The response's ``data``; GraphQL errors raise ``GraphQLError`` unless ``partial``.
+
+        With ``partial``, fields GitHub could not resolve come back null beside the ones it did.
+        """
+        payload = (
+            await self.request(
+                "POST", GITHUB_GRAPHQL, json={"query": query, "variables": dict(variables)}
+            )
+        ).json()
+        if not isinstance(payload, Mapping):
+            raise ValueError("GitHub answered GraphQL without an object")
+        data = payload.get("data")
+        if payload.get("errors") and not partial:
+            raise GraphQLError(payload["errors"], data if isinstance(data, Mapping) else None)
+        if not isinstance(data, Mapping):
+            raise ValueError("GitHub answered GraphQL without data")
+        return data
+
+
+@dataclass(frozen=True, slots=True)
+class Comparison:
+    """A three-dot ``base...head`` comparison."""
+
+    merge_base: str
+    files: list[dict[str, Any]]
+
+
+@dataclass(frozen=True, slots=True)
+class CommitCI:
+    """A commit's latest check runs and latest status per context, in REST's shapes.
+
+    Runs carry ``id``, ``name``, ``status``, ``conclusion``, ``details_url``, ``html_url``,
+    ``app`` (``id``, ``slug``) and ``check_suite`` (``id``); statuses carry ``context``,
+    ``state`` and ``target_url``. Enum values are REST's lower-case ones.
+    """
+
+    runs: list[dict[str, Any]]
+    statuses: list[dict[str, Any]]
+
+    @classmethod
+    def from_graphql(cls, commit: object) -> Self | None:
+        """``COMMIT_CI_FRAGMENT``'s answer; ``None`` when it held more than one page or
+        GitHub withheld a suite or run whole, which only REST can then list."""
+        parsed = _CICommit.model_validate(commit)
+        suites = parsed.check_suites
+        if suites is None or not suites.complete:
+            return None
+        runs: list[dict[str, Any]] = []
+        workflows: dict[int, tuple[int, str]] = {}
+        for suite in filter(None, suites.nodes):
+            app = suite.app or GraphqlCheckApp()
+            if suite.workflow_run is not None:
+                workflows[suite.database_id] = (
+                    suite.workflow_run.workflow.database_id,
+                    suite.workflow_run.event,
+                )
+            runs.extend(
+                {
+                    "id": run.database_id,
+                    "name": run.name,
+                    "status": run.status.lower(),
+                    "conclusion": run.conclusion.lower() if run.conclusion else None,
+                    "details_url": run.details_url,
+                    **({"completed_at": run.completed_at.isoformat()} if run.completed_at else {}),
+                    # REST links an Actions run to its job page and any other app's run to ``url``.
+                    "html_url": run.details_url if app.slug == "github-actions" else run.url,
+                    "app": app.rest(),
+                    "check_suite": {"id": suite.database_id},
+                }
+                for run in filter(None, suite.check_runs.nodes if suite.check_runs else [])
+            )
+        statuses = [
+            {
+                "context": status.context,
+                "state": _STATUS_STATES.get(status.state, status.state.lower()),
+                "target_url": status.target_url,
+                **({"updated_at": status.created_at.isoformat()} if status.created_at else {}),
+            }
+            for status in (parsed.status.contexts if parsed.status else [])
+        ]
+        return cls(cls.latest_runs(runs, workflows), statuses)
+
+    @staticmethod
+    def _rerunnable(runs: list[dict[str, Any]]) -> dict[int, tuple[int, int, str, int]]:
+        """Actions runs by index: their app, check suite, name and id."""
+        eligible: dict[int, tuple[int, int, str, int]] = {}
+        for index, run in enumerate(runs):
+            app, suite = run.get("app"), run.get("check_suite")
+            if not isinstance(app, dict) or not isinstance(suite, dict):
+                continue
+            app_id, suite_id = app.get("id"), suite.get("id")
+            name, order = run.get("name"), run.get("id")
+            if (
+                app.get("slug") == "github-actions"
+                and isinstance(app_id, int)
+                and isinstance(suite_id, int)
+                and isinstance(name, str)
+                and isinstance(order, int)
+            ):
+                eligible[index] = (app_id, suite_id, name, order)
+        return eligible
+
+    @classmethod
+    def has_reruns(cls, runs: list[dict[str, Any]]) -> bool:
+        """Whether two Actions runs share a name, so one may supersede the other."""
+        names = [(app_id, name) for app_id, _, name, _ in cls._rerunnable(runs).values()]
+        return len(names) != len(set(names))
+
+    @classmethod
+    def latest_runs(
+        cls, runs: list[dict[str, Any]], workflows: Mapping[int, tuple[int, str]]
+    ) -> list[dict[str, Any]]:
+        """``runs`` without the Actions runs a later run of the same workflow, event and
+        name superseded; ``workflows`` maps a check suite to its workflow and event."""
+        identities: dict[int, tuple[int, int, str, str]] = {}
+        latest: dict[tuple[int, int, str, str], int] = {}
+        orders: dict[int, int] = {}
+        for index, (app_id, suite_id, name, order) in cls._rerunnable(runs).items():
+            if (workflow := workflows.get(suite_id)) is None:
+                continue
+            workflow_id, event = workflow
+            identity = (app_id, workflow_id, event, name)
+            identities[index], orders[index] = identity, order
+            latest[identity] = max(latest.get(identity, order), order)
+        return [
+            run
+            for index, run in enumerate(runs)
+            if index not in identities or orders[index] == latest[identities[index]]
+        ]
+
+
+@dataclass(frozen=True, slots=True)
+class RepoClient:
+    """One repository's calls; REST paths are relative to ``repos/<owner>/<name>/``.
+
+    Raises like ``GitHubClient``.
+    """
+
+    github: GitHubClient
+    owner: str
+    name: str
+
+    def __post_init__(self) -> None:
+        # Every URL starts ``repos/<owner>/<name>/``, which "." or ".." would step out of.
+        if any(
+            part in {".", ".."} or "/" in part or "\\" in part for part in (self.owner, self.name)
+        ):
+            raise UnsafeRepoPath(self.full_name)
+
+    @property
+    def full_name(self) -> str:
+        return f"{self.owner}/{self.name}"
+
+    @staticmethod
+    def inside(path: str) -> str:
+        """``path``, a file path or ref, once it can only name something in the repository.
+
+        httpx resolves ``.`` and ``..`` segments before it sends a request, so a path made
+        of them would reach another repository with this client's token; those, empty
+        segments and backslashes raise ``UnsafeRepoPath``, as do segments that decode to
+        them, for any hop that decodes a path before it normalizes it.
+        """
+        if "\\" in path or any(
+            part in {"", ".", ".."} or unquote(part) in {".", ".."} for part in path.split("/")
+        ):
+            raise UnsafeRepoPath(path)
+        return path
+
+    def pull_request(self, number: int) -> PullRequestClient:
+        # pull_request_status imports this module.
+        from openswe.github.pull_request_status import PullRequestClient
+
+        return PullRequestClient(self, number)
+
+    async def get(self, path: str, params: Mapping[str, str] | None = None) -> object:
+        return await self.github.get(f"repos/{self.full_name}/{path}", params)
+
+    async def post(self, path: str, json: Mapping[str, object]) -> object:
+        return await self.github.post(f"repos/{self.full_name}/{path}", json)
+
+    async def patch(self, path: str, json: Mapping[str, object]) -> object:
+        return await self.github.patch(f"repos/{self.full_name}/{path}", json)
+
+    async def delete(self, path: str, json: Mapping[str, object] | None = None) -> None:
+        await self.github.delete(f"repos/{self.full_name}/{path}", json)
+
+    async def pages(
+        self,
+        path: str,
+        *,
+        key: str | None = None,
+        params: Mapping[str, str] | None = None,
+        max_pages: int | None = None,
+        total: int | None = None,
+    ) -> list[dict[str, Any]]:
+        return await self.github.pages(
+            f"repos/{self.full_name}/{path}",
+            key=key,
+            params=params,
+            max_pages=max_pages,
+            total=total,
+        )
+
+    async def graphql(
+        self, query: str, variables: Mapping[str, object] | None = None
+    ) -> Mapping[str, Any]:
+        """``$owner`` and ``$repo`` are this repository's."""
+        return await self.github.graphql(
+            query, {"owner": self.owner, "repo": self.name, **(variables or {})}
+        )
+
+    async def ci_graphql(
+        self, query: str, variables: Mapping[str, object] | None = None
+    ) -> tuple[Mapping[str, object], bool]:
+        """``graphql`` for a query of check suites, keeping the answer when GitHub withheld
+        only fields inside them, and whether a withheld one was a suite's ``workflowRun``.
+        A suite missing more is read over REST by ``CommitCI.from_graphql``'s callers."""
+        try:
+            return await self.graphql(query, variables), False
+        except GraphQLError as exc:
+            if exc.data is None or not exc.only_under_check_suites:
+                raise
+            logger.warning(
+                "GitHub withheld fields of check suites; reading them as unknown",
+                extra={
+                    "repo_full_name": self.full_name,
+                    "pr_number": (variables or {}).get("number"),
+                    "sha": (variables or {}).get("oid"),
+                    "graphql_error_paths": exc.paths,
+                    "graphql_error_types": sorted(exc.types),
+                },
+            )
+            return exc.data, exc.any_at_workflow_run
+
+    async def open_pull_heads(self, numbers: Collection[int]) -> dict[int, str]:
+        """The head commit of each of ``numbers`` that is open, read in one GraphQL query.
+
+        A number GitHub can't resolve, as a deleted pull request, is left out.
+        """
+        if not numbers:
+            return {}
+        fields = " ".join(
+            f"pr{number}: pullRequest(number: {number}) {{ state headRefOid }}"
+            for number in sorted(set(numbers))
+        )
+        data = await self.github.graphql(
+            "query OpenPullHeads($owner: String!, $repo: String!) "
+            f"{{ repository(owner: $owner, name: $repo) {{ {fields} }} }}",
+            {"owner": self.owner, "repo": self.name},
+            partial=True,
+        )
+        repository = data.get("repository")
+        if not isinstance(repository, Mapping):
+            raise ValueError("GitHub answered pull request heads without the repository")
+        heads: dict[int, str] = {}
+        for number in numbers:
+            pull = repository.get(f"pr{number}")
+            head = pull.get("headRefOid") if isinstance(pull, Mapping) else None
+            if isinstance(pull, Mapping) and pull.get("state") == "OPEN" and isinstance(head, str):
+                heads[number] = head
+        return heads
+
+    @staticmethod
+    def _participant_page(
+        connection: object, seen: set[str]
+    ) -> tuple[list[dict[str, object]], str | None]:
+        if not isinstance(connection, dict) or not isinstance(connection.get("nodes"), list):
+            raise ValueError("GitHub answered participants without a list")
+        nodes = connection["nodes"]
+        if any(not isinstance(node, dict) or "author" not in node for node in nodes):
+            raise ValueError("GitHub answered participants without authors")
+        page = connection.get("pageInfo")
+        if not isinstance(page, dict) or not isinstance(page.get("hasNextPage"), bool):
+            raise ValueError("GitHub answered participants without pagination")
+        if not page["hasNextPage"]:
+            return nodes, None
+        cursor = page.get("endCursor")
+        if not isinstance(cursor, str) or not cursor or cursor in seen:
+            raise ValueError("GitHub answered participants with an invalid cursor")
+        seen.add(cursor)
+        return nodes, cursor
+
+    @staticmethod
+    def _participant_author(author: object, logins: set[str]) -> None:
+        if author is None:
+            return
+        if (
+            not isinstance(author, dict)
+            or not isinstance(login := author.get("login"), str)
+            or not isinstance(kind := author.get("__typename"), str)
+        ):
+            raise ValueError("GitHub answered participants with an invalid author")
+        if kind != "Bot" and login.strip() and not login.lower().endswith("[bot]"):
+            logins.add(login.strip())
+
+    async def thread_participants(self, number: int) -> set[str]:
+        """Issue/PR authors and review replies, raising when the bounded read is incomplete."""
+        logins: set[str] = set()
+        comments_cursor: str | None = None
+        reviews_cursor: str | None = None
+        comments_seen: set[str] = set()
+        reviews_seen: set[str] = set()
+        comments_active = reviews_active = True
+        pending: list[tuple[str, str, set[str]]] = []
+        for _ in range(_THREAD_PARTICIPANT_MAX_REQUESTS):
+            if comments_active or reviews_active:
+                data = await self.graphql(
+                    _THREAD_PARTICIPANTS_QUERY,
+                    {
+                        "number": number,
+                        "commentsCursor": comments_cursor,
+                        "reviewsCursor": reviews_cursor,
+                        "commentsActive": comments_active,
+                        "reviewsActive": reviews_active,
+                    },
+                )
+                repository = data.get("repository")
+                thread = (
+                    repository.get("issueOrPullRequest")
+                    if isinstance(repository, Mapping)
+                    else None
+                )
+                if not isinstance(thread, Mapping) or "author" not in thread:
+                    raise ValueError("GitHub answered participants without a thread")
+                self._participant_author(thread["author"], logins)
+                if comments_active:
+                    comments, comments_cursor = self._participant_page(
+                        thread.get("comments"), comments_seen
+                    )
+                    for comment in comments:
+                        self._participant_author(comment["author"], logins)
+                    comments_active = comments_cursor is not None
+                if thread.get("__typename") == "Issue":
+                    reviews_active = False
+                elif thread.get("__typename") != "PullRequest":
+                    raise ValueError("GitHub answered participants with an invalid thread type")
+                elif reviews_active:
+                    reviews, reviews_cursor = self._participant_page(
+                        thread.get("reviews"), reviews_seen
+                    )
+                    for review in reviews:
+                        self._participant_author(review["author"], logins)
+                        seen: set[str] = set()
+                        comments, cursor = self._participant_page(review.get("comments"), seen)
+                        for comment in comments:
+                            self._participant_author(comment["author"], logins)
+                        if cursor is not None:
+                            review_id = review.get("id")
+                            if not isinstance(review_id, str) or not review_id:
+                                raise ValueError("GitHub answered participants without a review ID")
+                            pending.append((review_id, cursor, seen))
+                    reviews_active = reviews_cursor is not None
+            else:
+                review_id, cursor, seen = pending.pop()
+                data = await self.github.graphql(
+                    _REVIEW_PARTICIPANTS_QUERY, {"id": review_id, "cursor": cursor}
+                )
+                review = data.get("node")
+                if not isinstance(review, Mapping):
+                    raise ValueError("GitHub answered participants without a review")
+                comments, cursor = self._participant_page(review.get("comments"), seen)
+                for comment in comments:
+                    self._participant_author(comment["author"], logins)
+                if cursor is not None:
+                    pending.append((review_id, cursor, seen))
+            if not comments_active and not reviews_active and not pending:
+                return logins
+        raise ValueError("GitHub participant pagination exceeded its request limit")
+
+    async def read_file(
+        self, path: str, ref: str | None, *, max_chars: int, strict: bool = False
+    ) -> str | None:
+        """``path`` at ``ref`` (the default branch when ``None``); ``None`` when it is absent.
+
+        Without ``strict`` an unreadable or oversized file also reads as ``None``; with it,
+        those raise ``RepoFileUnreadableError``.
+        """
+        extra = {"repository": self.full_name, "ref": ref or "", "path": path}
+        try:
+            response = await self.github.request(
+                "GET",
+                f"repos/{self.full_name}/contents/{quote(self.inside(path), safe='/')}",
+                params={"ref": ref} if ref else None,
+                headers={"Accept": "application/vnd.github.raw"},
+            )
+        except GitHubError as refused:
+            if refused.response.status_code == 404:
+                return None
+            logger.warning(
+                "repository file fetch returned an unexpected status",
+                extra={**extra, "status_code": refused.response.status_code},
+            )
+            if strict:
+                raise RepoFileUnreadableError(
+                    f"Could not read {path}: HTTP {refused.response.status_code}"
+                ) from refused
+            return None
+        except httpx2.HTTPError as exc:
+            logger.exception("repository file fetch failed", extra=extra)
+            if strict:
+                raise RepoFileUnreadableError(f"Could not read {path}") from exc
+            return None
+        content = response.text.strip()
+        if len(content) > max_chars:
+            logger.warning(
+                "repository file exceeds the size cap; ignoring it",
+                extra={**extra, "chars": len(content), "max_chars": max_chars},
+            )
+            if strict:
+                raise RepoFileUnreadableError(f"Repository file {path} exceeds the size cap")
+            return None
+        return content if strict else content or None
+
+    async def raw_file(self, path: str, ref: str) -> bytes | None:
+        """``path``'s bytes at ``ref``, unaltered; ``None`` when it is absent there."""
+        try:
+            response = await self.github.request(
+                "GET",
+                f"repos/{self.full_name}/contents/{quote(self.inside(path), safe='/')}",
+                params={"ref": ref},
+                headers={"Accept": "application/vnd.github.raw+json"},
+            )
+        except GitHubError as refused:
+            if refused.response.status_code == 404:
+                return None
+            raise
+        return response.content
+
+    async def read_files(self, paths: Sequence[str], ref: str) -> dict[str, str]:
+        """Text of each of ``paths`` present at ``ref``, read in batched GraphQL queries."""
+        found: dict[str, str] = {}
+        for start in range(0, len(paths), _FILES_PER_QUERY):
+            batch = paths[start : start + _FILES_PER_QUERY]
+            params = "".join(f",$e{i}:String!" for i in range(len(batch)))
+            fields = "".join(
+                f"f{i}:object(expression:$e{i}){{...on Blob{{text}}}}" for i in range(len(batch))
+            )
+            data = await self.graphql(
+                f"query($owner:String!,$repo:String!{params})"
+                f"{{repository(owner:$owner,name:$repo){{{fields}}}}}",
+                {f"e{i}": f"{ref}:{path}" for i, path in enumerate(batch)},
+            )
+            repository = data.get("repository") or {}
+            for i, path in enumerate(batch):
+                blob = repository.get(f"f{i}")
+                if isinstance(blob, Mapping) and isinstance(blob.get("text"), str):
+                    found[path] = blob["text"]
+        return found
+
+    async def read_dir(self, path: str, ref: str | None) -> dict[str, str | None]:
+        """Text of each file directly in ``path`` at ``ref`` (the default branch when ``None``).
+
+        A file GitHub returns no text for (binary or too large) maps to ``None``.
+        """
+        data = await self.graphql(
+            "query($owner:String!,$repo:String!,$expression:String!)"
+            "{repository(owner:$owner,name:$repo){object(expression:$expression)"
+            "{...on Tree{entries{path type object{...on Blob{text}}}}}}}",
+            {"expression": f"{ref or 'HEAD'}:{path}"},
+        )
+        tree = (data.get("repository") or {}).get("object")
+        entries = tree.get("entries") if isinstance(tree, Mapping) else None
+        found: dict[str, str | None] = {}
+        for entry in entries if isinstance(entries, list) else []:
+            if not isinstance(entry, Mapping) or entry.get("type") != "blob":
+                continue
+            blob = entry.get("object")
+            text = blob.get("text") if isinstance(blob, Mapping) else None
+            found[entry["path"]] = text if isinstance(text, str) else None
+        return found
+
+    async def can_write(self, login: str) -> bool:
+        """Whether ``login`` has write, maintain or admin here; any failure denies."""
+        if not login:
+            return False
+        try:
+            payload = await self.get(f"collaborators/{quote(login, safe='')}/permission")
+        except httpx2.HTTPError, ValueError:
+            logger.info(
+                "Could not verify repository permission; denying",
+                extra={"repo_full_name": self.full_name, "github_login": login},
+            )
+            return False
+        permission = payload.get("permission") if isinstance(payload, dict) else None
+        return permission in {"admin", "maintain", "write"}
+
+    async def open_pull_for_branch(
+        self, branch: str, *, strict: bool = False
+    ) -> dict[str, Any] | None:
+        """The first open PR headed by ``branch``; ``strict`` raises on lookup failures."""
+        try:
+            payload = await self.get(
+                "pulls", {"head": f"{self.owner}:{branch}", "state": "open", "per_page": "1"}
+            )
+            if not isinstance(payload, list) or (payload and not isinstance(payload[0], dict)):
+                raise ValueError("GitHub answered open pull requests without a list of objects")
+            return payload[0] if payload else None
+        except httpx2.HTTPError, ValueError:
+            if strict:
+                raise
+            logger.warning(
+                "Failed to find open PR for branch",
+                extra={"repo_full_name": self.full_name, "branch": branch},
+            )
+            return None
+
+    async def info(self, *, retry_rate_limits: bool = True) -> dict[str, Any]:
+        """The repository itself: default branch, merge settings, visibility."""
+        payload = await self.github.get(
+            f"repos/{self.full_name}", retry_rate_limits=retry_rate_limits
+        )
+        if not isinstance(payload, dict):
+            raise ValueError("GitHub answered the repository without an object")
+        return payload
+
+    async def native_queue(self, branch: str) -> NativeQueueSnapshot:
+        """Read a bounded, complete queue view; candidate ancestry determines membership."""
+        data = await self.graphql(
+            """query($owner:String!,$repo:String!,$branch:String!,$ref:String!) {
+              repository(owner:$owner,name:$repo) {
+                databaseId nameWithOwner
+                ref(qualifiedName:$ref) { name target { oid } }
+                mergeQueue(branch:$branch) {
+                  id
+                  entries(first:100) {
+                    totalCount pageInfo { hasNextPage }
+                    nodes {
+                      id position state enqueuedAt
+                      baseCommit { oid }
+                      headCommit { oid parents(first:2) { totalCount nodes { oid } } }
+                      pullRequest {
+                        number headRefOid state reviewDecision isDraft baseRefName
+                        headRepository { nameWithOwner }
+                      }
+                    }
+                  }
+                }
+              }
+            }""",
+            {"branch": branch, "ref": f"refs/heads/{branch}"},
+        )
+        snapshot = NativeQueueSnapshot.model_validate(data.get("repository"))
+        if snapshot.repository.lower() != self.full_name.lower() or snapshot.branch != branch:
+            raise ValueError("Native queue repository or target changed")
+        return snapshot
+
+    async def labels(self) -> list[dict[str, Any]]:
+        return await self.pages("labels")
+
+    async def compare(self, base: str, head: str) -> Comparison:
+        """``base...head``, with at most GitHub's 300 changed files; refs are fully escaped."""
+        # The paginated commit list is never read, so only one commit comes back.
+        payload = await self.get(
+            f"compare/{quote(self.inside(base), safe='')}...{quote(self.inside(head), safe='')}",
+            {"per_page": "1"},
+        )
+        if not isinstance(payload, dict):
+            raise ValueError("GitHub answered the comparison without an object")
+        merge_base = payload.get("merge_base_commit")
+        sha = merge_base.get("sha") if isinstance(merge_base, dict) else None
+        files = payload.get("files") or []
+        if not isinstance(sha, str) or not isinstance(files, list):
+            raise ValueError("GitHub answered the comparison without a merge base and files")
+        return Comparison(sha, [file for file in files if isinstance(file, dict)])
+
+    async def branch(self, name: str) -> dict[str, Any]:
+        payload = await self.get(f"branches/{quote(self.inside(name), safe='')}")
+        if not isinstance(payload, dict):
+            raise ValueError("GitHub answered the branch without an object")
+        return payload
+
+    async def branch_sha(self, name: str) -> str:
+        payload = await self.branch(name)
+        commit = payload.get("commit")
+        sha = commit.get("sha") if isinstance(commit, dict) else None
+        if not isinstance(sha, str) or not sha:
+            raise ValueError("Target branch is unavailable")
+        return sha
+
+    async def ref_sha(self, ref: str) -> str | None:
+        """Read an exact qualified ref; API failures must not look like a missing ref."""
+        if not ref.startswith("refs/"):
+            raise ValueError("Expected a fully qualified Git ref")
+        references = TypeAdapter(list[GitReference]).validate_python(
+            await self.get(
+                f"git/matching-refs/{quote(self.inside(ref.removeprefix('refs/')), safe='')}"
+            )
+        )
+        return next((item.sha for item in references if item.ref == ref), None)
+
+    async def branch_rules(self, name: str) -> list[dict[str, Any]]:
+        """The rulesets' rules that apply to branch ``name``."""
+        return await self.pages(f"rules/branches/{quote(self.inside(name), safe='')}")
+
+    async def requires_conversation_resolution(self, branch: str) -> bool:
+        """Whether a ruleset or classic protection on ``branch`` holds merges for open threads."""
+        for rule in await self.branch_rules(branch):
+            parameters = rule.get("parameters")
+            if (
+                rule.get("type") == "pull_request"
+                and isinstance(parameters, Mapping)
+                and parameters.get("required_review_thread_resolution") is True
+            ):
+                return True
+        data = await self.graphql(
+            """query($owner:String!,$repo:String!,$ref:String!) {
+              repository(owner:$owner,name:$repo) {
+                ref(qualifiedName:$ref) { refUpdateRule { requiresConversationResolution } }
+              }
+            }""",
+            {"ref": f"refs/heads/{branch}"},
+        )
+        repository = data.get("repository")
+        ref = repository.get("ref") if isinstance(repository, Mapping) else None
+        rule = ref.get("refUpdateRule") if isinstance(ref, Mapping) else None
+        return isinstance(rule, Mapping) and rule.get("requiresConversationResolution") is True
+
+    async def required_approving_reviews(self, branch: str) -> int:
+        """The most approvals a ruleset or classic protection on ``branch`` requires."""
+        counts = [
+            parameters.get("required_approving_review_count")
+            for rule in await self.branch_rules(branch)
+            if rule.get("type") == "pull_request"
+            and isinstance(parameters := rule.get("parameters"), Mapping)
+        ]
+        data = await self.graphql(
+            """query($owner:String!,$repo:String!,$ref:String!) {
+              repository(owner:$owner,name:$repo) {
+                ref(qualifiedName:$ref) { refUpdateRule { requiredApprovingReviewCount } }
+              }
+            }""",
+            {"ref": f"refs/heads/{branch}"},
+        )
+        repository = data.get("repository")
+        ref = repository.get("ref") if isinstance(repository, Mapping) else None
+        rule = ref.get("refUpdateRule") if isinstance(ref, Mapping) else None
+        if isinstance(rule, Mapping):
+            counts.append(rule.get("requiredApprovingReviewCount"))
+        return max((count for count in counts if isinstance(count, int)), default=0)
+
+    async def commits(
+        self,
+        *,
+        path: str,
+        since: str | None = None,
+        ref: str | None = None,
+        limit: int = _PAGE_SIZE,
+    ) -> object:
+        """The newest ``limit`` commits (100 at most) that touched ``path``, on ``ref`` or the
+        default branch, since ``since`` when given."""
+        params = {"path": path, "per_page": str(min(limit, _PAGE_SIZE))}
+        if since:
+            params["since"] = since
+        if ref:
+            params["sha"] = ref
+        return await self.get("commits", params)
+
+    async def recent_file_authors(
+        self, paths: Sequence[str], *, since: str, ref: str | None = None
+    ) -> dict[str, set[str]]:
+        """Linked human authors of each path's newest 100 commits, omitting unreadable paths."""
+        authors: dict[str, set[str]] = {}
+        for start in range(0, len(paths), _HISTORIES_PER_QUERY):
+            batch = paths[start : start + _HISTORIES_PER_QUERY]
+            params = "".join(f",$p{i}:String!" for i in range(len(batch)))
+            fields = "".join(
+                f"f{i}:history(first:100,path:$p{i},since:$since)"
+                "{nodes{author{user{login}}}}"
+                for i in range(len(batch))
+            )
+            try:
+                data = await self.github.graphql(
+                    "query($owner:String!,$repo:String!,$ref:String!,$since:GitTimestamp!"
+                    f"{params}){{repository(owner:$owner,name:$repo)"
+                    f"{{object(expression:$ref){{...on Commit{{{fields}}}}}}}}}",
+                    {
+                        "owner": self.owner,
+                        "repo": self.name,
+                        "ref": f"{ref or 'HEAD'}^{{commit}}",
+                        "since": since,
+                        **{f"p{i}": path for i, path in enumerate(batch)},
+                    },
+                    partial=True,
+                )
+                repository = data.get("repository")
+                commit = repository.get("object") if isinstance(repository, Mapping) else None
+                if not isinstance(commit, Mapping):
+                    raise ValueError("GitHub answered file history without a commit")
+            except httpx2.HTTPError, ValueError:
+                logger.warning(
+                    "Could not read changed files' history",
+                    extra={"repository": self.full_name, "paths": list(batch)},
+                    exc_info=True,
+                )
+                continue
+            for i, path in enumerate(batch):
+                try:
+                    history = _History.model_validate(commit.get(f"f{i}"))
+                except ValueError:
+                    logger.warning(
+                        "Could not read a changed file's history",
+                        extra={"repository": self.full_name, "path": path},
+                        exc_info=True,
+                    )
+                    continue
+                authors[path] = {
+                    node.author.user.login.lower()
+                    for node in history.nodes
+                    if node.author.user is not None
+                    and not node.author.user.login.lower().endswith("[bot]")
+                }
+        return authors
+
+    async def commit_sha(self, ref: str) -> str:
+        """The SHA of the commit ``ref`` (a branch, tag or SHA) names."""
+        response = await self.github.request(
+            "GET",
+            f"repos/{self.full_name}/commits/{quote(self.inside(ref), safe='')}",
+            headers={"Accept": "application/vnd.github.sha"},
+        )
+        sha = response.text.strip()
+        if len(sha) != 40:
+            raise ValueError("GitHub answered the commit without a SHA")
+        return sha
+
+    async def tree(self, sha: str) -> RepoTree:
+        """Every file and directory in commit ``sha``, recursively."""
+        return RepoTree.model_validate(
+            await self.get(f"git/trees/{quote(self.inside(sha), safe='/')}", {"recursive": "1"})
+        )
+
+    async def create_branch(self, name: str, sha: str) -> None:
+        """Create branch ``name`` pointing at commit ``sha``."""
+        await self.post("git/refs", {"ref": f"refs/heads/{name}", "sha": sha})
+
+    async def delete_branch(self, name: str) -> None:
+        """Delete branch ``name``; GitHub closes any open pull request from it."""
+        await self.delete(f"git/refs/heads/{quote(self.inside(name), safe='/')}")
+
+    async def commit_files(
+        self,
+        *,
+        branch: str,
+        expected_head: str,
+        message: str,
+        additions: Mapping[str, str],
+        deletions: Sequence[str] = (),
+    ) -> str:
+        """Commit text files onto ``branch`` and return the new commit's SHA.
+
+        GitHub refuses the commit when ``branch`` no longer points at
+        ``expected_head``, so a concurrent push is never overwritten.
+        """
+        headline, _, body = message.strip().partition("\n")
+        data = await self.github.graphql(
+            "mutation($input:CreateCommitOnBranchInput!)"
+            "{createCommitOnBranch(input:$input){commit{oid}}}",
+            {
+                "input": {
+                    "branch": {"repositoryNameWithOwner": self.full_name, "branchName": branch},
+                    "expectedHeadOid": expected_head,
+                    "message": {"headline": headline, "body": body.strip()},
+                    "fileChanges": {
+                        "additions": [
+                            {"path": path, "contents": base64.b64encode(text.encode()).decode()}
+                            for path, text in additions.items()
+                        ],
+                        "deletions": [{"path": path} for path in deletions],
+                    },
+                }
+            },
+        )
+        commit = (data.get("createCommitOnBranch") or {}).get("commit") or {}
+        oid = commit.get("oid")
+        if not isinstance(oid, str):
+            raise ValueError("GitHub answered the commit without its SHA")
+        return oid
+
+    async def open_pull_request(
+        self, *, head: str, base: str, title: str, body: str, draft: bool
+    ) -> dict[str, Any]:
+        payload = await self.post(
+            "pulls", {"head": head, "base": base, "title": title, "body": body, "draft": draft}
+        )
+        if not isinstance(payload, dict):
+            raise ValueError("GitHub answered the new pull request without an object")
+        return payload
+
+    async def create_check_run(self, run: Mapping[str, object]) -> object:
+        return await self.post("check-runs", run)
+
+    async def delete_review_comment(self, comment_id: int) -> None:
+        await self.delete(f"pulls/comments/{comment_id}")
+
+    async def check_runs(
+        self, sha: str, *, include_superseded: bool = False, name: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Current checks on ``sha``, or their history with ``include_superseded``; with
+        ``name``, only the checks of that name."""
+        params = {"filter": "all" if include_superseded else "latest"}
+        if name is not None:
+            params["check_name"] = name
+        runs = await self.pages(
+            f"commits/{quote(self.inside(sha), safe='/')}/check-runs",
+            key="check_runs",
+            params=params,
+        )
+        if include_superseded or not CommitCI.has_reruns(runs):
+            return runs
+        try:
+            workflows = await self._workflow_runs(sha)
+        except httpx2.HTTPError, ValueError:
+            logger.warning(
+                "Could not identify superseded check runs",
+                extra={"repo_full_name": self.full_name, "sha": sha},
+                exc_info=True,
+            )
+            return runs
+        return CommitCI.latest_runs(
+            runs, {suite: (run.workflow_id, run.event) for suite, run in workflows.items()}
+        )
+
+    async def commit_ci(self, sha: str) -> CommitCI:
+        """``sha``'s latest check runs and commit statuses, in one GraphQL query when they fit."""
+        data, _ = await self.ci_graphql(_COMMIT_CI_QUERY, {"oid": self.inside(sha)})
+        repository = data.get("repository")
+        commit = repository.get("object") if isinstance(repository, Mapping) else None
+        if not isinstance(commit, Mapping):
+            raise ValueError("GitHub answered without the commit")
+        return CommitCI.from_graphql(commit) or await self.commit_ci_over_rest(sha)
+
+    async def commit_ci_over_rest(self, sha: str) -> CommitCI:
+        """``commit_ci`` page by page, for a commit with more check runs than one query holds."""
+        with MeteredTransport.attributed():
+            runs, statuses = await asyncio.gather(self.check_runs(sha), self.commit_statuses(sha))
+        return CommitCI(runs, statuses)
+
+    async def _workflow_runs(self, sha: str) -> dict[int, _WorkflowRun]:
+        """The Actions workflow runs on ``sha``, by the check suite each reports to."""
+        payloads = await self.pages("actions/runs", key="workflow_runs", params={"head_sha": sha})
+        return {
+            workflow.check_suite_id: workflow
+            for workflow in map(_WorkflowRun.model_validate, payloads)
+        }
+
+    async def workflow_ids(self, sha: str) -> dict[int, int]:
+        """The workflow behind each Actions check suite on ``sha``, by suite id."""
+        return {suite: run.workflow_id for suite, run in (await self._workflow_runs(sha)).items()}
+
+    async def workflow_for_suite(self, suite_id: int) -> WorkflowRun:
+        runs = await self.pages(
+            "actions/runs", key="workflow_runs", params={"check_suite_id": str(suite_id)}
+        )
+        parsed = [WorkflowRun.model_validate(run) for run in runs]
+        if len(parsed) != 1 or parsed[0].check_suite_id != suite_id:
+            raise ValueError("Required check workflow is ambiguous or unavailable")
+        return parsed[0]
+
+    async def merge_base(self, base: str, head: str) -> str:
+        payload = await self.get(
+            f"compare/{quote(self.inside(base), safe='')}...{quote(self.inside(head), safe='')}",
+            {"per_page": "1"},
+        )
+        return CommitComparison.model_validate(payload).merge_base
+
+    async def admission_artifact(self, run_id: int, name: str) -> dict[str, JsonValue]:
+        artifacts = [
+            Artifact.model_validate(item)
+            for item in await self.pages(f"actions/runs/{run_id}/artifacts", key="artifacts")
+        ]
+        matches = [item for item in artifacts if item.name == name and not item.expired]
+        if len(matches) != 1:
+            raise ValueError("Admission evidence is missing or ambiguous")
+        return await self.artifact_json(matches[0].id, "admission.json")
+
+    async def artifact_json(self, artifact_id: int, filename: str) -> dict[str, JsonValue]:
+        # GitHub redirects to a signed blob URL. Never forward authorization to it.
+        response = await self.github.http.get(
+            f"{GITHUB_API_BASE}/repos/{self.full_name}/actions/artifacts/{artifact_id}/zip",
+            follow_redirects=False,
+        )
+        if response.status_code != 302:
+            raise ValueError("Artifact download unavailable")
+        location = response.headers.get("location", "")
+        try:
+            async with github_client() as anonymous:
+                download = await request_with_safe_redirects(
+                    anonymous, "GET", location, validate_url=_artifact_destination, stream=True
+                )
+                try:
+                    download.raise_for_status()
+                    content = bytearray()
+                    async for chunk in download.aiter_bytes():
+                        content.extend(chunk)
+                        if len(content) > 1_000_000:
+                            raise ValueError("Artifact is too large")
+                finally:
+                    await download.aclose()
+        except httpx2.HTTPError:
+            # Signed artifact URLs must not appear in controller exception logs.
+            raise ValueError("Artifact download failed") from None
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            files = archive.infolist()
+            if len(files) != 1 or files[0].filename != filename or files[0].file_size > 100_000:
+                raise ValueError("Unexpected artifact contents")
+            return TypeAdapter(dict[str, JsonValue]).validate_json(archive.read(files[0]))
+
+    async def validation_runs(self, workflow: str, since: datetime) -> tuple[ValidationRun, ...]:
+        runs: list[ValidationRun] = []
+        for page in range(1, 11):
+            result = ValidationRuns.model_validate(
+                await self.get(
+                    f"actions/workflows/{quote(workflow, safe='')}/runs",
+                    {
+                        "event": "workflow_dispatch",
+                        "created": since.strftime(">=%Y-%m-%dT%H:%M:%SZ"),
+                        "per_page": "100",
+                        "page": str(page),
+                    },
+                )
+            )
+            runs.extend(result.workflow_runs)
+            if len(runs) >= result.total_count:
+                if len({run.id for run in runs}) != len(runs) or len(runs) != result.total_count:
+                    raise ValueError("Workflow discovery changed during pagination")
+                return tuple(runs)
+            if not result.workflow_runs:
+                break
+        raise ValueError("Workflow discovery exceeds the bounded search window")
+
+    async def validation_run(self, run_id: int) -> ValidationRun:
+        return ValidationRun.model_validate(await self.get(f"actions/runs/{run_id}"))
+
+    async def validation_source_digest(self, sha: str) -> str:
+        """Fingerprint service workflow sources using Homebase's approved-policy format."""
+        payload = await self.get(f"git/trees/{quote(self.inside(sha), safe='')}")
+        if not isinstance(payload, dict) or payload.get("truncated") is not False:
+            raise ValueError("Incomplete workflow source tree")
+        expected = {
+            ".github": ("040000", "tree"),
+            "cmd": ("040000", "tree"),
+            "langdev": ("100755", "blob"),
+        }
+        sources = []
+        for entry in TypeAdapter(list[dict[str, JsonValue]]).validate_python(payload.get("tree")):
+            path = entry.get("path")
+            if not isinstance(path, str) or path not in expected:
+                continue
+            mode, kind = expected[path]
+            source_sha = entry.get("sha")
+            if (
+                (entry.get("mode"), entry.get("type")) != (mode, kind)
+                or not isinstance(source_sha, str)
+                or not re.fullmatch(r"[0-9a-f]{40}", source_sha)
+            ):
+                raise ValueError("Invalid workflow source tree entry")
+            sources.append({"path": path, "mode": mode, "type": kind, "sha": source_sha})
+        if sorted(entry["path"] for entry in sources) != sorted(expected):
+            raise ValueError("Missing or duplicate workflow sources")
+        sources.sort(key=lambda entry: entry["path"])
+        return hashlib.sha256(
+            json.dumps(sources, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+
+    async def _validation_pages(
+        self, run_id: int, key: Literal["jobs", "artifacts"]
+    ) -> list[dict[str, JsonValue]]:
+        items: list[dict[str, JsonValue]] = []
+        total: int | None = None
+        for page in range(1, 51):
+            payload = await self.get(
+                f"actions/runs/{run_id}/{key}",
+                {
+                    "per_page": "100",
+                    "page": str(page),
+                    **({"filter": "latest"} if key == "jobs" else {}),
+                },
+            )
+            if not isinstance(payload, dict):
+                raise ValueError("Validation listing is not an object")
+            count = payload.get("total_count")
+            if type(count) is not int or count < 0 or (total is not None and count != total):
+                raise ValueError("Validation listing changed during pagination")
+            total = count
+            batch = TypeAdapter(list[dict[str, JsonValue]]).validate_python(payload.get(key))
+            items.extend(batch)
+            if len(items) == total:
+                identifiers = TypeAdapter(list[int]).validate_python(
+                    [item.get("id") for item in items], strict=True
+                )
+                if any(identifier <= 0 for identifier in identifiers) or len(
+                    set(identifiers)
+                ) != len(items):
+                    raise ValueError("Validation listing contains duplicate or invalid IDs")
+                return items
+            if not batch or len(items) > total:
+                break
+        raise ValueError("Validation listing is incomplete")
+
+    async def validation_jobs(self, run_id: int) -> tuple[ValidationJob, ...]:
+        return tuple(
+            ValidationJob.model_validate(job)
+            for job in await self._validation_pages(run_id, "jobs")
+        )
+
+    async def validation_artifacts(self, run_id: int) -> tuple[Artifact, ...]:
+        return tuple(
+            Artifact.model_validate(item)
+            for item in await self._validation_pages(run_id, "artifacts")
+        )
+
+    @asynccontextmanager
+    async def candidate_git(self) -> AsyncIterator[CandidateGit]:
+        """A dedicated sandbox with controller credentials kept in the GitHub proxy."""
+        from openswe.github.repo_names import normalize_repo_full_name
+        from openswe.merge_queue.git import CandidateGit
+        from openswe.sandboxes.providers.langsmith import (
+            configure_sandbox_proxy,
+            create_langsmith_sandbox,
+            get_async_sandbox_client,
+        )
+
+        repository = normalize_repo_full_name(self.full_name)
+        if not re.fullmatch(r"[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+", repository):
+            raise ValueError("Candidate Git requires a GitHub repository name")
+        authorization = self.github.http.headers.get("Authorization")
+        if (
+            self.github.login is not None
+            or not authorization
+            or not authorization.startswith("Bearer ")
+        ):
+            raise ValueError("Candidate writes require an explicitly supplied controller identity")
+        sandbox = await create_langsmith_sandbox(
+            prepare_work_dir=False,
+            create_params={"idle_ttl_seconds": 600, "delete_after_stop_seconds": 60},
+        )
+        try:
+            await configure_sandbox_proxy(sandbox.id, authorization.removeprefix("Bearer "))
+            git = CandidateGit(
+                sandbox,
+                PurePosixPath("/tmp/merge-queue.git"),
+                f"https://github.com/{repository}.git",
+            )
+            await git.initialize()
+            yield git
+        finally:
+            try:
+                async with asyncio.timeout(30), get_async_sandbox_client() as client:
+                    await client.stop_sandbox(sandbox.id)
+            except Exception:
+                logger.warning(
+                    "Failed to stop candidate sandbox",
+                    extra={"sandbox_id": sandbox.id},
+                    exc_info=True,
+                )
+
+    async def commit_statuses(self, sha: str) -> list[dict[str, Any]]:
+        """The latest status per context on ``sha``."""
+        latest: dict[str, dict[str, Any]] = {}
+        for status in await self.pages(
+            f"commits/{quote(self.inside(sha), safe='/')}/status", key="statuses"
+        ):
+            context = status.get("context")
+            if isinstance(context, str):
+                latest.setdefault(context, status)
+        return list(latest.values())
+
+
+def _artifact_destination(location: str) -> None:
+    url = urlparse(location)
+    if (
+        url.scheme != "https"
+        or not url.hostname
+        or not url.hostname.endswith((".blob.core.windows.net", ".actions.githubusercontent.com"))
+        or url.username
+        or url.password
+        or url.port not in (None, 443)
+    ):
+        raise ValueError("Untrusted artifact download destination")
+
+
+type ReadStatus = Literal["ok", "transient", "missing", "forbidden", "unavailable"]
+
+
+@dataclass(frozen=True, slots=True)
+class ReadResult[T]:
+    """A GitHub read and the reason it could not be completed."""
+
+    value: T | None
+    status: ReadStatus
+
+
+async def read_result[T](read: Awaitable[T]) -> ReadResult[T]:
+    """Preserve retryable failures separately from missing or inaccessible resources."""
+    try:
+        return ReadResult(await read, "ok")
+    except httpx2.HTTPStatusError as exc:
+        response = exc.response
+        status: ReadStatus = "unavailable"
+        if 500 <= response.status_code < 600 or GitHubError(response).rate_limited:
+            status = "transient"
+        elif response.status_code == 404:
+            status = "missing"
+        elif response.status_code in {401, 403}:
+            status = "forbidden"
+        logger.warning("GitHub read failed", extra={"read_status": status}, exc_info=True)
+        return ReadResult(None, status)
+    except GraphQLError as exc:
+        status = (
+            "transient"
+            if "RATE_LIMITED" in exc.types
+            else "missing"
+            if "NOT_FOUND" in exc.types
+            else "forbidden"
+            if "FORBIDDEN" in exc.types
+            else "unavailable"
+        )
+        logger.warning(
+            "GitHub GraphQL read failed",
+            extra={"read_status": status, "graphql_errors": exc.errors},
+        )
+        return ReadResult(None, status)
+    except httpx2.TransportError:
+        logger.warning("GitHub read transport failed", exc_info=True)
+        return ReadResult(None, "transient")
+    except httpx2.HTTPError, ValueError:
+        logger.warning("GitHub read unavailable", exc_info=True)
+        return ReadResult(None, "unavailable")
+
+
+async def or_none[T](read: Awaitable[T]) -> T | None:
+    """``read``'s answer, or ``None`` when GitHub could not give one."""
+    try:
+        return await read
+    except httpx2.HTTPError, ValueError:
+        return None
+
+
+def _json_or_none(response: httpx2.Response) -> object:
+    return None if response.status_code == 204 or not response.content else response.json()
+
+
+class Quota(BaseModel):
+    """One GitHub rate-limit resource: its hourly budget and what is left of it."""
+
+    limit: int
+    used: int
+    remaining: int
+    reset: int
+
+
+class _RateLimits(BaseModel):
+    resources: dict[str, Quota]
+
+
+_RATE_LIMITS = TypeAdapter(_RateLimits)
+
+
+class TreeEntry(BaseModel):
+    path: str
+    type: Literal["blob", "tree", "commit"]
+    size: int | None = None
+
+
+class RepoTree(BaseModel):
+    """A commit's tree; ``truncated`` when GitHub left entries out of a very large one."""
+
+    sha: str
+    tree: list[TreeEntry]
+    truncated: bool
+
+
+class _WorkflowRun(BaseModel):
+    workflow_id: int
+    check_suite_id: int
+    event: str
+
+
+class _GitHubErrorBody(BaseModel):
+    message: str = ""
+    errors: list[object] = []
+
+
+class GitHubError(httpx2.HTTPStatusError):
+    """GitHub refused a request; ``message`` is GitHub's own explanation."""
+
+    def __init__(self, response: httpx2.Response) -> None:
+        super().__init__(
+            f"GitHub answered {response.status_code}",
+            request=response.request,
+            response=response,
+        )
+
+    def __str__(self) -> str:
+        return f"{super().__str__()} ({self.failure_reason})"
+
+    @property
+    def failure_reason(self) -> str:
+        if self.response.status_code in {403, 429}:
+            if self.response.headers.get("x-ratelimit-remaining") == "0":
+                return "primary_rate_limit"
+            if self.rate_limited:
+                return "rate_limit"
+            if self.message in {
+                "Resource not accessible by integration",
+                "Resource not accessible by personal access token",
+            }:
+                return "permission_denied"
+        return "unknown"
+
+    @property
+    def rate_limited(self) -> bool:
+        return (
+            self.response.status_code == 429
+            or _Retry.rate_limited(self.response)
+            or (self.response.status_code == 403 and "Retry-After" in self.response.headers)
+        )
+
+    @property
+    def retry_in(self) -> float | None:
+        """Seconds until GitHub takes the refused request again, when it named a time.
+
+        ``None`` for a refusal that is not a rate limit, or one that named no time.
+        """
+        if not self.rate_limited:
+            return None
+        if (reset := _Retry._quota_reset_in(self.response)) is not None:  # noqa: SLF001
+            return reset
+        try:
+            wait = float(self.response.headers["Retry-After"])
+        except KeyError, ValueError:
+            return None
+        return wait if math.isfinite(wait) and wait > 0 else None
+
+    # GitHub's hourly quota resets within the hour; a wait it names further out is not trusted.
+    _LONGEST_WAIT: ClassVar[timedelta] = timedelta(hours=1)
+    # A secondary limit that names no wait usually clears within a minute.
+    _UNNAMED_WAIT: ClassVar[timedelta] = timedelta(minutes=1)
+
+    @property
+    def resume_at(self) -> datetime:
+        """When to try a rate-limited request again: GitHub's named time, capped at an hour."""
+        wait = self.retry_in
+        return datetime.now(UTC) + min(
+            self._UNNAMED_WAIT if wait is None else timedelta(seconds=wait), self._LONGEST_WAIT
+        )
+
+    @property
+    def message(self) -> str:
+        fallback = f"GitHub request failed ({self.response.status_code})"
+        try:
+            body = _GitHubErrorBody.model_validate(self.response.json())
+        except ValueError:
+            return fallback
+        details = "; ".join(
+            str(error["message"]) if isinstance(error, dict) and "message" in error else str(error)
+            for error in body.errors
+        )
+        if body.message and details:
+            return f"{body.message}: {details}"
+        return body.message or details or fallback
+
+
+class GraphQLError(ValueError):
+    """GitHub answered a GraphQL query with errors, and ``data`` with what it could resolve."""
+
+    def __init__(self, errors: object, data: Mapping[str, object] | None = None) -> None:
+        super().__init__(f"GitHub GraphQL errors: {errors}")
+        self.errors = errors
+        self.data = data
+
+    @staticmethod
+    def at_workflow_run(error: object) -> bool:
+        """Whether ``error`` is at or under a check suite's ``workflowRun``.
+
+        A suite's workflow run needs Actions access, which a token may lack beside
+        Checks access; GitHub then nulls only that suite's ``workflowRun``.
+        """
+        path = error.get("path") if isinstance(error, Mapping) else None
+        return isinstance(path, list) and "workflowRun" in path
+
+    @property
+    def paths(self) -> list[object]:
+        """Where each error is in the answer; ``None`` for one about the whole query."""
+        errors = self.errors if isinstance(self.errors, list) else [self.errors]
+        return [error.get("path") if isinstance(error, Mapping) else None for error in errors]
+
+    @property
+    def any_at_workflow_run(self) -> bool:
+        """Whether any error is at or under a check suite's ``workflowRun``."""
+        errors = self.errors if isinstance(self.errors, list) else [self.errors]
+        return any(self.at_workflow_run(error) for error in errors)
+
+    @property
+    def only_under_check_suites(self) -> bool:
+        """Whether every error is inside a commit's ``checkSuites``, so the rest of
+        ``data`` holds."""
+        paths = self.paths
+        return bool(paths) and all(
+            isinstance(path, list) and "checkSuites" in path[:-1] for path in paths
+        )
+
+    @property
+    def types(self) -> set[str]:
+        """GitHub's ``type`` for each error, such as ``NOT_FOUND`` or ``RATE_LIMITED``."""
+        return {
+            str(error["type"])
+            for error in (self.errors if isinstance(self.errors, list) else [])
+            if isinstance(error, dict) and "type" in error
+        }
+
+    @property
+    def message(self) -> str:
+        messages = (
+            str(error["message"])
+            for error in (self.errors if isinstance(self.errors, list) else [])
+            if isinstance(error, dict) and "message" in error
+        )
+        return "; ".join(messages) or "GitHub rejected the request"

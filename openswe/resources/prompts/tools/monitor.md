@@ -1,0 +1,70 @@
+Run a long-lived sandbox command and get its output as events while you keep working.
+
+`start` returns at once.
+The command keeps running after this run ends, and every event wakes this thread: it is added before your next model call while a run is active, or starts a new run when the thread is idle.
+Each event costs a model turn, so filter for the lines you would act on.
+
+How output becomes events:
+- The command's stdout and stderr, merged, are saved line by line, numbered from 1, in the monitor's raw log.
+  Nothing is lost to the filter; `output` reads it back.
+  The log rotates into 10 MiB segment files (`raw_logs`) and keeps the newest 50 MiB, so a long run drops its oldest lines.
+- `filter` is a separate shell command that reads those lines on stdin.
+  Each line it prints is event output; it is line-buffered for you, so `grep`, `awk` and `sed` need no flush flags.
+  With no filter every raw line is event output.
+- Lines printed within 200ms of each other are one burst, which names the raw line it starts at.
+- The first burst arrives as an event at once.
+  After each event the monitor waits before sending the next: 2s after the first, then twice as long after each one (4s, 8s, 16s, …).
+  Once it has been quiet for twice its current wait, the wait goes back to 2s.
+  Bursts printed during a wait are held and arrive together as one event that lists each of them.
+  An event shows at most 100 lines and says how many more it held.
+
+Pick the tool by how many notifications you need:
+- One, when a command finishes: use `background_execute`.
+- One per occurrence, until the command ends or the timeout: use `monitor`, e.g. `command="tail -F app.log"`, `filter="grep -E 'ERROR|Traceback'"`.
+- One, when a condition holds: use `monitor` with `interval`, which works like Playwright's `waitForFunction`.
+  `command` is then a check: it runs every `interval` seconds until it exits 0, and its output at that moment is the one event, after which the monitor ends.
+  For example, a server up: `command="curl -fsS localhost:3000/health"`, `interval=5`; a file written: `command="test -s out/report.json"`, `interval=10`.
+  For CI, notice individual failures promptly and use a bounded wait that resumes even if notifications are missing.
+  Write no polling loop yourself.
+
+Silence is not success.
+A filter that only matches the happy path stays silent through a crash or a hang.
+Match every terminal state you would act on (`Traceback|Error|FAILED|Killed|exited`), and broaden the filter rather than narrow it when unsure.
+
+A monitor ends when its command exits, its filter exits, it reaches its timeout, you stop it, or it gets too noisy: once 10 of its events in a row were held by a wait, without it going quiet in between, it stops and you are told why.
+
+Each human message opens one allowance for this thread's monitors:
+- 10 monitor starts.
+  Past that, `start` fails until a person writes again.
+- 50 events across all monitors.
+  Past that every monitor stops, further events are dropped (the raw logs still have them), and `start` fails until a person writes again.
+- 24 hours.
+  Every monitor's timeout is clipped to what is left, and `start` fails once it is gone.
+- 10 runs started for monitor output while the thread is idle.
+  After that the output waits for the next run a person starts, and the monitors stop.
+
+When a monitor ends you get one notice with the reason, both exit codes, the event and raw line counts, the last 20 raw lines, and the filter's stderr.
+Read more of the raw log with `output`, for example to see why a monitor timed out without an event.
+
+At most 3 monitors run per thread.
+Monitors share the worktree: never race them with edits, installs, commits, or pushes.
+
+Args:
+- action: `start` launches a monitor and returns its `monitor_id`; `output` reads its unfiltered raw lines; `stop` ends one; `list` shows this thread's monitors with their status and counts.
+- command: The shell command to run.
+  Required for `start`.
+- filter: A shell command that reads raw lines on stdin and prints the ones that should be events.
+  Optional.
+- description: A short, specific name shown on every event, e.g. "errors in deploy.log".
+  Required for `start`.
+- timeout: Required explicit deadline in seconds, 1 to 86400.
+  A terminal notification wakes the thread even if no output matched before the deadline.
+- interval: Seconds between runs of `command` as a check, 5 to 3600.
+  Optional; without it `command` runs once and every line it prints can be an event.
+  Each check runs for at most `interval` seconds or a minute, whichever is longer, and `timeout` still bounds the wait: a check that never passes ends the monitor as timed out.
+- monitor_id: The monitor to read or stop.
+  Required for `output` and `stop`.
+- start_line: First raw line to return for `output` (1-based, inclusive).
+  With neither line given, `output` returns the last 200 lines.
+- end_line: Last raw line to return for `output` (inclusive).
+  At most 500 lines or 64 KiB come back per call.

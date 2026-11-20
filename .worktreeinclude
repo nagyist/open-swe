@@ -1,0 +1,3 @@
+# Seed new worktrees with the local environment and persisted LangGraph development state.
+/.env
+/.langgraph_api/

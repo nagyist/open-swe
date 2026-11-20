@@ -1,0 +1,341 @@
+"""Deterministic reviewer picks: code owners and recent authors of the changed files.
+
+Candidates come from one CODEOWNERS area at a time, the one owning the most changed
+files first. Each scores the changed files they own plus those they changed within
+``HISTORY_WINDOW``, divided by one more than the open reviews they already have.
+Only people inside their work hours are picked; when nobody is, the pick waits
+for whoever's work day starts first. Anyone already on the request, or rotated
+away from it for not accepting, is skipped.
+"""
+
+import asyncio
+import logging
+from collections import Counter
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from typing import Self
+
+from openswe.dashboard.profiles import PROFILES
+from openswe.expedited_review.eligibility import ChangedFile
+from openswe.github.codeowners import CodeOwners
+from openswe.github.http import GitHubAppUnavailable, GitHubClient, RepoClient
+from openswe.github.pull_request_status import PullRequestClient
+from openswe.human_review.coverage import Area, Coverage
+from openswe.human_review.requests import HumanReviewRequest
+from openswe.slack.availability import ReviewerAvailability
+from openswe.users import User
+
+logger = logging.getLogger(__name__)
+
+HISTORY_WINDOW = timedelta(days=90)
+HISTORY_MAX_FILES = 30
+
+
+def _is_bot(login: str) -> bool:
+    return login.lower().endswith("[bot]")
+
+
+@dataclass(frozen=True, slots=True)
+class Candidate:
+    login: str
+    owned: int
+    touched: int
+    open_reviews: int = 0
+
+    @property
+    def score(self) -> float:
+        return (self.owned + self.touched) / (1 + self.open_reviews)
+
+    @classmethod
+    def rank(cls, candidates: list[Self]) -> list[Self]:
+        """Best first; ties go to fewer open reviews, then ownership, then history, then login."""
+        return sorted(
+            candidates,
+            key=lambda c: (-c.score, c.open_reviews, -c.owned, -c.touched, c.login.lower()),
+        )
+
+    def reason(self, total_files: int) -> str:
+        """Why them, addressed to them."""
+        files = f"{total_files} changed file{'s' if total_files != 1 else ''}"
+        parts: list[str] = []
+        if self.owned:
+            parts.append(f"own {self.owned} of the {files}")
+        if self.touched:
+            of = "of them" if self.owned else f"of the {files}"
+            parts.append(f"changed {self.touched} {of} in the last {HISTORY_WINDOW.days} days")
+        parts.append(
+            f"have {self.open_reviews} other open review{'s' if self.open_reviews != 1 else ''}"
+            if self.open_reviews
+            else "have no other open reviews"
+        )
+        if len(parts) == 2:
+            return f"You {parts[0]} and {parts[1]}."
+        return f"You {', '.join(parts[:-1])}, and {parts[-1]}."
+
+
+@dataclass(frozen=True, slots=True)
+class Pick:
+    login: str
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class Wait:
+    """Nobody eligible is on shift; ``login``'s work day starts first, at ``until``."""
+
+    login: str
+    until: datetime
+
+
+async def _touched(repo: RepoClient, ref: str | None, files: list[ChangedFile]) -> Counter[str]:
+    since = (datetime.now(UTC) - HISTORY_WINDOW).isoformat()
+    busiest = sorted(files, key=lambda f: (-f.changed_lines, f.filename))[:HISTORY_MAX_FILES]
+    authors = await repo.recent_file_authors(
+        [file.filename for file in busiest], since=since, ref=ref
+    )
+    touched: Counter[str] = Counter()
+    for file in busiest:
+        touched.update(authors.get(file.filename, set()))
+    return touched
+
+
+async def choose_reviewer(
+    request: HumanReviewRequest, *, area: Area | None = None, candidates: Candidates | None = None
+) -> Pick | Wait | None:
+    """The best on-shift owner of ``area``, when to try again, or ``None`` when nobody qualifies.
+
+    Without ``area`` it is the first area nobody on the request owns, the largest first, falling
+    back to anyone who changed the files; ``None`` once every area has someone.
+    """
+    pr = request.pull_request
+    extra = {
+        "request_id": str(request.id),
+        "repository": f"{pr.owner}/{pr.repo}",
+        "pr_number": pr.number,
+    }
+    logger.info("Picking a reviewer", extra={**extra, "base_ref": pr.base_ref})
+    try:
+        async with GitHubClient.as_app(pr.owner, pr.repo) as github:
+            return await _choose_reviewer(
+                request,
+                github.repo(pr.owner, pr.repo).pull_request(pr.number),
+                area,
+                extra,
+                candidates=candidates,
+            )
+    except GitHubAppUnavailable:
+        logger.warning("No GitHub App token to pick a reviewer", extra=extra)
+        return None
+
+
+@dataclass(frozen=True, slots=True)
+class Candidates:
+    """Who could review a pull request: the code owners and recent authors of its changed files."""
+
+    files: list[ChangedFile]
+    coverage: Coverage
+    owned: Counter[str]
+    touched: Counter[str]
+
+    @classmethod
+    async def gather(
+        cls, request: HumanReviewRequest, pull: PullRequestClient, extra: dict[str, object]
+    ) -> Self | None:
+        """``None`` when the changed files cannot be read."""
+        pr = request.pull_request
+        files = await ChangedFile.of_pull(pull)
+        if not files:
+            logger.warning("Could not read the changed files to pick a reviewer", extra=extra)
+            return None
+        ref = pr.base_ref or None
+        codeowners, touched = await asyncio.gather(
+            CodeOwners.fetch(pull.repo, ref), _touched(pull.repo, ref, files)
+        )
+        coverage = (
+            await Coverage.build(codeowners, [changed.filename for changed in files])
+            if codeowners is not None
+            else Coverage(())
+        )
+        owned = coverage.owned()
+        logger.info(
+            "Gathered reviewer candidates",
+            extra={
+                **extra,
+                "changed_files": len(files),
+                "history_files": min(len(files), HISTORY_MAX_FILES),
+                "has_codeowners": codeowners is not None,
+                "code_owners": dict(owned.most_common()),
+                "recent_authors": dict(touched.most_common()),
+            },
+        )
+        return cls(files, coverage, owned, touched)
+
+    @property
+    def logins(self) -> set[str]:
+        return set(self.owned.keys() | self.touched.keys())
+
+    def first_open_area(self, request: HumanReviewRequest) -> Area | None:
+        """The largest code owner area nobody on the request owns yet."""
+        on_request = [p.github_login for p in request.participants if p.decision != "expired"]
+        open_areas = self.coverage.uncovered(on_request)
+        return open_areas[0] if open_areas else None
+
+    def tentative(self, request: HumanReviewRequest) -> frozenset[str]:
+        """Everyone the next unclaimed pick could land on, before availability and workload."""
+        author = (request.pull_request.author or "").lower()
+        if not self.coverage.areas:
+            return frozenset(self.logins - {author})
+        area = self.first_open_area(request)
+        if area is None:
+            return frozenset()
+        return frozenset((area.owners - {author}) or (self.logins - {author}))
+
+    @classmethod
+    async def of_request(cls, request: HumanReviewRequest) -> Self | None:
+        """As the GitHub App reads them; ``None`` when it cannot."""
+        pr = request.pull_request
+        extra = {"request_id": str(request.id), "repository": f"{pr.owner}/{pr.repo}"}
+        try:
+            async with PullRequestClient.as_app(pr.owner, pr.repo, pr.number) as pull:
+                return await cls.gather(request, pull, extra)
+        except GitHubAppUnavailable:
+            logger.warning("No GitHub App token to gather reviewer candidates", extra=extra)
+            return None
+
+
+async def _choose_reviewer(
+    request: HumanReviewRequest,
+    pull: PullRequestClient,
+    area: Area | None,
+    extra: dict[str, object],
+    *,
+    candidates: Candidates | None = None,
+) -> Pick | Wait | None:
+    pr = request.pull_request
+    if candidates is None:
+        candidates = await Candidates.gather(request, pull, extra)
+    if candidates is None:
+        return None
+    author = (pr.author or "").lower()
+    logins = sorted(candidates.logins - {author})
+    users = await asyncio.gather(*(User.for_login("github", login) for login in logins))
+    posters = await request.recent_channel_posters()
+    taken = {p.user_id for p in request.participants if p.decision != "expired"}
+    missed = {p.user_id for p in request.participants if p.decision == "expired"}
+    people: dict[str, User] = {}
+    skipped: dict[str, str] = {author: "author"} if author in candidates.logins else {}
+    for login, user in zip(logins, users, strict=True):
+        if user is None:
+            skipped[login] = "no_open_swe_account"
+        elif user.id not in posters:
+            skipped[login] = "not_recent_channel_poster"
+        elif _is_bot(login):
+            skipped[login] = "bot"
+        elif not await PROFILES.allows_auto_human_review(user.github_login or login):
+            skipped[login] = "opted_out"
+        elif request.is_author(user.id, login):
+            skipped[login] = "author"
+        elif user.id in taken:
+            skipped[login] = "already_on_request"
+        elif user.id in missed:
+            skipped[login] = "missed_pick"
+        else:
+            people[login] = user
+    hours = dict(
+        zip(
+            people,
+            await asyncio.gather(
+                *(ReviewerAvailability.for_user(user) for user in people.values())
+            ),
+            strict=True,
+        )
+    )
+    for login in list(people):
+        if hours[login].out_of_office is True:
+            skipped[login] = "out_of_office"
+            del people[login]
+        elif hours[login].out_of_office is None:
+            logger.warning(
+                "Reviewer availability is unknown; retaining candidate for normal eligibility checks",
+                extra={**extra, "github_login": login},
+            )
+    logger.info(
+        "Filtered reviewer candidates",
+        extra={**extra, "eligible": sorted(people), "skipped": skipped},
+    )
+    fallback = False
+    if area is None and candidates.coverage.areas:
+        if (area := candidates.first_open_area(request)) is None:
+            logger.info("Every code owner area already has a reviewer", extra=extra)
+            return None
+        fallback = True
+    if area is not None:
+        owners = {login: user for login, user in people.items() if login in area.owners}
+        logger.info(
+            "Narrowed reviewer candidates to a code owner area",
+            extra={**extra, "code_owners": list(area.handles), "eligible": sorted(owners)},
+        )
+        if owners or not fallback:
+            people = owners
+    if not people:
+        logger.info("No Open SWE user owns or recently changed these files", extra=extra)
+        return None
+    loads = await HumanReviewRequest.open_review_counts(
+        [user.id for user in people.values()], excluding=request.id
+    )
+    ranked = Candidate.rank(
+        [
+            Candidate(login, candidates.owned[login], candidates.touched[login], loads[user.id])
+            for login, user in people.items()
+        ]
+    )
+    now = datetime.now(UTC)
+    logger.info(
+        "Ranked reviewer candidates",
+        extra={
+            **extra,
+            "ranking": [
+                {
+                    "github_login": c.login,
+                    "owned": c.owned,
+                    "touched": c.touched,
+                    "open_reviews": c.open_reviews,
+                    "score": round(c.score, 3),
+                    "timezone": hours[c.login].zone_name,
+                    "on_shift": hours[c.login].on_shift(now),
+                    "next_start": hours[c.login].next_start(now).isoformat(),
+                }
+                for c in ranked
+            ],
+        },
+    )
+    by_start = sorted(ranked, key=lambda c: hours[c.login].next_start(now))
+    for candidate in by_start:
+        if not await pull.repo.can_write(candidate.login):
+            logger.info(
+                "Skipped a reviewer candidate without write access",
+                extra={**extra, "github_login": candidate.login},
+            )
+            continue
+        start = hours[candidate.login].next_start(now)
+        if start > now:
+            logger.info(
+                "No eligible reviewer is on shift; waiting for the first work day to start",
+                extra={**extra, "github_login": candidate.login, "until": start.isoformat()},
+            )
+            return Wait(candidate.login, start)
+        reason = candidate.reason(len(candidates.files))
+        logger.info(
+            "Picked a reviewer",
+            extra={
+                **extra,
+                "github_login": candidate.login,
+                "score": round(candidate.score, 3),
+                "owned": candidate.owned,
+                "touched": candidate.touched,
+                "open_reviews": candidate.open_reviews,
+            },
+        )
+        return Pick(people[candidate.login].login_for("github") or candidate.login, reason)
+    logger.info("No candidate reviewer has write access", extra=extra)
+    return None

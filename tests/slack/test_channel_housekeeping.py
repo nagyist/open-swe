@@ -1,0 +1,95 @@
+import json
+from typing import Any
+from unittest.mock import AsyncMock
+
+import pytest
+from fastapi import BackgroundTasks, Request
+
+from openswe.slack import routes as slack_routes
+from openswe.slack.payloads import SlackChannelContext
+
+JOIN = {
+    "type": "message",
+    "subtype": "channel_join",
+    "channel": "C-code",
+    "user": "U1",
+    "text": "<@U1> has joined the channel",
+    "ts": "1717171717.000100",
+    "event_ts": "1717171717.000100",
+}
+
+
+def _request(event: dict[str, Any]) -> Request:
+    body = json.dumps(
+        {
+            "type": "event_callback",
+            "event_id": "Ev1",
+            "authorizations": [{"user_id": "U-BOT"}],
+            "event": event,
+        }
+    ).encode()
+
+    async def receive() -> dict[str, Any]:
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    return Request(
+        {"type": "http", "method": "POST", "path": "/webhooks/slack", "headers": []}, receive
+    )
+
+
+@pytest.fixture
+def webhook(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    monkeypatch.setattr(
+        "openswe.incidents.channels.handle_slack_event", AsyncMock(return_value=None)
+    )
+    calls: dict[str, Any] = {
+        "verify_slack_signature": lambda **_: True,
+        "resolve_slack_channel_context": AsyncMock(
+            return_value=SlackChannelContext(
+                id="C-code", is_ext_shared=False, is_pending_ext_shared=False
+            )
+        ),
+        "claim_slack_event": AsyncMock(return_value=True),
+        "slack_event_already_seen": AsyncMock(return_value=False),
+        "lookup_slack_thread_id": AsyncMock(return_value="thread-code"),
+        "queue_message_for_thread": AsyncMock(return_value=True),
+        "resolve_slack_thread_id": AsyncMock(return_value="thread-code"),
+        "get_slack_repo_config": AsyncMock(return_value={"owner": "acme", "name": "billing"}),
+        "SLACK_BOT_USER_ID": "U-BOT",
+    }
+    monkeypatch.setattr(SlackChannelContext, "allows_operations", property(lambda _self: True))
+    for name, mock in calls.items():
+        monkeypatch.setattr(slack_routes.common, name, mock)
+    dispatched = AsyncMock()
+    monkeypatch.setattr(slack_routes.service, "process_slack_mention", dispatched)
+    monkeypatch.setattr(slack_routes, "is_listening_channel", AsyncMock(return_value=False))
+    return {**calls, "process_slack_mention": dispatched}
+
+
+async def _post(event: dict[str, Any]) -> tuple[dict[str, str], BackgroundTasks]:
+    tasks = BackgroundTasks()
+    response = await slack_routes.slack_webhook(_request(event), tasks)
+    for task in tasks.tasks:
+        await task()
+    return response, tasks
+
+
+@pytest.mark.parametrize(
+    "subtype",
+    ["channel_leave", "group_join", "channel_topic", "channel_name", "channel_purpose"],
+)
+async def test_the_channel_narrating_itself_is_never_a_request(
+    webhook: dict[str, Any], subtype: str
+) -> None:
+    response, _ = await _post({**JOIN, "subtype": subtype})
+
+    assert response["reason"] == "Slack channel housekeeping, not a request"
+    webhook["process_slack_mention"].assert_not_awaited()
+
+
+async def test_an_ordinary_message_still_reaches_the_session(webhook: dict[str, Any]) -> None:
+    ordinary = {key: value for key, value in JOIN.items() if key != "subtype"}
+    await _post({**ordinary, "text": "<@U-BOT> what is the status?"})
+
+    webhook["process_slack_mention"].assert_awaited_once()
+    webhook["queue_message_for_thread"].assert_not_awaited()

@@ -1,0 +1,108 @@
+import type {
+  AgentStream,
+  RoutedModel,
+  StreamConnection,
+} from "@/features/agents/lib/stream/connection"
+import type {
+  QueuedTurn,
+  SubagentToolCall,
+  TranscriptToolCallState,
+} from "@/features/agents/lib/transcript/reducer"
+import type { ImageChunk, Message } from "@/features/agents/lib/types"
+import type { PassageReply } from "@/features/agents/utils/passageReply"
+import type { ContextUsage } from "@/features/agents/lib/contextUsage"
+
+/** The human message and run configuration a new run starts from. */
+export interface ThreadRunInput {
+  /** Omitted for a message-less run such as `/offload`. */
+  message?: {
+    /** Client-minted id, shared by the graph's message and the transcript row. */
+    id: string
+    text: string
+    images?: ReadonlyArray<ImageChunk>
+    replies?: ReadonlyArray<PassageReply>
+  }
+  configurable: Record<string, unknown>
+  /**
+   * Hold the message until the live run ends instead of steering it. The
+   * server makes it a run of its own that starts when the thread goes idle.
+   */
+  enqueue?: boolean
+  onAccepted?: () => void
+  onRejected?: (error: unknown) => void
+}
+
+interface ThreadSourceShared {
+  threadId: string
+  /** The transcript this client holds, as rows the message renderers understand. */
+  messages: Array<Message>
+  /**
+   * The view renders `messages` from this index on. A source that holds a long
+   * thread whole paints only its newest turns; `loadOlder` moves this back.
+   */
+  shownFrom: number
+  /**
+   * Follow-ups queued behind the live run, oldest first. Server truth: they
+   * survive a reload and show in every tab. Empty for sources without a queue.
+   */
+  queued: ReadonlyArray<QueuedTurn>
+  /** A run is live as this client sees it. */
+  isRunning: boolean
+  /** The one-time transcript load has not produced anything yet. */
+  isHydrating: boolean
+  /** Settles with that load; a rejection means the transcript is unavailable. */
+  hydration: Promise<unknown>
+  error: unknown
+  isOffloading: boolean
+  routed: RoutedModel | null
+  connection: StreamConnection
+  /** Context size and model the last model call reported, when the source knows them. */
+  contextUsage: ContextUsage | null
+  /**
+   * Start a run. A rejection means the run could not be started; resolution
+   * says nothing about the run finishing (the SDK stream resolves only when it
+   * does, the transcript log as soon as the command is accepted).
+   */
+  startRun: (input: ThreadRunInput) => Promise<void>
+  /** Cancel the live run. Resolves with whether the server accepted it. */
+  stop: () => Promise<boolean>
+  /**
+   * The thread has turns older than the ones shown. Sources that always show
+   * the whole thread report false and a `loadOlder` that does nothing, so a
+   * reader never has to branch on `kind`.
+   */
+  hasOlder: boolean
+  isLoadingOlder: boolean
+  /** Show the next page of older turns. A no-op while one is in flight. */
+  loadOlder: () => void
+  /** Show every older turn at once, offered only by a source that holds them all. */
+  loadAllOlder?: () => void
+}
+
+/** The thread is served by the SDK's `useStream`. */
+export interface StreamThreadSource extends ThreadSourceShared {
+  kind: "stream"
+  stream: AgentStream
+  /**
+   * Cancel one entry from the SDK's own submission queue, by
+   * `queued[].turnId` — keeps the local store in sync, unlike a plain
+   * run-cancel REST call (which leaves it stale until the next hydrate).
+   */
+  cancelQueued: (id: string) => Promise<boolean>
+}
+
+/** The thread is served by the append-only transcript event log. */
+export interface TranscriptThreadSource extends ThreadSourceShared {
+  kind: "transcript"
+  settledRunId: string | null
+  /** Nested tool calls under a subagent namespace, for the subagent card. */
+  subagentToolCalls: (
+    namespace: ReadonlyArray<string>
+  ) => Array<SubagentToolCall>
+  /** A subagent's own transcript: what it said and did under its namespace. */
+  subagentMessages: (namespace: ReadonlyArray<string>) => Array<Message>
+  /** The `task` call that spawned a subagent, or null when there is none. */
+  subagentTask: (toolCallId: string) => TranscriptToolCallState | null
+}
+
+export type ThreadSource = StreamThreadSource | TranscriptThreadSource

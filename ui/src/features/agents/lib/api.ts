@@ -1,0 +1,641 @@
+import { productAnalytics } from "@/lib/analytics"
+import type {
+  AgentPullRequestContextResponse,
+  ThreadFixScope,
+  AgentPullRequestStatusResponse,
+  AgentBackgroundOutput,
+  AgentBackgroundWork,
+  AgentQueuedMessage,
+  AgentSchedule,
+  AgentThread,
+  Message,
+  AutomationTriggerConfig,
+  WorkflowPushApprovalsResponse,
+} from "./types"
+import type { WorkspaceFileIndex, WorkspacePath } from "./workspaceFiles"
+import { dashboardApiBase } from "@/lib/api-base"
+import {
+  DashboardRequestError,
+  REQUEST_ID_HEADER,
+  dashboardApiUrl,
+  dashboardForwardedHeaders,
+  networkError,
+  newRequestId,
+} from "@/lib/dashboard-fetch"
+import { withRequestTiming } from "@/lib/perf/fetchTiming"
+
+export type { AgentSchedule, AgentThread, Message }
+
+export class AgentsApiError extends DashboardRequestError {
+  constructor(status: number, message: string, requestId?: string) {
+    super(status, message, requestId)
+    this.name = "AgentsApiError"
+  }
+
+  /** A failed response, named by its `detail` when the body has one. */
+  static async fromResponse(
+    response: Response,
+    requestId?: string
+  ): Promise<AgentsApiError> {
+    let message = response.statusText
+    try {
+      const body: unknown = await response.json()
+      const detail =
+        body !== null && typeof body === "object" && "detail" in body
+          ? (body as { detail: unknown }).detail
+          : undefined
+      if (typeof detail === "string" && detail) message = detail
+      else if (detail !== undefined) message = JSON.stringify(detail)
+    } catch {
+      // Not a JSON error body; the status text is all we have.
+    }
+    return new AgentsApiError(response.status, message, requestId)
+  }
+}
+
+export interface ScheduleCreateRequest {
+  prompt: string
+  /** Every trigger, any of which fires the automation; replaces them all on update. */
+  triggers?: Array<AutomationTriggerConfig>
+  name?: string | null
+  admin_thread?: boolean
+  model_id?: string | null
+  effort?: string | null
+  /** Robin's, not the creator's: admins only, unbounded. */
+  system?: boolean
+}
+
+export interface ScheduleUpdateRequest {
+  prompt?: string | null
+  /** Every trigger, any of which fires the automation; replaces them all on update. */
+  triggers?: Array<AutomationTriggerConfig>
+  name?: string | null
+  admin_thread?: boolean
+  model_id?: string | null
+  effort?: string | null
+  enabled?: boolean | null
+  system?: boolean
+}
+
+export interface ScheduleTriggerResult {
+  status: "started"
+  schedule_id: string
+  thread_id: string
+  run_id: string | null
+}
+
+export interface ThreadPrDiffFile {
+  path: string
+  previousPath: string | null
+  status: "added" | "removed" | "modified" | "renamed" | string
+  additions: number
+  deletions: number
+  originalContent: string | null
+  modifiedContent: string | null
+  patch?: string | null
+  unrenderable: boolean
+}
+
+export interface ThreadBranchDiff {
+  prNumber: number | null
+  baseRef: string
+  headRef: string | null
+  baseSha: string
+  headSha: string
+  truncated: boolean
+  files: Array<ThreadPrDiffFile>
+}
+
+/** Files changed by a thread run. */
+export interface ThreadTurnDiff {
+  status: "ready" | "missing" | "error"
+  truncated: boolean
+  summary: {
+    files: number
+    additions: number
+    deletions: number
+  }
+  files: Array<ThreadPrDiffFile>
+}
+
+export interface ThreadRecoveryPatch {
+  blob: Blob
+  filename: string
+}
+
+export interface CloudTerminalConnection {
+  url: string
+  protocol: string
+  ticket: string
+}
+
+export interface ThreadBrowserTab {
+  id: string
+  title: string
+  url: string
+}
+
+/** The window of its LangSmith browser a thread's agent drives, as the dashboard embeds it. */
+export interface ThreadBrowser {
+  tabs: Array<ThreadBrowserTab>
+  /** LangSmith's page for the window, minted for the dashboard to frame. */
+  act_url: string
+  expires_at: string
+}
+
+/** A tool the page offers Robin, as a message's `page_tools` carries it. */
+export interface PageToolOffer {
+  name: string
+  description: string
+  parameters: object
+}
+
+/** A command Robin queued for this tab's page, under the page's own name for its tool. */
+export interface PageCommand {
+  position: number
+  tool: string
+  arguments: Record<string, unknown>
+}
+
+export interface PageQueue {
+  /** The invalidation topic the queue changes under. */
+  topic: string
+  commands: Array<PageCommand>
+}
+
+export type ThreadScope = "all" | "interactive" | "automation" | "bot"
+export type ThreadSortBy = "created_at" | "updated_at"
+
+export interface ThreadsPageParams {
+  hierarchy?: boolean
+  limit?: number
+  offset?: number
+  all?: boolean
+  resolved?: boolean
+  viewed?: boolean
+  source?: string
+  status?: string
+  q?: string
+  scope?: ThreadScope
+  automationId?: string
+  /** An allowed Slack bot's `team_id:bot_id`, with `scope: "bot"`. */
+  bot?: string
+  repo?: string
+  /** A project id, or `"none"` for threads outside every project. */
+  project?: string
+  ownerless?: boolean
+  owned?: boolean
+  /** Thread sources to leave out, such as `slack`. */
+  excludeSources?: Array<string>
+  sortBy?: ThreadSortBy
+}
+
+export interface ThreadsPage {
+  items: Array<AgentThread>
+  total?: number
+  limit: number
+  offset: number
+  hasMore?: boolean
+}
+
+export interface SidebarRepo {
+  repoFullName: string
+  name: string
+  updatedAt: number
+  projectId?: null
+}
+
+/** One of the viewer's projects, listed even before it has a thread. */
+export interface SidebarProjectFolder {
+  projectId: string
+  /** The repository bound to the project, whose threads it files. */
+  repoFullName: string | null
+  name: string
+  updatedAt: number
+}
+
+export type SidebarFolder = SidebarRepo | SidebarProjectFolder
+
+/** Where a file's bytes are served, relative to the dashboard API. */
+export interface ThreadFilePreviewLink {
+  path: string
+}
+
+const API_BASE = dashboardApiBase()
+
+export const agentsLangGraphApiUrl = `${API_BASE}/dashboard/api`
+
+const timedFetch = withRequestTiming((input, init) => fetch(input, init))
+const timedListFetch = withRequestTiming((input, init) => fetch(input, init), {
+  measureLists: true,
+})
+
+function errorDetailMessage(detail: unknown): string {
+  if (typeof detail === "string") return detail
+  if (Array.isArray(detail)) {
+    const messages = detail.flatMap((issue: unknown) => {
+      if (
+        !issue ||
+        typeof issue !== "object" ||
+        !("msg" in issue) ||
+        typeof issue.msg !== "string"
+      )
+        return []
+      const field =
+        "loc" in issue && Array.isArray(issue.loc)
+          ? issue.loc
+              .slice(1)
+              .filter(
+                (part: unknown) =>
+                  typeof part === "string" || typeof part === "number"
+              )
+              .join(".")
+          : ""
+      if (
+        field === "name" &&
+        "type" in issue &&
+        issue.type === "string_too_long" &&
+        "ctx" in issue &&
+        issue.ctx &&
+        typeof issue.ctx === "object" &&
+        "max_length" in issue.ctx &&
+        typeof issue.ctx.max_length === "number"
+      )
+        return [
+          `Please use a shorter name (${issue.ctx.max_length} characters or fewer)`,
+        ]
+      return [field ? `${field}: ${issue.msg}` : issue.msg]
+    })
+    if (messages.length) return messages.join("; ")
+  }
+  return JSON.stringify(detail) ?? "Request failed"
+}
+
+export async function agentsRequest<T>(
+  path: string,
+  init: RequestInit = {},
+  measureList = false
+): Promise<T> {
+  return productAnalytics.mutation(path, init.method, async () => {
+    const requestId = newRequestId()
+    const res = await (measureList ? timedListFetch : timedFetch)(
+      dashboardApiUrl(path),
+      {
+        ...init,
+        credentials: "include",
+        headers: {
+          "Content-Type": "application/json",
+          [REQUEST_ID_HEADER]: requestId,
+          ...dashboardForwardedHeaders(),
+          ...init.headers,
+        },
+      }
+    ).catch((cause: unknown) => {
+      throw networkError(cause, requestId)
+    })
+    if (!res.ok) {
+      let message = res.statusText
+      try {
+        const body = await res.json()
+        if (body?.detail) {
+          message = errorDetailMessage(body.detail)
+        }
+      } catch {
+        /* ignore */
+      }
+      throw new AgentsApiError(res.status, message, requestId)
+    }
+    // A proxied cancel comes back 202 with no body; only parse what is there.
+    const text = await res.text()
+    return (text ? JSON.parse(text) : undefined) as T
+  })
+}
+
+function filenameFromContentDisposition(value: string | null): string | null {
+  const match = /filename="([^"]+)"/.exec(value ?? "")
+  return match?.[1] ?? null
+}
+
+async function agentsBlobRequest(path: string): Promise<ThreadRecoveryPatch> {
+  const requestId = newRequestId()
+  const res = await fetch(dashboardApiUrl(path), {
+    credentials: "include",
+    headers: {
+      Accept: "text/x-diff",
+      [REQUEST_ID_HEADER]: requestId,
+      ...dashboardForwardedHeaders(),
+    },
+  }).catch((cause: unknown) => {
+    throw networkError(cause, requestId)
+  })
+  if (!res.ok) {
+    let message = res.statusText
+    try {
+      const body = await res.json()
+      if (body?.detail) {
+        message = errorDetailMessage(body.detail)
+      }
+    } catch {
+      /* ignore */
+    }
+    throw new AgentsApiError(res.status, message, requestId)
+  }
+  return {
+    blob: await res.blob(),
+    filename:
+      filenameFromContentDisposition(res.headers.get("content-disposition")) ??
+      "robin-recovery.patch",
+  }
+}
+
+function buildThreadsPageQuery(params: ThreadsPageParams): string {
+  const search = new URLSearchParams()
+  if (params.hierarchy != null)
+    search.set("hierarchy", String(params.hierarchy))
+  if (params.limit != null) search.set("limit", String(params.limit))
+  if (params.offset != null) search.set("offset", String(params.offset))
+  if (params.all != null) search.set("all", String(params.all))
+  if (params.resolved != null) search.set("resolved", String(params.resolved))
+  if (params.viewed != null) search.set("viewed", String(params.viewed))
+  if (params.source) search.set("source", params.source)
+  if (params.status) search.set("status", params.status)
+  if (params.q) search.set("q", params.q)
+  if (params.scope) search.set("scope", params.scope)
+  if (params.automationId) search.set("automation_id", params.automationId)
+  if (params.bot) search.set("bot", params.bot)
+  if (params.repo) search.set("repo", params.repo)
+  if (params.project) search.set("project", params.project)
+  if (params.ownerless != null)
+    search.set("ownerless", String(params.ownerless))
+  if (params.owned) search.set("owned", "true")
+  for (const source of params.excludeSources ?? [])
+    search.append("exclude_source", source)
+  if (params.sortBy) search.set("sort_by", params.sortBy)
+  const query = search.toString()
+  return query ? `?${query}` : ""
+}
+
+function buildReposQuery(params: {
+  includeResolved?: boolean
+  includeAutomations?: boolean
+  owned?: boolean
+  excludeSources?: Array<string>
+}): string {
+  const search = new URLSearchParams()
+  if (params.includeResolved != null)
+    search.set("include_resolved", String(params.includeResolved))
+  if (params.includeAutomations != null) {
+    search.set("include_automations", String(params.includeAutomations))
+  }
+  if (params.owned) search.set("owned", "true")
+  for (const source of params.excludeSources ?? [])
+    search.append("exclude_source", source)
+  const query = search.toString()
+  return query ? `?${query}` : ""
+}
+
+export type PullRequestCheckState =
+  | "failing"
+  | "passing"
+  | "pending"
+  | "unknown"
+
+export type PullRequestLiveState = "open" | "draft" | "merged" | "closed"
+
+/** Live GitHub truth for one PR, keyed `owner/repo#number`. */
+export interface PullRequestSnapshot {
+  checks: PullRequestCheckState
+  state: PullRequestLiveState | null
+}
+
+export const agentsApi = {
+  langGraphApiUrl: agentsLangGraphApiUrl,
+  listThreadRepos: (
+    params: {
+      includeResolved?: boolean
+      includeAutomations?: boolean
+      owned?: boolean
+      excludeSources?: Array<string>
+    } = {},
+    measure = false
+  ) =>
+    agentsRequest<Array<SidebarFolder>>(
+      `/threads/repos${buildReposQuery(params)}`,
+      {},
+      measure
+    ),
+  listPinnedThreads: (measure = false) =>
+    agentsRequest<Array<AgentThread>>("/threads/pinned", {}, measure),
+  reorderSidebarThreads: (body: {
+    thread_ids: Array<string>
+    project?: string
+    repo?: string
+    ownerless?: boolean
+  }) =>
+    agentsRequest<{ ok: boolean }>("/threads/order", {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
+  reorderPinnedThreads: (threadIds: Array<string>) =>
+    agentsRequest<{ ok: boolean }>("/threads/pinned/order", {
+      method: "PUT",
+      body: JSON.stringify({ thread_ids: threadIds }),
+    }),
+  listThreadsPage: (params: ThreadsPageParams = {}, measure = false) =>
+    agentsRequest<ThreadsPage>(
+      `/threads/page${buildThreadsPageQuery(params)}`,
+      {},
+      measure
+    ),
+  shareThread: (threadId: string) =>
+    agentsRequest<AgentThread>(
+      `/threads/${encodeURIComponent(threadId)}/share`,
+      { method: "POST" }
+    ),
+  continueThreadPrivately: (threadId: string) =>
+    agentsRequest<AgentThread>(
+      `/threads/${encodeURIComponent(threadId)}/continue-private`,
+      { method: "POST" }
+    ),
+  renameThread: (threadId: string, title: string) =>
+    agentsRequest<AgentThread>(`/threads/${encodeURIComponent(threadId)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ title }),
+    }),
+  resolveAllThreads: () =>
+    agentsRequest<{ resolved: number }>("/threads/resolve-all", {
+      method: "POST",
+    }),
+  resolveThread: (threadId: string, resolved: boolean) =>
+    agentsRequest<AgentThread>(
+      `/threads/${encodeURIComponent(threadId)}/resolve`,
+      {
+        method: "POST",
+        body: JSON.stringify({ resolved }),
+      }
+    ),
+  pinThread: (threadId: string, pinned: boolean) =>
+    agentsRequest<void>(`/threads/${encodeURIComponent(threadId)}/pin`, {
+      method: pinned ? "POST" : "DELETE",
+    }),
+  listSchedules: (allUsers = false) =>
+    agentsRequest<Array<AgentSchedule>>(
+      allUsers ? "/schedules?all_users=true" : "/schedules"
+    ),
+  createSchedule: (body: ScheduleCreateRequest) =>
+    agentsRequest<AgentSchedule>("/schedules", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  updateSchedule: (scheduleId: string, body: ScheduleUpdateRequest) =>
+    agentsRequest<AgentSchedule>(
+      `/schedules/${encodeURIComponent(scheduleId)}`,
+      {
+        method: "PATCH",
+        body: JSON.stringify(body),
+      }
+    ),
+  triggerSchedule: (scheduleId: string) =>
+    agentsRequest<ScheduleTriggerResult>(
+      `/schedules/${encodeURIComponent(scheduleId)}/trigger`,
+      { method: "POST" }
+    ),
+  deleteSchedule: (scheduleId: string) =>
+    agentsRequest<void>(`/schedules/${encodeURIComponent(scheduleId)}`, {
+      method: "DELETE",
+    }),
+  getThread: (threadId: string) =>
+    agentsRequest<AgentThread>(`/threads/${encodeURIComponent(threadId)}`),
+  setThreadViewed: (
+    threadId: string,
+    viewed: boolean,
+    responseId?: string | null
+  ) =>
+    agentsRequest<{ viewed: boolean }>(
+      `/threads/${encodeURIComponent(threadId)}/read-state`,
+      { method: "PUT", body: JSON.stringify({ viewed, responseId }) }
+    ),
+  getPullRequestChecks: (
+    pullRequests: Array<{ repoFullName: string; number: number }>
+  ) =>
+    agentsRequest<Record<string, PullRequestSnapshot>>(
+      "/threads/pull-request-checks",
+      { method: "POST", body: JSON.stringify({ pullRequests }) }
+    ),
+  getThreadPullRequestStatus: (threadId: string) =>
+    agentsRequest<AgentPullRequestStatusResponse>(
+      `/threads/${encodeURIComponent(threadId)}/pull-request-status`
+    ),
+  getThreadBackgroundWork: (threadId: string) =>
+    agentsRequest<AgentBackgroundWork>(
+      `/threads/${encodeURIComponent(threadId)}/background-work`
+    ),
+  getThreadBackgroundOutput: (threadId: string, taskId: string) =>
+    agentsRequest<AgentBackgroundOutput>(
+      `/threads/${encodeURIComponent(threadId)}/background-work/${encodeURIComponent(taskId)}/output`
+    ),
+  getThreadQueuedMessages: (threadId: string) =>
+    agentsRequest<Array<AgentQueuedMessage>>(
+      `/threads/${encodeURIComponent(threadId)}/queued-messages`
+    ),
+  getThreadPullRequestContext: (
+    threadId: string,
+    repoFullName: string,
+    number: number,
+    scope: ThreadFixScope
+  ) => {
+    const query = new URLSearchParams({
+      repo_full_name: repoFullName,
+      number: String(number),
+      scope,
+    })
+    return agentsRequest<AgentPullRequestContextResponse>(
+      `/threads/${encodeURIComponent(threadId)}/pull-request-context?${query}`
+    )
+  },
+  listWorkflowApprovals: (threadId: string) =>
+    agentsRequest<WorkflowPushApprovalsResponse>(
+      `/workflow-approval/${encodeURIComponent(threadId)}`
+    ),
+  approveWorkflowPush: (threadId: string, fingerprint: string) =>
+    agentsRequest<{ status: string; fingerprint: string }>(
+      `/workflow-approval/${encodeURIComponent(threadId)}/${encodeURIComponent(fingerprint)}/approve`,
+      { method: "POST" }
+    ),
+  rejectWorkflowPush: (threadId: string, fingerprint: string) =>
+    agentsRequest<{ status: string; fingerprint: string }>(
+      `/workflow-approval/${encodeURIComponent(threadId)}/${encodeURIComponent(fingerprint)}/reject`,
+      { method: "POST" }
+    ),
+  cancelRun: (threadId: string, runId: string) =>
+    agentsRequest<unknown>(
+      `/threads/${encodeURIComponent(threadId)}/runs/${encodeURIComponent(runId)}/cancel`,
+      { method: "POST" }
+    ),
+  cancelThread: (threadId: string) =>
+    agentsRequest<AgentThread>(
+      `/threads/${encodeURIComponent(threadId)}/cancel`,
+      {
+        method: "POST",
+      }
+    ),
+  adminCancelThread: (threadId: string) =>
+    agentsRequest<AgentThread>(
+      `/admin/threads/${encodeURIComponent(threadId)}/cancel`,
+      {
+        method: "POST",
+      }
+    ),
+  deleteThread: (threadId: string) =>
+    agentsRequest<void>(`/threads/${encodeURIComponent(threadId)}`, {
+      method: "DELETE",
+    }),
+  getThreadBranchDiff: (threadId: string) =>
+    agentsRequest<ThreadBranchDiff>(
+      `/threads/${encodeURIComponent(threadId)}/branch-diff`
+    ),
+  getThreadWorkingTreeDiff: (threadId: string) =>
+    agentsRequest<ThreadTurnDiff>(
+      `/threads/${encodeURIComponent(threadId)}/working-tree-diff`
+    ),
+  getThreadPath: (threadId: string, path: string) =>
+    agentsRequest<WorkspacePath>(
+      `/threads/${encodeURIComponent(threadId)}/files?path=${encodeURIComponent(path)}`
+    ),
+  createThreadFilePreview: (threadId: string, path: string) =>
+    agentsRequest<ThreadFilePreviewLink>(
+      `/threads/${encodeURIComponent(threadId)}/files/preview-url`,
+      { method: "POST", body: JSON.stringify({ path }) }
+    ),
+  getThreadFileIndex: (threadId: string) =>
+    agentsRequest<WorkspaceFileIndex>(
+      `/threads/${encodeURIComponent(threadId)}/file-index`
+    ),
+  downloadThreadRecoveryPatch: (threadId: string) =>
+    agentsBlobRequest(
+      `/threads/${encodeURIComponent(threadId)}/recovery.patch`
+    ),
+  connectCloudTerminal: (threadId: string) =>
+    agentsRequest<CloudTerminalConnection>(
+      `/threads/${encodeURIComponent(threadId)}/terminal/connect`,
+      { method: "POST" }
+    ),
+  getThreadBrowser: (threadId: string) =>
+    agentsRequest<ThreadBrowser>(
+      `/threads/${encodeURIComponent(threadId)}/browser`
+    ),
+  openThreadBrowser: (threadId: string) =>
+    agentsRequest<ThreadBrowser>(
+      `/threads/${encodeURIComponent(threadId)}/browser`,
+      { method: "POST" }
+    ),
+  pageCommands: (pageSession: string) =>
+    agentsRequest<PageQueue>(
+      `/page-sessions/${encodeURIComponent(pageSession)}/commands`
+    ),
+  recordPageCommand: (pageSession: string, position: number, result: unknown) =>
+    agentsRequest<void>(
+      `/page-sessions/${encodeURIComponent(pageSession)}/commands/${position}/result`,
+      { method: "POST", body: JSON.stringify({ result }) }
+    ),
+}

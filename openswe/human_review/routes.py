@@ -1,0 +1,199 @@
+"""Dashboard API for asking a repository's Slack review channel to review a pull request."""
+
+import logging
+from datetime import UTC, datetime
+from typing import Any, Literal
+
+from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel
+
+from openswe.audit_logs.middleware import audit_endpoint
+from openswe.dashboard.deps import SESSION_DEP
+from openswe.dashboard.repo_access import require_repo_access_for_user
+from openswe.github.http import GitHubClient, or_none
+from openswe.github.pull_request_status import (
+    OpenPullRequest,
+    OpenPullRequests,
+    pull_request_identity,
+)
+from openswe.github.pull_requests import PullRequestPayload
+from openswe.github.repo_files import RepoSettings
+from openswe.human_review.card import mention
+from openswe.human_review.dashboard import DashboardReviewRequest
+from openswe.human_review.lifecycle import ReviewCard
+from openswe.human_review.requests import HumanReviewRequest
+from openswe.human_review.review_queue import ReviewQueue
+from openswe.human_review.standard import Origin, RequestResult, review_blockers
+from openswe.slack.client import GitHubPrRef
+from openswe.users import User
+from openswe.utils.startup_trace import apm_span
+from openswe.utils.timing import RequestTimings
+
+logger = logging.getLogger(__name__)
+router = APIRouter(tags=["human-review"])
+
+
+@router.get("/review-assignments")
+async def api_review_assignments(
+    repo: str = "",
+    sort: Literal["created", "updated"] = "updated",
+    direction: Literal["asc", "desc"] = "desc",
+    page: int = Query(1, ge=1),
+    session: dict[str, str] = SESSION_DEP,
+) -> OpenPullRequests:
+    login = session["sub"]
+    repositories = {name.lower() for name in repo.split(",")} if repo else set()
+    if any(
+        pull_request_identity({"repo_full_name": name, "number": 1}) is None
+        for name in repositories
+    ):
+        raise HTTPException(422, "repository must be owner/repo")
+    user = await User.for_login("github", login)
+    rows: list[OpenPullRequest] = []
+    if user is not None:
+        async with GitHubClient.as_user(login) as github:
+            rows = await ReviewQueue(github, login, user, repositories).rows(sort, direction)
+    start = (page - 1) * 100
+    return OpenPullRequests(
+        pull_requests=rows[start : start + 100],
+        next_page=page + 1 if start + 100 < len(rows) else None,
+        incomplete=False,
+        updated_at=datetime.now(UTC).isoformat(),
+    )
+
+
+class HumanReviewRequestBody(BaseModel):
+    # Omitted, the card shows the start of the pull request's description.
+    inline_summary: str | None = None
+    channel: str = ""
+
+
+class HumanReviewDismissBody(BaseModel):
+    reason: str = ""
+
+
+class HumanReviewDismissResult(BaseModel):
+    request_id: str
+
+
+def _pr_ref(owner: str, repo: str, number: int) -> GitHubPrRef:
+    if pull_request_identity({"repo_full_name": f"{owner}/{repo}", "number": number}) is None:
+        raise HTTPException(422, "invalid pull request")
+    return GitHubPrRef(
+        owner=owner,
+        repo=repo,
+        number=number,
+        url=f"https://github.com/{owner}/{repo}/pull/{number}",
+    )
+
+
+class HumanReviewAvailability(BaseModel):
+    available: bool
+    active: bool
+    permalink: str = ""
+    # The open request is a draft's expedited card only its author can see until they mark it ready.
+    awaiting_ready: bool = False
+    blockers: list[str] = []
+
+
+@router.get("/repos/{owner}/{repo}/pulls/{number}/human-review")
+async def api_human_review_availability(
+    owner: str,
+    repo: str,
+    number: int,
+    session: dict[str, Any] = SESSION_DEP,
+    active_only: bool = False,
+) -> HumanReviewAvailability:
+    _pr_ref(owner, repo, number)
+    login = str(session["sub"])
+    await require_repo_access_for_user(login, f"{owner}/{repo}")
+    active = await HumanReviewRequest.active_for(owner, repo, number)
+    channel = ""
+    blockers = None
+    if not active_only:
+        async with GitHubClient.as_app(owner, repo) as github:
+            pull = github.repo(owner, repo).pull_request(number)
+            settings = await RepoSettings.cached(owner, repo)
+            payload = await or_none(pull.pull())
+            snapshot = PullRequestPayload.model_validate(payload) if payload is not None else None
+            if not settings.review_channel_rules and (snapshot is None or not snapshot.head_sha):
+                raise HTTPException(404, "Pull request is unavailable")
+            channel = await or_none(
+                settings.channel_for_pr(pull, snapshot=snapshot, for_display=True)
+            )
+            if channel is None:
+                raise HTTPException(404, "Pull request is unavailable")
+            blockers = None if active is not None else await review_blockers(pull, snapshot)
+    return HumanReviewAvailability(
+        available=bool(channel),
+        active=active is not None,
+        permalink=(
+            await active.permalink(await User.for_login("github", login))
+            if active is not None
+            else ""
+        ),
+        awaiting_ready=active is not None and active.awaiting_ready,
+        blockers=blockers or [],
+    )
+
+
+@router.post("/repos/{owner}/{repo}/pulls/{number}/human-review")
+@audit_endpoint
+async def api_request_human_review(
+    owner: str,
+    repo: str,
+    number: int,
+    body: HumanReviewRequestBody | None = None,
+    session: dict[str, Any] = SESSION_DEP,
+) -> RequestResult:
+    pr_ref = _pr_ref(owner, repo, number)
+    login = str(session["sub"])
+    span_tags = {"pull_request.url": pr_ref.url}
+    details: dict[str, object] = {"pull_request_url": pr_ref.url}
+    with RequestTimings.logged("Dashboard review request finished", details):
+        with apm_span("human_review.requester", span_tags):
+            requester = await User.for_login("github", login)
+        if requester is None:
+            raise HTTPException(403, "No Robin user record for this login")
+        with apm_span("human_review.repo_access", span_tags):
+            token = await require_repo_access_for_user(login, f"{owner}/{repo}")
+        options = body or HumanReviewRequestBody()
+        inline_summary = options.inline_summary
+        if inline_summary is not None and not inline_summary.strip():
+            raise HTTPException(422, "inline_summary must not be blank")
+        result = await DashboardReviewRequest(pr_ref, Origin(requester=requester), token).request(
+            channel=options.channel,
+            inline_summary=inline_summary,
+        )
+        details["success"] = result.success
+        details["reused"] = result.reused
+    if not result.success:
+        if result.retry_after_seconds is not None:
+            raise HTTPException(
+                503, result.error, headers={"Retry-After": str(result.retry_after_seconds)}
+            )
+        raise HTTPException(409, result.error)
+    return result
+
+
+@router.post("/repos/{owner}/{repo}/pulls/{number}/human-review/dismiss")
+@audit_endpoint
+async def api_dismiss_human_review_request(
+    owner: str,
+    repo: str,
+    number: int,
+    body: HumanReviewDismissBody | None = None,
+    session: dict[str, Any] = SESSION_DEP,
+) -> HumanReviewDismissResult:
+    """Take down a pull request's open review request, as its card's Dismiss button does."""
+    pr_ref = _pr_ref(owner, repo, number)
+    login = str(session["sub"])
+    await require_repo_access_for_user(login, f"{owner}/{repo}")
+    request = await HumanReviewRequest.active_for(pr_ref.owner, pr_ref.repo, pr_ref.number)
+    if request is None:
+        raise HTTPException(404, "This pull request has no open review request")
+    person = await User.for_login("github", login)
+    by = mention(person) if person is not None else f"@{login}"
+    if not await ReviewCard(request).dismiss_by(by, (body or HumanReviewDismissBody()).reason):
+        raise HTTPException(409, "This review request is already closed")
+    return HumanReviewDismissResult(request_id=str(request.id))

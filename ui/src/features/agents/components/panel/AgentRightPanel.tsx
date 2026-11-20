@@ -1,0 +1,447 @@
+import { useCallback, useEffect, useMemo, useState } from "react"
+import { IconButton } from "@langchain/macaw-components/IconButton"
+import { ArrowsInIcon } from "@phosphor-icons/react/dist/ssr/ArrowsIn"
+import { ArrowsOutIcon } from "@phosphor-icons/react/dist/ssr/ArrowsOut"
+import { SidebarSimpleIcon } from "@phosphor-icons/react/dist/ssr/SidebarSimple"
+import type { ReactNode } from "react"
+
+import type {
+  PanelThreadRef,
+  RightPanelSurface,
+} from "@/features/agents/lib/rightPanelStore"
+import type { TerminalGroupsController } from "@/features/agents/lib/terminalGroups"
+import type { TerminalTarget } from "@/features/agents/lib/terminalSession"
+import {
+  TerminalActions,
+  TerminalPanel,
+} from "@/features/agents/components/TerminalPanel"
+import { FilesPanel } from "@/features/agents/components/files/FilesPanel"
+import { RightPanelTabs } from "@/features/agents/components/panel/RightPanelTabs"
+import { RightPanelSheet } from "@/features/agents/components/panel/RightPanelSheet"
+import { RIGHT_PANEL_INLINE_LAYOUT_MEDIA_QUERY } from "@/features/agents/components/panel/rightPanelLayout"
+import {
+  selectThreadRightPanelState,
+  useRightPanelStore,
+} from "@/features/agents/lib/rightPanelStore"
+import { workspaceTargetKey } from "@/features/agents/lib/workspaceFiles"
+import { useRegisterAppCommands } from "@/lib/appCommands"
+import { cn } from "@/lib/utils"
+import { productAnalytics } from "@/lib/analytics"
+import type { PassageReply } from "@/features/agents/utils/passageReply"
+
+export interface AgentRightPanelProps {
+  threadRef: PanelThreadRef
+  terminals: TerminalGroupsController
+  terminalTarget: TerminalTarget
+  terminalAvailable: boolean
+  diffAvailable: boolean
+  /** Rendered for the Changes surface; `fullScreen` drives layout-only extras. */
+  renderDiff: (state: { fullScreen: boolean }) => ReactNode
+  /** Rendered for the Browser surface, which only cloud threads offer. */
+  renderBrowser?: () => ReactNode
+  browserAvailable?: boolean
+  /** Rendered for the Background work surface, which only cloud threads offer. */
+  renderBackgroundWork?: () => ReactNode
+  backgroundWorkAvailable?: boolean
+  /** Rendered for the App surface, once the thread's agent previews an app. */
+  renderApp?: () => ReactNode
+  renderArtifact?: () => ReactNode
+  collapsed: boolean
+  onCollapsedChange: (next: boolean) => void
+  onTerminalAddToChat?: (text: string) => void
+  /** Offers Reply on text selected in an open file. */
+  onReply?: (reply: PassageReply) => void
+  /** Whether the thread's run is going; an open file refreshes when it ends. */
+  running?: boolean
+}
+
+function useIsNarrowLayout(): boolean {
+  const [narrow, setNarrow] = useState(() =>
+    typeof window === "undefined"
+      ? false
+      : window.matchMedia(RIGHT_PANEL_INLINE_LAYOUT_MEDIA_QUERY).matches
+  )
+  useEffect(() => {
+    const media = window.matchMedia(RIGHT_PANEL_INLINE_LAYOUT_MEDIA_QUERY)
+    const onChange = () => setNarrow(media.matches)
+    onChange()
+    media.addEventListener("change", onChange)
+    return () => media.removeEventListener("change", onChange)
+  }, [])
+  return narrow
+}
+
+/**
+ * The right-hand column of a thread, and of the new-thread screen.
+ * Surfaces (changes, terminals) live in the right-panel store so
+ * a thread's tabs survive navigation; this component owns only the layout
+ * controls and the mapping from a surface to the component that renders it.
+ */
+export function AgentRightPanel(props: AgentRightPanelProps) {
+  const {
+    threadRef,
+    terminals,
+    terminalTarget,
+    terminalAvailable,
+    diffAvailable,
+    collapsed,
+    onCollapsedChange,
+  } = props
+
+  const byThreadKey = useRightPanelStore((state) => state.byThreadKey)
+  const openSurface = useRightPanelStore((state) => state.open)
+  const openTerminalSurface = useRightPanelStore((state) => state.openTerminal)
+  const openFileSurface = useRightPanelStore((state) => state.openFile)
+  const activateSurface = useRightPanelStore((state) => state.activateSurface)
+  const closeSurfaceById = useRightPanelStore((state) => state.closeSurface)
+  const closeOtherSurfaces = useRightPanelStore(
+    (state) => state.closeOtherSurfaces
+  )
+  const closeSurfacesToRight = useRightPanelStore(
+    (state) => state.closeSurfacesToRight
+  )
+  const closeAllSurfaces = useRightPanelStore((state) => state.closeAllSurfaces)
+  const reconcileTerminalSurfaces = useRightPanelStore(
+    (state) => state.reconcileTerminalSurfaces
+  )
+
+  const panelState = useMemo(
+    () => selectThreadRightPanelState(byThreadKey, threadRef),
+    [byThreadKey, threadRef]
+  )
+  const surfaces = panelState.surfaces
+  const activeSurfaceId = panelState.activeSurfaceId
+  const activeSurface =
+    surfaces.find((surface) => surface.id === activeSurfaceId) ?? null
+
+  const [maximized, setMaximized] = useState(false)
+  const narrow = useIsNarrowLayout()
+
+  useEffect(
+    () =>
+      useRightPanelStore.subscribe((state, previous) => {
+        const before = selectThreadRightPanelState(
+          previous.byThreadKey,
+          threadRef
+        )
+        const after = selectThreadRightPanelState(state.byThreadKey, threadRef)
+        if (before.surfaces.length > 0 && after.surfaces.length === 0) {
+          setMaximized(false)
+          onCollapsedChange(true)
+        }
+      }),
+    [onCollapsedChange, threadRef]
+  )
+
+  // Terminal groups are the source of truth for which terminal surfaces exist:
+  // a pty closed from inside the terminal must not leave a dead tab behind.
+  const terminalGroupIds = terminals.state.terminalGroups
+    .map((group) => group.id)
+    .join(",")
+  useEffect(() => {
+    reconcileTerminalSurfaces(
+      threadRef,
+      terminalGroupIds ? terminalGroupIds.split(",") : []
+    )
+  }, [reconcileTerminalSurfaces, terminalGroupIds, threadRef])
+
+  const handleAddTerminal = useCallback(() => {
+    openTerminalSurface(threadRef, terminals.addGroup())
+  }, [openTerminalSurface, terminals, threadRef])
+
+  const handleAddDiff = useCallback(() => {
+    openSurface(threadRef, "diff")
+  }, [openSurface, threadRef])
+
+  const handleAddFiles = useCallback(() => {
+    openSurface(threadRef, "files")
+  }, [openSurface, threadRef])
+
+  const handleAddBrowser = useCallback(() => {
+    openSurface(threadRef, "preview")
+  }, [openSurface, threadRef])
+
+  const handleAddBackgroundWork = useCallback(() => {
+    openSurface(threadRef, "background")
+  }, [openSurface, threadRef])
+
+  const handleAddApp = useCallback(() => {
+    openSurface(threadRef, "app")
+  }, [openSurface, threadRef])
+
+  const handleActivate = useCallback(
+    (surface: RightPanelSurface) => {
+      activateSurface(threadRef, surface.id)
+      if (surface.kind !== "terminal") return
+      const groupId = surface.resourceId
+      const terminalId = terminals.state.terminalGroups.find(
+        (group) => group.id === groupId
+      )?.terminalIds[0]
+      if (terminalId) terminals.focus(terminalId)
+    },
+    [activateSurface, terminals, threadRef]
+  )
+
+  const handleCloseSurface = useCallback(
+    (surface: RightPanelSurface) => {
+      if (surface.kind === "terminal") {
+        // The pty owns the tab: only drop the surface once it is really gone.
+        void terminals.closeGroup(surface.resourceId).then((closed) => {
+          if (closed) closeSurfaceById(threadRef, surface.id)
+        })
+        return
+      }
+      closeSurfaceById(threadRef, surface.id)
+    },
+    [closeSurfaceById, terminals, threadRef]
+  )
+
+  const toggleTerminal = useCallback(() => {
+    if (!collapsed && activeSurface?.kind === "terminal") {
+      onCollapsedChange(true)
+      return
+    }
+    onCollapsedChange(false)
+    productAnalytics.featureOpened("terminal")
+    const existing = surfaces.find((surface) => surface.kind === "terminal")
+    if (existing) handleActivate(existing)
+    else handleAddTerminal()
+  }, [
+    activeSurface?.kind,
+    collapsed,
+    handleActivate,
+    handleAddTerminal,
+    onCollapsedChange,
+    surfaces,
+  ])
+
+  useRegisterAppCommands(
+    useMemo(
+      () => [
+        {
+          id: "toggle-work-panel",
+          label: "Toggle work panel",
+          aliases: ["show panel", "hide panel", "right panel"],
+          shortcuts: ["mod+alt+b"],
+          group: "Workspace",
+          run: () => onCollapsedChange(!collapsed),
+        },
+        ...(diffAvailable
+          ? [
+              {
+                id: "toggle-changes",
+                label: "Toggle changes",
+                aliases: ["diff", "review changes"],
+                shortcuts: ["mod+d"],
+                group: "Workspace",
+                run: () => {
+                  if (!collapsed && activeSurface?.kind === "diff") {
+                    onCollapsedChange(true)
+                  } else {
+                    productAnalytics.featureOpened("diff")
+                    onCollapsedChange(false)
+                    handleAddDiff()
+                  }
+                },
+              },
+            ]
+          : []),
+        ...(terminalAvailable
+          ? [
+              {
+                id: "toggle-terminal",
+                label: "Toggle terminal",
+                aliases: ["open terminal", "hide terminal"],
+                shortcuts: ["mod+j", "ctrl+`"],
+                group: "Workspace",
+                run: toggleTerminal,
+              },
+            ]
+          : []),
+      ],
+      [
+        activeSurface?.kind,
+        collapsed,
+        diffAvailable,
+        handleAddDiff,
+        onCollapsedChange,
+        terminalAvailable,
+        toggleTerminal,
+      ]
+    )
+  )
+
+  const showPanel = (
+    <IconButton
+      className="fixed top-2 right-2 z-sidebar size-7"
+      color="secondary"
+      icon={SidebarSimpleIcon}
+      label="Show panel"
+      onClick={() => onCollapsedChange(false)}
+      tooltipProps={{ side: "left" }}
+      variant="plain"
+    />
+  )
+  // An app answers the agent's calls to its tools from its frame, so while
+  // one is open the inline panel collapses out of sight instead of unmounting.
+  const keepsApp =
+    !narrow &&
+    props.renderApp !== undefined &&
+    surfaces.some((surface) => surface.kind === "app")
+  if (collapsed && !keepsApp) return showPanel
+  const shown = collapsed ? null : activeSurface
+
+  const layoutControls = (
+    <div className="flex shrink-0 items-center">
+      {activeSurface?.kind === "terminal" ? (
+        <TerminalActions
+          groupId={activeSurface.resourceId}
+          terminals={terminals}
+        />
+      ) : null}
+      {narrow ? null : (
+        <IconButton
+          className="size-7"
+          color="secondary"
+          icon={maximized ? ArrowsInIcon : ArrowsOutIcon}
+          label={maximized ? "Exit full screen" : "Expand panel"}
+          onClick={() => setMaximized((value) => !value)}
+          variant="plain"
+        />
+      )}
+      <IconButton
+        className="size-7"
+        color="secondary"
+        icon={SidebarSimpleIcon}
+        label="Hide panel"
+        onClick={() => {
+          setMaximized(false)
+          onCollapsedChange(true)
+        }}
+        variant="plain"
+      />
+    </div>
+  )
+
+  const body = (
+    <>
+      {shown?.kind === "artifact" ? props.renderArtifact?.() : null}
+      {shown?.kind === "diff"
+        ? props.renderDiff({ fullScreen: maximized })
+        : null}
+      {shown?.kind === "preview" && props.renderBrowser
+        ? props.renderBrowser()
+        : null}
+      {shown?.kind === "background" && props.renderBackgroundWork
+        ? props.renderBackgroundWork()
+        : null}
+      {/* The app stays mounted while hidden, behind another tab or in the
+          collapsed panel, so it keeps its state and goes on answering the
+          agent's calls to its tools. */}
+      {props.renderApp && surfaces.some((surface) => surface.kind === "app") ? (
+        <div
+          className={cn(
+            "flex min-h-0 flex-1 flex-col",
+            shown?.kind !== "app" && "hidden"
+          )}
+        >
+          {props.renderApp()}
+        </div>
+      ) : null}
+      {shown?.kind === "files" || shown?.kind === "file" ? (
+        <FilesPanel
+          key={workspaceTargetKey(terminalTarget)}
+          target={terminalTarget}
+          relativePath={shown.kind === "file" ? shown.relativePath : null}
+          revealRequestId={shown.kind === "file" ? shown.revealRequestId : 0}
+          onOpenFile={(path) => openFileSurface(threadRef, path)}
+          onReply={props.onReply}
+          running={props.running}
+        />
+      ) : null}
+      {/* Terminals stay mounted while hidden so their scrollback survives tab
+          switches; every other surface unmounts. */}
+      {surfaces
+        .filter((surface) => surface.kind === "terminal")
+        .map((surface) => (
+          <div
+            key={surface.id}
+            className={cn(
+              "min-h-0 flex-1",
+              surface.id !== activeSurfaceId && "hidden"
+            )}
+          >
+            <TerminalPanel
+              target={terminalTarget}
+              groupId={surface.resourceId}
+              terminals={terminals}
+              {...(props.onTerminalAddToChat
+                ? { onAddToChat: props.onTerminalAddToChat }
+                : {})}
+            />
+          </div>
+        ))}
+    </>
+  )
+
+  const tabs = (
+    <RightPanelTabs
+      mode={narrow ? "sheet" : "inline"}
+      maximized={maximized}
+      surfaces={surfaces}
+      activeSurfaceId={activeSurfaceId}
+      pendingSurfaceIds={EMPTY_PENDING_SURFACE_IDS}
+      onActivate={handleActivate}
+      onCloseSurface={handleCloseSurface}
+      onCloseOtherSurfaces={(surface) =>
+        closeOtherSurfaces(threadRef, surface.id)
+      }
+      onCloseSurfacesToRight={(surface) =>
+        closeSurfacesToRight(threadRef, surface.id)
+      }
+      onCloseAllSurfaces={() => closeAllSurfaces(threadRef)}
+      onCopyFilePath={(relativePath) => {
+        const nav = navigator as { clipboard?: Clipboard }
+        if (nav.clipboard) void nav.clipboard.writeText(relativePath)
+      }}
+      onAddTerminal={handleAddTerminal}
+      onAddDiff={handleAddDiff}
+      onAddFiles={handleAddFiles}
+      {...(props.renderBrowser
+        ? {
+            onAddBrowser: handleAddBrowser,
+            browserAvailable: props.browserAvailable ?? false,
+          }
+        : {})}
+      {...(props.renderBackgroundWork
+        ? {
+            onAddBackgroundWork: handleAddBackgroundWork,
+            backgroundWorkAvailable: props.backgroundWorkAvailable ?? false,
+          }
+        : {})}
+      {...(props.renderApp ? { onAddApp: handleAddApp } : {})}
+      terminalAvailable={terminalAvailable}
+      diffAvailable={diffAvailable}
+      layoutControls={layoutControls}
+      hidden={collapsed}
+    >
+      {body}
+    </RightPanelTabs>
+  )
+
+  if (narrow) {
+    return (
+      <RightPanelSheet open onClose={() => onCollapsedChange(true)}>
+        {tabs}
+      </RightPanelSheet>
+    )
+  }
+  return (
+    <>
+      {collapsed && showPanel}
+      {tabs}
+    </>
+  )
+}
+
+const EMPTY_PENDING_SURFACE_IDS: ReadonlySet<string> = new Set<string>()

@@ -1,0 +1,104 @@
+{
+  "name": "open-swe-desktop",
+  "version": "0.3.20",
+  "private": true,
+  "description": "Experimental Robin desktop client",
+  "main": "build/main.cjs",
+  "scripts": {
+    "build": "node scripts/build-main.cts",
+    "build:ui": "pnpm --filter open-swe-dashboard run build",
+    "dev": "pnpm run build && electron . --dev",
+    "start": "pnpm run build && electron .",
+    "test:run": "node --test test/*.test.cts test/*.test.ts",
+    "test": "pnpm run build && pnpm run test:run",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "check": "pnpm run typecheck && pnpm run test",
+    "pack": "pnpm run build && pnpm run build:cli && electron-builder --dir",
+    "dist": "pnpm run build && pnpm run build:cli && electron-builder",
+    "build:cli": "pnpm --filter open-swe-cli run build"
+  },
+  "build": {
+    "appId": "com.langchain.openswe",
+    "productName": "Robin",
+    "publish": {
+      "provider": "github",
+      "owner": "langchain-ai",
+      "repo": "open-swe"
+    },
+    "asar": true,
+    "npmRebuild": true,
+    "icon": "../ui/public/logo-mark.png",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "build/**/*",
+      "src/setup.html",
+      "src/approval-panel.html",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "resources/app-update.yml",
+        "to": "app-update.yml"
+      },
+      {
+        "from": "../ui/public/logo-mark.png",
+        "to": "icon.png"
+      },
+      {
+        "from": "../cli/dist/robin",
+        "to": "bin/robin"
+      },
+      {
+        "from": "../cli/dist/oswe",
+        "to": "bin/oswe"
+      }
+    ],
+    "mac": {
+      "icon": "../mobile/assets/icon.icon",
+      "category": "public.app-category.developer-tools",
+      "artifactName": "Robin-${version}-${arch}-mac.${ext}",
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "entitlements": "entitlements.mac.plist",
+      "extendInfo": {
+        "NSUserActivityTypes": [
+          "NSUserActivityTypeBrowsingWeb"
+        ]
+      },
+      "entitlementsInherit": "entitlements.mac.inherit.plist",
+      "target": [
+        "dmg",
+        "zip"
+      ]
+    },
+    "dmg": {
+      "size": "2g"
+    },
+    "win": {
+      "target": [
+        "nsis"
+      ]
+    },
+    "linux": {
+      "category": "Development",
+      "target": [
+        "AppImage"
+      ]
+    }
+  },
+  "author": "LangChain",
+  "license": "MIT",
+  "homepage": "https://github.com/langchain-ai/open-swe",
+  "devDependencies": {
+    "@types/node": "26.6.3",
+    "electron": "44.9.1",
+    "electron-builder": "26.15.3",
+    "typescript": "7.0.2"
+  },
+  "dependencies": {
+    "electron-updater": "6.8.9",
+    "open-swe-bridge-client": "workspace:*"
+  }
+}

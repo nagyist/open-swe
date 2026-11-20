@@ -1,0 +1,73 @@
+import { Button } from "@langchain/macaw-components/Button"
+import { Input } from "@langchain/macaw-components/Input"
+import { useId, useState } from "react"
+
+import { parsePullRequestInput } from "../lib/pullRequest"
+import { useRouter } from "../lib/router"
+
+/** Opens the Design QA page of a pull request someone types or pastes, once they submit it. */
+export function OpenPullRequestInput({
+  shared,
+}: {
+  shared: readonly string[]
+}) {
+  const { navigate } = useRouter()
+  const hintId = useId()
+  const [value, setValue] = useState("")
+  const [invalid, setInvalid] = useState(false)
+  const numbers = shared.length === 1
+
+  const open = (text: string) => {
+    const pr = parsePullRequestInput(text, shared)
+    if (!pr) {
+      setInvalid(text.trim().length > 0)
+      return
+    }
+    setValue("")
+    setInvalid(false)
+    navigate({ page: "pull", pr, run: null })
+  }
+
+  return (
+    <form
+      className="w-full"
+      onSubmit={(event) => {
+        event.preventDefault()
+        open(value)
+      }}
+    >
+      <div className="flex items-start gap-space-2">
+        <Input
+          size="sm"
+          className="min-w-0 flex-1"
+          debounceMs={0}
+          aria-label="Open Design QA for a pull request"
+          isError={invalid}
+          aria-describedby={invalid ? hintId : undefined}
+          placeholder={
+            numbers ? "PR number or link" : "owner/repo#123 or PR link"
+          }
+          value={value}
+          onChange={(next) => {
+            setValue(next)
+            setInvalid(false)
+          }}
+        />
+        <Button size="sm" type="submit">
+          Open PR
+        </Button>
+      </div>
+      {invalid && (
+        <p
+          id={hintId}
+          role="alert"
+          className="mt-space-2 text-xs text-error-secondary"
+        >
+          {numbers
+            ? "Enter a PR number, owner/repo#123, or a GitHub PR link."
+            : "Enter owner/repo#123 or a GitHub PR link. A bare number works when you share a single repository."}
+        </p>
+      )}
+    </form>
+  )
+}

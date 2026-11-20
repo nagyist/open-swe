@@ -1,0 +1,224 @@
+"""FastAPI application composition."""
+
+import asyncio
+import logging
+from collections.abc import AsyncIterator
+from contextlib import AsyncExitStack, asynccontextmanager
+
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import JSONResponse
+from starlette.routing import Route
+
+from openswe.agent_api import server as agent_api_server
+from openswe.api.github_errors import add_github_error_handlers
+from openswe.api.health import router as health_router
+from openswe.api.public_origin import PublicOriginMiddleware
+from openswe.api.request_ids import add_request_ids
+from openswe.api.tracing import configure_datadog_environment
+from openswe.audit_logs.middleware import AuditLogMiddleware
+from openswe.config import ENV
+from openswe.dashboard import router as dashboard_router
+from openswe.mcp import server as agent_mcp_server
+from openswe.mda_channels.api import router as mda_channel_api_router
+from openswe.mda_channels.github_deliveries import router as mda_github_deliveries_router
+from openswe.mda_channels.resolve_user import router as mda_resolve_user_router
+from openswe.mda_channels.slack_channel_events import router as mda_slack_channel_events_router
+from openswe.review.eval_report_routes import router as reviewer_eval_report_router
+from openswe.rollout_events import router as rollout_webhook_router
+from openswe.sandboxes.tool_routes import router as sandbox_tool_router
+from openswe.short_links.routes import router as short_link_router
+from openswe.slack.routes import router as slack_webhook_router
+from openswe.threads.plan_api import plan_router
+from openswe.threads.router import ThreadRouter
+from openswe.threads.runs_api import JOIN_HEADER, STEERED_HEADER
+from openswe.threads.workflow_approval_api import workflow_approval_router
+from openswe.users.authorization import AccountConflict
+from openswe.users.records import UnknownUser
+from openswe.utils.dashboard_ui import mount_dashboard_ui
+from openswe.utils.event_loop import pin_single_event_loop, watch_for_stalls
+from openswe.utils.http_pool import close_pool as close_http_pool
+
+logger = logging.getLogger(__name__)
+
+# Before the queue starts: it reads this when it builds its workers, and Open SWE
+# cannot survive them landing on different loops.
+pin_single_event_loop()
+
+AGENT_MCP = agent_mcp_server.build_mount()
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    from openswe import database
+    from openswe.agent_api.client import validate_mda_startup_config
+    from openswe.analytics.worker import start_worker, stop_worker
+    from openswe.bridge import listener as bridge_listener
+    from openswe.dashboard.admin import configured_admins
+    from openswe.dashboard.oauth import validate_github_login_allowlist
+    from openswe.database.analytics import activate_reporting, load_workspace
+    from openswe.database.notifications import LISTENER
+    from openswe.jobs.kinds import SEGMENT_WORKER, start_jobs
+    from openswe.jobs.kinds import WORKER as JOB_WORKER
+    from openswe.jobs.worker import WorkerShutdown
+    from openswe.plugins.rooms import ROOMS as PLUGIN_ROOMS
+    from openswe.review.styles import delete_analyzer_crons
+    from openswe.sandboxes.providers.registry import validate_sandbox_startup_config
+    from openswe.slack.http import validate_slack_startup_config
+    from openswe.threads.local_writes import LOCAL_WRITES
+    from openswe.transcript import listener as transcript_listener
+    from openswe.ui_invalidations.hub import HUB
+    from openswe.users import User
+    from openswe.utils.datadog_spans import DatadogSpans
+
+    pin_single_event_loop()
+    # Before any request: a LangSmith detailed trace takes Datadog's spans from here on.
+    DatadogSpans.install()
+    validate_github_login_allowlist()
+    validate_sandbox_startup_config()
+    validate_mda_startup_config()
+    validate_slack_startup_config()
+    # Before anything is served: no thread or run is ever made on this Agent Server.
+    LOCAL_WRITES.seal()
+    database.require_configured()
+    await database.migrate()
+    try:
+        # The review-style analyzer is gone; its nightly crons would fail every run.
+        await delete_analyzer_crons()
+    except Exception:  # noqa: BLE001
+        logger.exception("Deleting review-style analyzer crons failed")
+    if admins := configured_admins():
+        await User.sync_admins(admins)
+    try:
+        await load_workspace()
+        await activate_reporting()
+        await start_worker()
+    except Exception:  # noqa: BLE001
+        logger.warning("Analytics startup failed", exc_info=True)
+    try:
+        await transcript_listener.start()
+    except Exception:  # noqa: BLE001
+        # Transcript readers fall back to in-process notifications; a thread
+        # driven from another process is what goes quiet until this recovers.
+        logger.warning("Transcript listener startup failed", exc_info=True)
+    try:
+        await bridge_listener.start()
+    except Exception:  # noqa: BLE001
+        # Bridge waiters fall back to in-process notifications and their own
+        # liveness ticks; what goes quiet is a bridge driven from another replica.
+        logger.warning("Sandbox bridge listener startup failed", exc_info=True)
+    try:
+        await PLUGIN_ROOMS.start()
+    except Exception:  # noqa: BLE001
+        # Rooms stop being live: members see each other's edits when they reload.
+        logger.warning("Plugin room listener startup failed", exc_info=True)
+    try:
+        await HUB.start()
+    except Exception:  # noqa: BLE001
+        # Dashboard pages still load and refetch on their own actions; what
+        # stops is hearing about changes made elsewhere.
+        logger.warning("UI invalidation hub startup failed", exc_info=True)
+    LISTENER.start()
+    JOB_WORKER.start(first=start_jobs)
+    SEGMENT_WORKER.start()
+    try:
+        from openswe.server import warm_agent_build
+
+        warm_agent_build()
+    except Exception:  # noqa: BLE001
+        # Runs still build whatever is missing on first use, just more slowly.
+        logger.warning("Warming the agent build failed", exc_info=True)
+    try:
+        async with AsyncExitStack() as stack:
+            stack.enter_context(WorkerShutdown(JOB_WORKER, SEGMENT_WORKER))
+            stack.enter_context(watch_for_stalls())
+            if AGENT_MCP is not None:
+                for mcp_app in AGENT_MCP.apps:
+                    await stack.enter_async_context(mcp_app.lifespan(mcp_app))
+            yield
+    finally:
+        await asyncio.gather(SEGMENT_WORKER.stop(), JOB_WORKER.stop())
+        await HUB.stop()
+        await bridge_listener.stop()
+        await PLUGIN_ROOMS.stop()
+        await transcript_listener.stop()
+        await LISTENER.stop()
+        await stop_worker()
+        await close_http_pool()
+        await database.close()
+        # Spans still queued at exit would miss the LangSmith client's own flush.
+        await asyncio.to_thread(DatadogSpans.drain, 5)
+
+
+async def _conflict(_request: Request, exc: Exception) -> JSONResponse:
+    return JSONResponse({"detail": str(exc)}, status_code=409)
+
+
+def create_app() -> FastAPI:
+    configure_datadog_environment()
+    app = FastAPI(title="Robin", lifespan=lifespan)
+    allowed_origins = [
+        origin.strip()
+        for origin in ENV.DASHBOARD_ALLOWED_ORIGINS.get().split(",")
+        if origin.strip()
+    ]
+    if "*" in allowed_origins:
+        raise RuntimeError(
+            "DASHBOARD_ALLOWED_ORIGINS must not include '*' when allow_credentials=True"
+        )
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[*allowed_origins, "open-swe://app"],
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=["*"],
+        # The SDK reconnects to a run stream's Location and reads its run id from
+        # Content-Location. The steered header says the message joined the live run, and
+        # the join header names the join a run stream answers.
+        expose_headers=[
+            "X-Request-ID",
+            "Retry-After",
+            "Location",
+            "Content-Location",
+            STEERED_HEADER,
+            JOIN_HEADER,
+        ],
+    )
+    app.add_middleware(AuditLogMiddleware)
+    # Ahead of the core /threads and /runs routes, which the custom app shadows.
+    app.add_middleware(ThreadRouter)
+    # Starlette leaves `text/event-stream` and already-encoded responses alone.
+    app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=4)
+    # Wraps every route and the MCP mount, so they see which domain the request used.
+    app.add_middleware(PublicOriginMiddleware)
+    add_request_ids(app)
+    add_github_error_handlers(app)
+    app.add_exception_handler(UnknownUser, _conflict)
+    app.add_exception_handler(AccountConflict, _conflict)
+    app.include_router(dashboard_router)
+    app.include_router(plan_router)
+    app.include_router(workflow_approval_router)
+    app.include_router(mda_channel_api_router)
+    app.include_router(mda_resolve_user_router)
+    app.include_router(mda_slack_channel_events_router)
+    app.include_router(mda_github_deliveries_router)
+    app.include_router(slack_webhook_router)
+    app.include_router(health_router)
+    app.include_router(rollout_webhook_router)
+    app.include_router(sandbox_tool_router)
+    app.include_router(short_link_router)
+    app.include_router(reviewer_eval_report_router)
+    # Routed at the exact path so no redirect sits between MDA and the agent API.
+    app.router.routes.append(
+        Route(agent_api_server.API_PATH, agent_api_server.API, methods=["POST"])
+    )
+    if AGENT_MCP is not None:
+        app.state.fastmcp_server = AGENT_MCP.apps[0].state.fastmcp_server
+        app.router.routes.extend(AGENT_MCP.root_routes)
+        app.mount(agent_mcp_server.PREFIX, AGENT_MCP.app)
+    mount_dashboard_ui(app)
+    return app
+
+
+app = create_app()

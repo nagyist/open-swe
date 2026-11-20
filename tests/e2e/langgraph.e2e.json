@@ -1,0 +1,15 @@
+{
+  "$schema": "https://langgra.ph/schema.json",
+  "python_version": "3.14",
+  "dependencies": ["."],
+  "graphs": {
+    "agent": "./tests/e2e/agent_entrypoint.py:traced_agent",
+    "review-scout": "./tests/e2e/review_scout_entrypoint.py:traced_review_scout"
+  },
+  "http": {
+    "app": "./tests/e2e/harness.py:app"
+  },
+  "webhooks": {
+    "url": { "disable_loopback": false, "require_https": false }
+  }
+}

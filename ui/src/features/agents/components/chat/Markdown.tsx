@@ -1,0 +1,551 @@
+import { Link as MacawLink } from "@langchain/macaw-components/Link"
+import {
+  InfoRegularIcon,
+  WarningRegularIcon,
+} from "@langchain/macaw-components/icons"
+import {
+  Component,
+  createContext,
+  createElement,
+  memo,
+  use,
+  useMemo,
+  useRef,
+  useState,
+} from "react"
+import { ChatCenteredTextIcon } from "@phosphor-icons/react/dist/ssr/ChatCenteredText"
+import { LightbulbIcon } from "@phosphor-icons/react/dist/ssr/Lightbulb"
+import { WarningOctagonIcon } from "@phosphor-icons/react/dist/ssr/WarningOctagon"
+import { Dialog, DialogContent } from "@langchain/macaw-components/Dialog"
+import {
+  Streamdown,
+  defaultRemarkPlugins,
+  defaultUrlTransform,
+} from "streamdown"
+import type { ComponentProps, ReactNode } from "react"
+import type { IconComponent } from "@langchain/macaw-components/Icon"
+import type { Components, ExtraProps } from "streamdown"
+import "streamdown/styles.css"
+import { cn } from "@/lib/utils"
+import {
+  PreviewablePullRequestCard,
+  PreviewablePullRequestLink,
+} from "@/features/agents/components/PullRequestPreview"
+import { CodeBlock } from "./CodeBlock"
+import { useCopyAction } from "@langchain/macaw-components/CopyButton"
+import { IconButton } from "@langchain/macaw-components/IconButton"
+import { ArrowsOutSimpleIcon } from "@phosphor-icons/react/dist/ssr/ArrowsOutSimple"
+import { CheckIcon } from "@phosphor-icons/react/dist/ssr/Check"
+import { CopySimpleIcon } from "@phosphor-icons/react/dist/ssr/CopySimple"
+import { MermaidDiagram } from "./MermaidDiagram"
+import { TableScroll } from "./TableScroll"
+import {
+  orderedListGutterStyle,
+  remarkGithubAlerts,
+  remarkNormalizeListItemIndentation,
+  remarkResolveRelativeUrls,
+} from "./markdownPlugins"
+
+interface MarkdownProps {
+  content: string
+  /** When true, keep Streamdown in streaming mode for the duration of the run. */
+  isLive?: boolean
+  /**
+   * Rewrite image and attachment video `src` URLs before rendering (e.g. route
+   * private GitHub attachments through an authenticated proxy). Return the URL
+   * unchanged to leave it as-is.
+   */
+  transformMediaUrl?: (src: string) => string
+  /** The workspace file the content was read from; its relative links open with `onOpenFile`. */
+  workspacePath?: string
+  /** Where the workspace file's relative images load from. */
+  imageBase?: string
+  onOpenFile?: (path: string) => void
+  enlargeImages?: boolean
+  className?: string
+}
+
+// Stand-in origins for a workspace document's relative links and images. The
+// sanitizer keeps only http(s) URLs and hardening drops relative ones, so they
+// travel as these and become real URLs in `urlTransform`, which runs last.
+const WORKSPACE_LINK = "https://robin-workspace.invalid/"
+const DOCUMENT_IMAGE = "https://robin-document.invalid/"
+// Images resolve below this, so one whose `..` climbs out of the document's
+// folder is dropped instead of clamped onto a file of the same name.
+const DOCUMENT_FOLDER = `${DOCUMENT_IMAGE}folder/`
+
+const REMARK_PLUGINS = [
+  ...Object.values(defaultRemarkPlugins),
+  remarkGithubAlerts,
+  remarkNormalizeListItemIndentation,
+]
+
+/** `data-alert` is set by remarkGithubAlerts and would otherwise be sanitized away. */
+const ALLOWED_TAGS = { blockquote: ["cite", "dataAlert"] }
+
+const SHIKI_THEME: ["github-light", "github-dark"] = [
+  "github-light",
+  "github-dark",
+]
+
+/** GitHub's own five alert kinds; the colours live in styles/markdown.css. */
+const ALERTS: Record<string, { label: string; Icon: IconComponent }> = {
+  note: { label: "Note", Icon: InfoRegularIcon },
+  tip: { label: "Tip", Icon: LightbulbIcon },
+  important: { label: "Important", Icon: ChatCenteredTextIcon },
+  warning: { label: "Warning", Icon: WarningRegularIcon },
+  caution: { label: "Caution", Icon: WarningOctagonIcon },
+}
+
+/**
+ * Streamdown's defaults dress every element in utility classes sized for a
+ * documentation page; chat markdown is styled by `.chat-markdown` instead, so
+ * these renderers emit the plain element and drop the hast node prop.
+ */
+function passthrough(tag: string) {
+  return function PassthroughElement({ node: _node, ...props }: ExtraProps) {
+    return createElement(tag, props)
+  }
+}
+
+type HastElement = NonNullable<ExtraProps["node"]>
+
+const FENCE_TITLE_ATTR =
+  /(?:^|\s)(?:title|file(?:name)?)=(?:"([^"]+)"|'([^']+)'|(\S+))/i
+const FENCE_FILENAME_TOKEN = /^[\w@][\w@./-]*\.[A-Za-z0-9]+$/
+
+/** Pulls a filename out of fence meta: ```ts title="x.ts" / ```ts src/main.ts */
+function fenceTitle(meta: string | undefined): string | null {
+  if (!meta) return null
+  const attr = FENCE_TITLE_ATTR.exec(meta)
+  return (
+    attr?.[1] ??
+    attr?.[2] ??
+    attr?.[3] ??
+    meta.split(/\s+/).find((token) => FENCE_FILENAME_TOKEN.test(token)) ??
+    null
+  )
+}
+
+/** Streamdown leaves syntax highlighting to the host, so fences render through CodeBlock. */
+function fencedCode(node: HastElement | undefined) {
+  const code = node?.children.find(
+    (child) => child.type === "element" && child.tagName === "code"
+  )
+  if (code?.type !== "element") return null
+  const { className, metastring } = code.properties
+  const languageClass = Array.isArray(className)
+    ? className.join(" ")
+    : String(className ?? "")
+  return {
+    text: code.children
+      .map((child) => (child.type === "text" ? child.value : ""))
+      .join(""),
+    language: /language-([^\s]+)/.exec(languageClass)?.[1],
+    title: fenceTitle(typeof metastring === "string" ? metastring : undefined),
+  }
+}
+
+/** The `transformMediaUrl` a GitHub attachment video plays through. */
+const MediaUrlTransform = createContext<((src: string) => string) | undefined>(
+  undefined
+)
+
+function GithubAttachment({ href }: { href: string }) {
+  const transformMediaUrl = use(MediaUrlTransform)
+  const [failed, setFailed] = useState(false)
+  if (failed)
+    return (
+      <MacawLink variant="xs" href={href} target="_blank" rel="noreferrer">
+        {href}
+      </MacawLink>
+    )
+  return (
+    <video
+      src={transformMediaUrl ? transformMediaUrl(href) : href}
+      controls
+      playsInline
+      preload="metadata"
+      aria-label="GitHub attachment video"
+      className="max-h-[70vh] max-w-full rounded-lg border border-subtle"
+      onError={() => setFailed(true)}
+    />
+  )
+}
+
+function ExternalLink({
+  node: _node,
+  children,
+  ...props
+}: ExtraProps & ComponentProps<"a">) {
+  return (
+    <PreviewablePullRequestLink {...props} target="_blank" rel="noreferrer">
+      {children}
+    </PreviewablePullRequestLink>
+  )
+}
+
+function MarkdownTable({ children, ...props }: ComponentProps<"table">) {
+  const [open, setOpen] = useState(false)
+  const inline = useRef<HTMLDivElement>(null)
+  const trigger = useRef<HTMLButtonElement>(null)
+  const { copied, onCopy } = useCopyAction()
+  const table = <table {...props}>{children}</table>
+  const copy = (
+    <IconButton
+      icon={copied ? CheckIcon : CopySimpleIcon}
+      label={copied ? "Copied" : "Copy table"}
+      size="xs"
+      color="secondary"
+      variant="plain"
+      onClick={() =>
+        onCopy(inline.current?.querySelector("table")?.innerText ?? "")
+      }
+    />
+  )
+
+  return (
+    <>
+      <div
+        ref={inline}
+        className="chat-markdown-table flex items-start gap-space-2"
+      >
+        <TableScroll className="min-w-0 flex-1">{table}</TableScroll>
+        <div className="flex shrink-0 gap-space-1 pt-space-1">
+          {copy}
+          <IconButton
+            ref={trigger}
+            icon={ArrowsOutSimpleIcon}
+            label="Expand table"
+            size="xs"
+            color="secondary"
+            variant="plain"
+            aria-haspopup="dialog"
+            onClick={() => setOpen(true)}
+          />
+        </div>
+      </div>
+      <Dialog open={open} onOpenChange={setOpen}>
+        <DialogContent
+          title="Table"
+          className="h-[calc(100dvh-2rem)] w-[calc(100vw-2rem)] max-w-none"
+          childrenClassName="min-h-0 flex-1 overflow-auto"
+          onCloseAutoFocus={(event) => {
+            event.preventDefault()
+            trigger.current?.focus({ preventScroll: true })
+          }}
+        >
+          <div className="flex justify-end">{copy}</div>
+          <div className="chat-markdown min-h-0 min-w-0">
+            <TableScroll
+              className="chat-markdown-table"
+              viewportClassName="max-h-full"
+            >
+              {table}
+            </TableScroll>
+          </div>
+        </DialogContent>
+      </Dialog>
+    </>
+  )
+}
+
+const COMPONENTS: Components = {
+  h1: passthrough("h1"),
+  h2: passthrough("h2"),
+  h3: passthrough("h3"),
+  h4: passthrough("h4"),
+  h5: passthrough("h5"),
+  h6: passthrough("h6"),
+  p: ({ node, children, ...props }: ExtraProps & ComponentProps<"p">) => {
+    const content = node?.children.filter(
+      (child) => child.type !== "text" || child.value.trim()
+    )
+    const link = content?.length === 1 ? content[0] : undefined
+    const href = link?.type === "element" ? link.properties.href : undefined
+    if (
+      link?.type === "element" &&
+      link.tagName === "a" &&
+      typeof href === "string" &&
+      /^https:\/\/github\.com\/user-attachments\/assets\/[\da-f-]+$/i.test(
+        href
+      ) &&
+      link.children.length === 1 &&
+      link.children[0]?.type === "text" &&
+      link.children[0].value === href
+    )
+      return (
+        <p {...props}>
+          <GithubAttachment key={href} href={href} />
+        </p>
+      )
+    const paragraph = <p {...props}>{children}</p>
+    const label = link?.type === "element" ? link.children[0] : undefined
+    if (
+      link?.type === "element" &&
+      link.tagName === "a" &&
+      typeof href === "string" &&
+      link.children.length === 1 &&
+      label?.type === "text"
+    )
+      return (
+        <PreviewablePullRequestCard
+          href={href}
+          label={label.value}
+          fallback={paragraph}
+        />
+      )
+    return paragraph
+  },
+  ul: passthrough("ul"),
+  li: passthrough("li"),
+  hr: passthrough("hr"),
+  strong: passthrough("strong"),
+  em: passthrough("em"),
+  del: passthrough("del"),
+  pre: ({ node, children, ...props }: ExtraProps & ComponentProps<"pre">) => {
+    const fence = fencedCode(node)
+    if (!fence) return <pre {...props}>{children}</pre>
+    if (fence.language === "mermaid")
+      return <MermaidDiagram source={fence.text} />
+    return (
+      <CodeBlock
+        text={fence.text}
+        language={fence.language}
+        title={fence.title}
+      />
+    )
+  },
+  ol: ({ node, ...props }: ExtraProps & ComponentProps<"ol">) => {
+    const itemCount =
+      node?.children.filter(
+        (child) => child.type === "element" && child.tagName === "li"
+      ).length ?? 0
+    const gutter = orderedListGutterStyle(itemCount, props.start)
+    return (
+      <ol
+        {...props}
+        style={gutter ? { ...props.style, ...gutter } : props.style}
+      />
+    )
+  },
+  blockquote: ({
+    node: _node,
+    children,
+    ...props
+  }: ExtraProps & ComponentProps<"blockquote"> & { "data-alert"?: string }) => {
+    const alert = ALERTS[props["data-alert"] ?? ""]
+    // Not a <blockquote>: an alert's body is ordinary text under a coloured
+    // title rather than a muted quote.
+    if (!alert) return <blockquote {...props}>{children}</blockquote>
+    return (
+      <div role="note" data-alert={props["data-alert"]}>
+        <p>
+          <alert.Icon
+            size={14}
+            weight="regular"
+            aria-hidden
+            className="shrink-0"
+          />
+          {alert.label}
+        </p>
+        {children}
+      </div>
+    )
+  },
+  table: ({ node: _node, ...props }: ExtraProps & ComponentProps<"table">) => (
+    <MarkdownTable {...props} />
+  ),
+  thead: passthrough("thead"),
+  inlineCode: ({
+    node: _node,
+    ...props
+  }: ExtraProps & ComponentProps<"code">) => <code {...props} />,
+  img: ({ src, alt }: ExtraProps & ComponentProps<"img">) => (
+    <img
+      src={typeof src === "string" ? src : undefined}
+      alt={alt ?? ""}
+      loading="lazy"
+      className="border border-subtle"
+    />
+  ),
+  a: ExternalLink,
+}
+
+interface BoundaryProps {
+  content: string
+  children: ReactNode
+}
+
+interface BoundaryState {
+  failed: boolean
+  key: string
+}
+
+// A render-time throw anywhere in the markdown tree would otherwise white-screen
+// the whole page; contain it and fall back to the raw markdown text.
+class MarkdownErrorBoundary extends Component<BoundaryProps, BoundaryState> {
+  state: BoundaryState = { failed: false, key: this.props.content }
+
+  static getDerivedStateFromError(): Partial<BoundaryState> {
+    return { failed: true }
+  }
+
+  static getDerivedStateFromProps(
+    props: BoundaryProps,
+    state: BoundaryState
+  ): Partial<BoundaryState> | null {
+    if (props.content !== state.key)
+      return { failed: false, key: props.content }
+    return null
+  }
+
+  render(): ReactNode {
+    if (this.state.failed) {
+      return (
+        <pre className="font-sans [overflow-wrap:anywhere] break-words whitespace-pre-wrap text-primary">
+          {this.props.content}
+        </pre>
+      )
+    }
+    return this.props.children
+  }
+}
+
+export const Markdown = memo(function Markdown({
+  content,
+  isLive = false,
+  transformMediaUrl,
+  workspacePath,
+  imageBase,
+  onOpenFile,
+  enlargeImages = false,
+  className,
+}: MarkdownProps) {
+  const [image, setImage] = useState<{ src: string; alt: string } | null>(null)
+  const components = useMemo(
+    () => ({
+      ...COMPONENTS,
+      ...(workspacePath !== undefined &&
+        onOpenFile && {
+          a: ({ node, href, ...props }: ExtraProps & ComponentProps<"a">) =>
+            href?.startsWith(WORKSPACE_LINK) ? (
+              <a
+                {...props}
+                href="#"
+                onClick={(event) => {
+                  event.preventDefault()
+                  onOpenFile(
+                    decodeURIComponent(new URL(href).pathname.slice(1))
+                  )
+                }}
+              />
+            ) : (
+              <ExternalLink {...props} node={node} href={href} />
+            ),
+        }),
+      ...(enlargeImages && {
+        img: ({ src, alt }: ExtraProps & ComponentProps<"img">) => (
+          <img
+            src={typeof src === "string" ? src : undefined}
+            alt={alt ?? ""}
+            loading="lazy"
+            role="button"
+            tabIndex={0}
+            aria-label={`Enlarge ${alt || "image"}`}
+            className="cursor-zoom-in border border-subtle focus-visible:ring-2 focus-visible:ring-focus focus-visible:outline-none"
+            onClick={(event) => {
+              event.preventDefault()
+              event.stopPropagation()
+              if (typeof src === "string") setImage({ src, alt: alt ?? "" })
+            }}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault()
+                event.currentTarget.click()
+              }
+            }}
+          />
+        ),
+      }),
+    }),
+    [enlargeImages, workspacePath, onOpenFile]
+  )
+  const urlTransform = useMemo(() => {
+    if (!transformMediaUrl && workspacePath === undefined) return undefined
+    return (
+      url: string,
+      key: string,
+      node: Parameters<typeof defaultUrlTransform>[2]
+    ) => {
+      if (key === "src" && url.startsWith(DOCUMENT_IMAGE)) {
+        // Returned as is: the default would empty the desktop's preview scheme.
+        return imageBase && url.startsWith(DOCUMENT_FOLDER)
+          ? new URL(url.slice(DOCUMENT_FOLDER.length), imageBase).href
+          : ""
+      }
+      if (key === "src" && transformMediaUrl) return transformMediaUrl(url)
+      return defaultUrlTransform(url, key, node)
+    }
+  }, [transformMediaUrl, workspacePath, imageBase])
+
+  return (
+    <div
+      className={cn(
+        "chat-markdown max-w-full min-w-0 text-sm leading-[1.6] [overflow-wrap:anywhere] break-words text-primary",
+        className
+      )}
+    >
+      <MarkdownErrorBoundary content={content}>
+        <MediaUrlTransform value={transformMediaUrl}>
+          <Streamdown
+            mode={isLive ? "streaming" : "static"}
+            parseIncompleteMarkdown={isLive}
+            isAnimating={isLive}
+            shikiTheme={SHIKI_THEME}
+            className="streamdown-agent max-w-full min-w-0 space-y-0"
+            components={components}
+            remarkPlugins={
+              workspacePath !== undefined
+                ? [
+                    ...REMARK_PLUGINS,
+                    [
+                      remarkResolveRelativeUrls,
+                      {
+                        images: `${DOCUMENT_FOLDER}document`,
+                        links: `${WORKSPACE_LINK}${workspacePath}`,
+                      },
+                    ],
+                  ]
+                : REMARK_PLUGINS
+            }
+            allowedTags={ALLOWED_TAGS}
+            urlTransform={urlTransform}
+          >
+            {content}
+          </Streamdown>
+        </MediaUrlTransform>
+      </MarkdownErrorBoundary>
+      <Dialog
+        open={image !== null}
+        onOpenChange={(open) => {
+          if (!open) setImage(null)
+        }}
+      >
+        <DialogContent
+          title={image?.alt || "Image preview"}
+          className="h-[calc(100dvh-2rem)] w-[95vw] max-w-[95vw]"
+          childrenClassName="flex-1 items-center justify-center"
+        >
+          {image && (
+            <img
+              src={image.src}
+              alt={image.alt}
+              className="h-full min-h-0 w-full object-contain"
+            />
+          )}
+        </DialogContent>
+      </Dialog>
+    </div>
+  )
+})

@@ -1,48 +1,95 @@
+# Robin
+
 <div align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="apps/docs/logo/dark.svg">
-    <source media="(prefers-color-scheme: light)" srcset="apps/docs/logo/light.svg">
-    <img src="apps/docs/logo/dark.svg" alt="Open SWE Logo" width="35%">
-  </picture>
+  <h3>An open-source software factory built on Deep Agents by LangChain.</h3>
 </div>
 
 <div align="center">
-  <h1>Open SWE - An Open-Source Asynchronous Coding Agent</h1>
+  <a href="https://opensource.org/licenses/MIT" target="_blank"><img src="https://img.shields.io/github/license/langchain-ai/open-swe" alt="License"></a>
+  <a href="https://github.com/langchain-ai/open-swe" target="_blank"><img src="https://img.shields.io/github/stars/langchain-ai/open-swe" alt="GitHub Stars"></a>
+  <a href="https://github.com/langchain-ai/deepagents" target="_blank"><img src="https://img.shields.io/badge/Built%20on-Deep%20Agents-blue" alt="Built on Deep Agents"></a>
+  <a href="https://github.com/langchain-ai/langgraph" target="_blank"><img src="https://img.shields.io/badge/Powered%20by-LangGraph-blue" alt="Powered by LangGraph"></a>
+  <a href="https://x.com/langchain" target="_blank"><img src="https://img.shields.io/twitter/url/https/twitter.com/langchain.svg?style=social&label=Follow%20%40LangChain" alt="Twitter / X"></a>
 </div>
 
-> [!WARNING]
-> **⚠️ DEPRECATION NOTICE**
-> 
-> This repository is no longer actively maintained and will not receive further updates. The project has been deprecated and users are advised to seek alternative solutions for their coding agent needs.
+<br>
 
-Open SWE is an open-source cloud-based asynchronous coding agent built with [LangGraph](https://docs.langchain.com/oss/javascript/langgraph/overview). It autonomously understands codebases, plans solutions, and executes code changes across entire repositories—from initial planning to opening pull requests.
-
-> [!TIP]
-> Try out Open SWE yourself using our [public demo](https://swe.langchain.com)!
->
-> **Note: you're required to set your own LLM API keys to use the demo.**
+Robin turns engineering work into a repeatable system: investigate a codebase, implement changes, validate them, and deliver a pull request.
+It also reviews pull requests, learns repository-specific review preferences, monitors CI, and responds to feedback.
+Built by LangChain, it is open source and deployable in your infrastructure.
 
 > [!NOTE]
-> 📚 See the **Open SWE documentation files [here](https://github.com/langchain-ai/open-swe/tree/main/apps/docs)**
+> **Under active development.**
+> Expect breaking changes and rough edges.
+> We’re not accepting issues or external contributions at this time.
+> You’re welcome to explore and fork the code, but correctness, stability, and compatibility are not guaranteed.
 >
-> 💬 Read the **announcement blog post [here](https://blog.langchain.com/introducing-open-swe-an-open-source-asynchronous-coding-agent/)**
->
-> 📺 Watch the **announcement video [here](https://youtu.be/TaYVvXbOs8c)**
+> If you really want to deploy it yourself, follow the [installation guide](docs/INSTALLATION.md).
+> Deploying it as is requires [Managed Deep Agents](https://docs.langchain.com/langsmith/python/managed-deep-agents-overview), which runs its agent; without it, we recommend forking and adapting the code to your own runtime.
 
-# Features
+## What Robin does
 
-![UI Screenshot](./static/ui-screenshot.png)
+```mermaid
+flowchart LR
+    A[Issues, conversations, PRs, schedules] --> B[Plan and investigate]
+    B --> C[Implement in an isolated sandbox]
+    C --> D[Validate and deliver a PR]
+    D --> E[Review, CI, and feedback]
+    E -->|Follow-up work| B
+```
 
-- 📝 **Planning**: Open SWE has a dedicated planning step which allows it to deeply understand complex codebases and nuanced tasks. You're also given the ability to accept, edit, or reject the proposed plan before it's executed.
-- 🤝 **Human in the loop**: With Open SWE, you can send it messages while it's running (both during the planning and execution steps). This allows for giving real time feedback and instructions without having to interrupt the process.
-- 🏃 **Parallel Execution**: You can run as many Open SWE tasks as you want in parallel! Since it runs in a sandbox environment in the cloud, you're not limited by the number of tasks you can run at once.
-- 🧑‍💻 **End to end task management**: Open SWE will automatically create GitHub issues for tasks, and create pull requests which will close the issue when implementation is complete.
+- **Build:** Investigate repositories, edit code, run focused validation, and open or update pull requests.
+- **Parallelize:** Use subagents for research and independent work.
+- **Review:** Run on-demand or opt-in automatic reviews, publish findings to GitHub, and learn from historical feedback.
+- **Investigate:** Use read-only PR chat to understand a change without implementing changes.
+- **Operate:** Schedule recurring tasks and monitor opted-in PRs with `/baby-sit`, diagnosing failures and rerunning only evidence-backed flaky jobs.
+- **Customize:** Choose models, reasoning effort, instructions, skills, integrations, and sandbox providers.
 
+Start and continue work from the **dashboard**, **GitHub issues and PR conversations**, or **Slack**.
+In [Linear](docs/INSTALLATION.md#linear), mention or delegate an issue to the Robin app to open an agent session.
+Cloud coding follow-ups reuse the thread’s context and sandbox; independent threads can run in parallel.
 
-## Usage
+## How it works
 
-Open SWE can be used in multiple ways:
+[Deep Agents](https://github.com/langchain-ai/deepagents) supplies planning, filesystem, shell, skills, and subagent primitives.
+[LangGraph](https://github.com/langchain-ai/langgraph) provides durable execution and thread state.
+Robin adds engineering tools, integrations, authorization, and user interfaces.
+The graph entrypoints are declared in [`langgraph.json`](langgraph.json), with an [architecture inventory](AGENTS.md#architecture).
 
-- 🖥️ **From the UI**. You can create, manage and execute Open SWE tasks from the [web application](https://swe.langchain.com).
-- 📝 **From GitHub**. You can start Open SWE tasks directly from GitHub issues simply by adding a label `open-swe`, or `open-swe-auto` (adding `-auto` will cause Open SWE to automatically accept the plan, requiring no intervention from you). The default `open-swe` labels now use Claude Opus 4.5 for optimal performance. Note: `open-swe-max` and `open-swe-max-auto` labels are deprecated and should no longer be used.
+Cloud coding runs in persistent, per-thread Linux sandboxes with tooling supplied by global setup scripts and sandbox images.
+An unreachable coding sandbox is not silently replaced.
+[LangSmith](https://smith.langchain.com/) is the default sandbox and tracing provider; [other providers and local execution](docs/CUSTOMIZATION.md#1-sandbox) are configurable.
+PR chat does not need a sandbox.
 
+## Control and safety
+
+- **GitHub access:** Coding sandboxes normally receive installation-wide GitHub App access; selected workflows use narrower repository scopes.
+  Repository bindings control integrations, not credentials or image preloads.
+  See [GitHub access](docs/reference/execution.md#github-access-and-the-sandbox-image).
+- **Integrations:** Runs get MCP tools from LangSmith Managed Tools kits: the owner's personal kit in private threads and Robin's bot kit otherwise.
+  Add other servers to a kit in LangSmith; see the [customization guide](docs/CUSTOMIZATION.md#mcp-servers).
+- **Approvals:** Workflow-file approval prompts guard detected Git pushes, not every possible shell or API write.
+  Reviewers are instructed not to commit or push; PR chat excludes mutation tools.
+
+Sandboxes have powerful tools and may have network access.
+Use least-privilege credentials, restrict repositories and integrations, and tailor approval policies to your deployment.
+Local execution does not provide cloud sandbox isolation.
+
+## Documentation
+
+- [Robin rollout checklist](docs/ROBIN_ROLLOUT.md) — External integration updates, desktop upgrade checks, and compatibility boundaries
+- [Customization guide](docs/CUSTOMIZATION.md) — Models, sandboxes, tools, skills, prompts, triggers, and middleware
+- [Plugin guide](docs/PLUGINS.md) — Build web apps: sandboxed single-file plugins people add to their sidebar
+- [Defaults, routing, and sandbox images](docs/reference/execution.md) — Routing, settings, images, and access
+- [Human review in Slack](docs/reference/human-review.md) — Review requests in a repository's Slack channel, merged once reviewers approve
+- [Expedited Slack review](docs/reference/expedited-slack-review.md) — Human approval for small pull requests
+- [Backend API documentation](docs/DEVELOPMENT.md#backend-api-documentation) — Live API docs and the generated [OpenAPI schema](swagger.json)
+- [Original announcement](https://blog.langchain.com/open-swe-an-open-source-framework-for-internal-coding-agents/) — Background on the internal coding-agent framework
+- [Security policy](SECURITY.md) — Report security concerns privately
+
+## License
+
+Robin is licensed under the [MIT License](LICENSE).
+
+That license covers Robin's own code only.
+It does not cover anything under [`vendor/`](vendor/README.md), which is not licensed by this repository at all.

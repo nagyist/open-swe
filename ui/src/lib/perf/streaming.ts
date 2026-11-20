@@ -1,0 +1,296 @@
+/**
+ * The `agent_run` span: one run as the browser experiences it.
+ *
+ *   submit ─▶ accepted ─▶ stream_open ─▶ first_event ─▶ generation_start
+ *          ─▶ first_text ─▶ end
+ *
+ * `generation_start` is the first assistant message the model opens, so it is
+ * the time until the run visibly produces something — thinking or a tool call
+ * included. `first_text` is the later time to the first streamed assistant
+ * text, the counterpart of the backend's `open_swe_dashboard_thread_ttft`
+ * histogram; a run whose opening move is a tool call reaches it only after that
+ * round trip, so the two are far apart and only `generation_start` answers "has
+ * the agent started". A run joined mid-stream may have missed the message and
+ * then carries no `generation_start`.
+ *
+ * The span also counts stream events and text chunks, samples the lag between an
+ * event's timestamp and its handling, and, in development builds, accumulates
+ * React commit time for the transcript while the run streams.
+ *
+ * The stream pool keeps background runs alive, so request and transcript
+ * timings are matched to a tracker by thread id and never charged to a
+ * neighbour. The id stays internal; it is not part of the exported span.
+ */
+
+import { subscribeRequestTimings } from "./fetchTiming"
+import { startSpan } from "./trace"
+import type { PerfAttributes, PerfThreadSource, SpanHandle } from "./trace"
+
+export type RunEndReason = "success" | "error" | "interrupt" | "stopped"
+
+/** What a submitted span knows about the turn it will time; see `submitted`. */
+interface RunSubmission {
+  messageId: string | null
+  runningTurnId: string | null
+}
+
+const UNSUBMITTED: RunSubmission = { messageId: null, runningTurnId: null }
+
+interface RunState extends RunSubmission {
+  span: SpanHandle
+  /** The transcript turn this span times, once the log names it. */
+  turnId: string | null
+  events: number
+  textDeltas: number
+  lagSum: number
+  lagMax: number
+  lagSamples: number
+  builds: number
+  buildMs: number
+  commits: number
+  commitMs: number
+  commitMaxMs: number
+}
+
+const openRuns = new Set<RunTracker>()
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null
+}
+
+/** An assistant message chunk, as the server streams it or the SDK names it. */
+const AI_MESSAGE_TYPES = new Set<unknown>(["ai", "AIMessageChunk"])
+
+/** Whether a message chunk's content carries any text. */
+function hasText(content: unknown): boolean {
+  if (typeof content === "string") return content.length > 0
+  return (
+    Array.isArray(content) &&
+    content.some(
+      (block) =>
+        isRecord(block) &&
+        block["type"] === "text" &&
+        typeof block["text"] === "string" &&
+        block["text"].length > 0
+    )
+  )
+}
+
+function openRunsFor(threadId: string): Array<RunTracker> {
+  const key = threadId.toLowerCase()
+  return [...openRuns].filter((run) => run.threadId === key)
+}
+
+subscribeRequestTimings((timing) => {
+  for (const run of openRunsFor(timing.threadId)) {
+    if (timing.kind === "command") {
+      run.state?.span.set({ command_ttfb_ms: Math.round(timing.ttfbMs) })
+    } else if (timing.kind === "stream_events") {
+      run.state?.span.mark("stream_open", {
+        stream_ttfb_ms: Math.round(timing.ttfbMs),
+      })
+    }
+  }
+})
+
+export class RunTracker {
+  state: RunState | null = null
+  threadId: string | null
+  private readonly threadSource: PerfThreadSource
+
+  constructor(options: {
+    /** `null` until a lazily created thread has an id; see `bindThread`. */
+    threadId: string | null
+    /** The backend whose runs this tracker times, sent as `thread_source`. */
+    threadSource: PerfThreadSource
+  }) {
+    this.threadId = options.threadId?.toLowerCase() ?? null
+    this.threadSource = options.threadSource
+  }
+
+  private begin(
+    extra: PerfAttributes,
+    submission: RunSubmission = UNSUBMITTED
+  ): void {
+    if (this.state && !this.state.span.ended) {
+      this.state.span.abandon("superseded")
+    }
+    this.state = {
+      span: startSpan("agent_run", {
+        ...extra,
+        thread_source: this.threadSource,
+      }),
+      turnId: null,
+      ...submission,
+      events: 0,
+      textDeltas: 0,
+      lagSum: 0,
+      lagMax: 0,
+      lagSamples: 0,
+      builds: 0,
+      buildMs: 0,
+      commits: 0,
+      commitMs: 0,
+      commitMaxMs: 0,
+    }
+    openRuns.add(this)
+  }
+
+  bindThread(threadId: string | null): void {
+    this.threadId = threadId?.toLowerCase() ?? null
+  }
+
+  /**
+   * The user pressed send on this stream. The span times the turn that records
+   * `messageId`: a new turn for a fresh or queued message, or the running turn
+   * a message steers. A message-less run (`/offload`) times the next turn to
+   * start other than `runningTurnId`.
+   */
+  submitted(submission: RunSubmission = UNSUBMITTED): void {
+    this.begin({ joined: false }, submission)
+  }
+
+  /** The server accepted the run. */
+  created(): void {
+    this.state?.span.mark("accepted")
+  }
+
+  /** An event of the `lifecycle` or `messages` channel, as `useChannelEffect` gives it. */
+  event(event: unknown): void {
+    if (!isRecord(event) || !isRecord(event["params"])) return
+    const params = event["params"]
+    const method = event["method"]
+
+    // A run this client did not submit (queued message, another tab, Slack)
+    // shows first as its output: no event says a run started.
+    if (method === "messages" && (!this.state || this.state.span.ended)) {
+      this.begin({ joined: true })
+      this.state?.span.mark("accepted")
+    }
+
+    const state = this.state
+    if (!state || state.span.ended) return
+
+    state.events += 1
+    state.span.mark("first_event")
+
+    const timestamp = params["timestamp"]
+    if (typeof timestamp === "number" && Number.isFinite(timestamp)) {
+      const lag = Date.now() - timestamp
+      state.lagSum += lag
+      state.lagMax = Math.max(state.lagMax, lag)
+      state.lagSamples += 1
+    }
+
+    if (method !== "messages") return
+    const [message] = Array.isArray(params["data"]) ? params["data"] : []
+    if (!isRecord(message) || !AI_MESSAGE_TYPES.has(message["type"])) return
+    state.span.mark("generation_start")
+    if (!hasText(message["content"])) return
+    state.textDeltas += 1
+    state.span.mark("first_text")
+  }
+
+  /**
+   * A transcript-log event of `turnId` reached the browser. `opensRun` starts
+   * a span for a run this client did not submit (a queued message, another
+   * tab, Slack); `text` is a streamed prose flush (`delta`) or assistant prose
+   * that first arrived whole in its completed message (`message`), which still
+   * marks `first_text` but is not a delta; `humanMessageId` is the human
+   * message the event records; `ends` is the turn's outcome. Events of a turn
+   * the span does not time, such as the one a queued message waits behind,
+   * leave it alone.
+   */
+  transcriptEvent(options: {
+    turnId: string
+    opensRun?: boolean
+    humanMessageId?: string
+    text?: "delta" | "message"
+    ends?: RunEndReason
+  }): void {
+    if (options.opensRun && (!this.state || this.state.span.ended)) {
+      this.begin({ joined: true })
+      this.state?.span.mark("accepted")
+    }
+    const state = this.state
+    if (!state || state.span.ended) return
+    if (state.turnId === null && this.claims(state, options))
+      state.turnId = options.turnId
+    if (options.turnId !== state.turnId) return
+    state.events += 1
+    state.span.mark("first_event")
+    if (options.text === "delta") state.textDeltas += 1
+    if (options.text) state.span.mark("first_text")
+    if (options.ends) this.completed(options.ends)
+  }
+
+  private claims(
+    state: RunState,
+    event: { turnId: string; opensRun?: boolean; humanMessageId?: string }
+  ): boolean {
+    if (state.messageId !== null)
+      return event.humanMessageId === state.messageId
+    return Boolean(event.opensRun) && event.turnId !== state.runningTurnId
+  }
+
+  transcriptBuilt(durationMs: number): void {
+    const state = this.state
+    if (!state || state.span.ended) return
+    state.builds += 1
+    state.buildMs += durationMs
+  }
+
+  transcriptCommitted(durationMs: number): void {
+    const state = this.state
+    if (!state || state.span.ended) return
+    state.commits += 1
+    state.commitMs += durationMs
+    state.commitMaxMs = Math.max(state.commitMaxMs, durationMs)
+  }
+
+  /** The run's streaming phase ended. */
+  completed(reason: RunEndReason): void {
+    const state = this.state
+    if (!state || state.span.ended) return
+    const attributes: PerfAttributes = {
+      reason,
+      events: state.events,
+      text_deltas: state.textDeltas,
+      builds: state.builds,
+      build_ms: Math.round(state.buildMs),
+    }
+    if (state.lagSamples > 0) {
+      attributes["lag_avg_ms"] = Math.round(state.lagSum / state.lagSamples)
+      attributes["lag_max_ms"] = Math.round(state.lagMax)
+    }
+    if (state.commits > 0) {
+      attributes["commits"] = state.commits
+      attributes["commit_ms"] = Math.round(state.commitMs)
+      attributes["commit_max_ms"] = Math.round(state.commitMaxMs)
+    }
+    state.span.end(attributes)
+    openRuns.delete(this)
+    this.state = null
+  }
+
+  dispose(): void {
+    if (this.state && !this.state.span.ended) {
+      this.state.span.abandon("unmounted")
+    }
+    openRuns.delete(this)
+    this.state = null
+  }
+}
+
+/** Transcript work for a thread while its run streams. */
+export function runTranscriptBuilt(threadId: string, durationMs: number): void {
+  for (const run of openRunsFor(threadId)) run.transcriptBuilt(durationMs)
+}
+
+/** React `Profiler` commit durations; only fires in development builds. */
+export function runTranscriptCommitted(
+  threadId: string,
+  durationMs: number
+): void {
+  for (const run of openRunsFor(threadId)) run.transcriptCommitted(durationMs)
+}

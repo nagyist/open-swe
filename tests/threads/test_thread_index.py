@@ -1,0 +1,271 @@
+import asyncio
+from datetime import UTC, datetime, timedelta
+
+import pytest
+from sqlalchemy import text
+
+from openswe.threads import index
+from openswe.threads.creation import TITLE_LOCKED_KEY
+from openswe.threads.index import IndexedThread, ThreadExistsError, ThreadSearch
+
+pytestmark = pytest.mark.usefixtures("registry_db")
+
+_DAY = datetime(2026, 10, 1, tzinfo=UTC)
+
+
+async def _seed() -> None:
+    for n, (owner, visibility, status) in enumerate(
+        [("ada", "private", "idle"), ("ada", "public", "busy"), ("bob", "public", "idle")]
+    ):
+        await index.create(
+            f"t{n}",
+            runtime="mda" if n else "local",
+            metadata={"owner_login": owner, "visibility": visibility, "repo": {"name": "app"}},
+            status=status,
+            created_at=_DAY + timedelta(hours=n),
+            updated_at=_DAY + timedelta(hours=10 - n),
+        )
+
+
+async def test_a_thread_round_trips_in_the_agent_servers_shape() -> None:
+    created = await index.create("t1", runtime="mda", metadata={"title": "Fix it"})
+
+    assert await index.get("t1") == created
+    shape = created.as_langgraph()
+    assert shape["thread_id"] == "t1"
+    assert shape["metadata"] == {"title": "Fix it"}
+    assert shape["status"] == "idle"
+    assert created.as_langgraph(["thread_id", "status"]) == {"thread_id": "t1", "status": "idle"}
+
+
+async def test_activity_commits_invalidate_sidebar_lists() -> None:
+    from openswe.database import postgres
+    from openswe.ui_invalidations import Topic, outbox
+
+    topic = Topic.THREADS.keyed("public")
+    await index.create("t1", runtime="mda")
+    assert await outbox.invalidated_since({topic: 60}) == {topic}
+    async with postgres.transaction() as conn:
+        await conn.execute(text("DELETE FROM ui_invalidation"))
+    await index.update("t1", {"latest_run_status": "running"})
+    assert await outbox.invalidated_since({topic: 60}) == set()
+    for patch in [{"updated_at_ms": 123}, {"title": "Renamed"}, {"resolved": True}]:
+        async with postgres.transaction() as conn:
+            await conn.execute(text("DELETE FROM ui_invalidation"))
+        await index.update("t1", patch)
+        assert await outbox.invalidated_since({topic: 60}) == {topic}
+
+
+async def test_creating_an_indexed_thread_raises_or_returns_it() -> None:
+    first = await index.create("t1", runtime="local", metadata={"title": "first"})
+
+    with pytest.raises(ThreadExistsError):
+        await index.create("t1", runtime="mda", metadata={"title": "second"})
+    assert await index.create("t1", runtime="mda", if_exists="do_nothing") == first
+
+
+async def test_an_update_merges_top_level_keys_as_the_agent_server_does() -> None:
+    await index.create("t1", runtime="mda", metadata={"a": 1, "b": {"x": 1}})
+
+    updated = await index.update("t1", {"b": {"y": 2}, "c": None})
+
+    assert updated is not None
+    assert updated.metadata == {"a": 1, "b": {"y": 2}, "c": None}
+    assert await index.update("missing", {"a": 1}) is None
+
+
+async def test_an_update_unless_title_locked_skips_a_thread_a_person_renamed() -> None:
+    await index.create("auto", runtime="mda", metadata={"title": "Untitled"})
+    await index.create("mine", runtime="mda", metadata={"title": "Mine", TITLE_LOCKED_KEY: True})
+
+    assert await index.update("auto", {"title": "PR"}, unless_title_locked=True) is not None
+    assert await index.update("mine", {"title": "PR"}, unless_title_locked=True) is None
+    mine = await index.get("mine")
+    assert mine is not None and mine.metadata["title"] == "Mine"
+
+
+async def test_search_filters_sorts_and_pages_like_the_agent_server() -> None:
+    await _seed()
+
+    def ids(found: list[index.IndexedThread]) -> list[str]:
+        return [thread.thread_id for thread in found]
+
+    assert ids(await ThreadSearch(metadata={"owner_login": "ada"}).run()) == ["t1", "t0"]
+    assert ids(await ThreadSearch(metadata={"repo": {"name": "app"}}, limit=2).run()) == [
+        "t2",
+        "t1",
+    ]
+    assert ids(await ThreadSearch(sort_by="updated_at", offset=1, limit=5).run()) == ["t1", "t2"]
+    assert ids(await ThreadSearch(sort_by="created_at", sort_order="asc").run()) == [
+        "t0",
+        "t1",
+        "t2",
+    ]
+    assert ids(await ThreadSearch(status="busy").run()) == ["t1"]
+    assert ids(await ThreadSearch(ids=["t2", "t0", "nope"]).run()) == ["t2", "t0"]
+    assert ids(await ThreadSearch(metadata={"visibility": "public"}, ids=["t0", "t1"]).run()) == [
+        "t1"
+    ]
+    assert await ThreadSearch(metadata={"owner_login": "ada"}, limit=1).count() == 2
+
+
+async def test_a_text_search_ranks_title_matches_and_recent_activity_first() -> None:
+    now = datetime.now(UTC)
+    for thread_id, metadata, age in [
+        ("old-title", {"title": "Widget cache"}, timedelta(days=90)),
+        ("new-branch", {"title": "Fix", "branch_name": "widget-fix"}, timedelta(hours=1)),
+        ("old-branch", {"title": "Fix", "branch_name": "widget-old"}, timedelta(days=30)),
+        ("new-title", {"title": "Speed up widgets"}, timedelta(days=2)),
+        ("repo", {"title": "Other", "repo_owner": "Acme", "repo_name": "Widgets"}, timedelta(0)),
+        ("miss", {"title": "Unrelated"}, timedelta(0)),
+    ]:
+        await index.create(
+            thread_id, runtime="mda", metadata=metadata, created_at=now - age, updated_at=now - age
+        )
+
+    found = await ThreadSearch(text="WIDGET", limit=10).run()
+
+    assert [thread.thread_id for thread in found] == [
+        "new-title",
+        "old-title",
+        "repo",
+        "new-branch",
+        "old-branch",
+    ]
+    assert all(thread.rank is not None for thread in found)
+    assert await ThreadSearch(text="acme/widgets").count() == 1
+    assert "search_rank" not in (await ThreadSearch(limit=1).run())[0].as_langgraph()
+    fuzzy = await ThreadSearch(text="widgte", limit=1).run()
+    assert len(fuzzy) == 1
+    assert fuzzy[0].thread_id != "miss"
+    assert await ThreadSearch(text="widgte").count() == 5
+
+
+async def test_a_text_search_matches_derived_titles_and_unescaped_values() -> None:
+    now = datetime.now(UTC)
+    for thread_id, metadata in [
+        ("quoted", {"title": "Fix", "pull_requests": [{"title": 'Handle "retry" in C:\\tmp'}]}),
+        ("untitled", {}),
+        ("review", {"kind": "reviewer", "pr": {"number": 12, "title": "Ship it"}}),
+        ("branch", {"title": "Other", "branch_name": "review-12"}),
+    ]:
+        await index.create(thread_id, runtime="mda", metadata=metadata, updated_at=now)
+
+    async def ids(text: str) -> list[str]:
+        return [thread.thread_id for thread in await ThreadSearch(text=text).run()]
+
+    assert await ids('"retry" in c:\\tmp') == ["quoted"]
+    assert await ids("untitled") == ["untitled"]
+    assert await ids("review: #12") == ["review"]
+    assert await ids("review") == ["review", "branch"]
+
+
+async def test_a_status_change_restarts_its_clock_but_a_repeat_does_not() -> None:
+    await index.create("t1", runtime="mda")
+
+    await index.set_status("t1", "busy")
+    later = datetime.now(UTC) + timedelta(seconds=1)
+    [stuck] = await index.busy_since(later)
+    await index.set_status("t1", "busy")
+
+    assert [thread.thread_id for thread in await index.busy_since(later)] == [stuck.thread_id]
+    await index.set_status("t1", "idle")
+    assert await index.busy_since(later) == []
+    assert await index.delete("t1")
+    assert not await index.delete("t1")
+
+
+async def test_a_sync_that_read_an_older_copy_never_lands_after_a_newer_one() -> None:
+    agent_server = {"title": "old"}
+    first_read, release = asyncio.Event(), asyncio.Event()
+
+    def copy() -> IndexedThread:
+        return IndexedThread(
+            thread_id="t1",
+            runtime="local",
+            metadata=dict(agent_server),
+            status="idle",
+            created_at=_DAY,
+            updated_at=_DAY,
+        )
+
+    async def slow_read() -> IndexedThread:
+        read = copy()
+        first_read.set()
+        await release.wait()
+        return read
+
+    async def read() -> IndexedThread:
+        return copy()
+
+    slow = asyncio.create_task(index.sync("t1", slow_read))
+    await first_read.wait()
+    agent_server["title"] = "new"
+    fast = asyncio.create_task(index.sync("t1", read))
+    await asyncio.sleep(0.1)
+    release.set()
+    await asyncio.gather(slow, fast)
+
+    synced = await index.get("t1")
+    assert synced is not None and synced.metadata == {"title": "new"}
+
+
+async def test_numeric_search_does_not_match_nearby_pr_numbers() -> None:
+    await index.create("wanted", runtime="mda", metadata={"pr_number": 59163})
+    await index.create("neighbor", runtime="mda", metadata={"pr_number": 59136})
+    found = await ThreadSearch(text="59163").run()
+    assert [thread.thread_id for thread in found] == ["wanted"]
+    assert await ThreadSearch(text="59163").count() == 1
+
+
+@pytest.mark.parametrize(
+    "patch", [{"title": "Renamed"}, {"resolved": True}, {"latest_run_status": "running"}]
+)
+async def test_activity_pagination_ignores_non_activity_writes(
+    patch: dict[str, str | bool],
+) -> None:
+    for n in range(11):
+        at = _DAY + timedelta(hours=n)
+        await index.create(
+            f"t{n:02}",
+            runtime="mda",
+            metadata={"updated_at_ms": int(at.timestamp() * 1000)},
+            created_at=at,
+            updated_at=at,
+        )
+    await index.update("t00", patch)
+    await index.set_status("t00", "busy")
+    first = await ThreadSearch(sort_by="updated_at", activity_order=True, limit=10).run()
+    second = await ThreadSearch(sort_by="updated_at", activity_order=True, offset=10).run()
+    assert [thread.thread_id for thread in first] == [f"t{n:02}" for n in range(10, 0, -1)]
+    assert [thread.thread_id for thread in second] == ["t00"]
+    assert (await ThreadSearch(sort_by="updated_at", limit=1).run())[0].thread_id == "t00"
+    await index.update("t00", {"updated_at_ms": int((_DAY + timedelta(days=1)).timestamp() * 1000)})
+    assert (await ThreadSearch(sort_by="updated_at", activity_order=True, limit=1).run())[
+        0
+    ].thread_id == "t00"
+    await index.create(
+        "future",
+        runtime="mda",
+        metadata={"updated_at_ms": int((datetime.now(UTC) + timedelta(days=1)).timestamp() * 1000)},
+    )
+    await index.update("t00", {"updated_at_ms": None})
+    assert [
+        thread.thread_id
+        for thread in await ThreadSearch(sort_by="updated_at", activity_order=True, limit=2).run()
+    ] == ["future", "t00"]
+    await index.import_newer(
+        [
+            IndexedThread(
+                thread_id="t00",
+                runtime="mda",
+                metadata={},
+                status="idle",
+                created_at=_DAY,
+                updated_at=datetime.now(UTC) + timedelta(days=2),
+            )
+        ]
+    )
+    assert (await ThreadSearch(sort_by="updated_at", activity_order=True, limit=1).run())[
+        0
+    ].thread_id == "t00"

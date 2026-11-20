@@ -1,0 +1,316 @@
+import { formatJsonToolResult } from "./toolResultJson"
+import type {
+  AcpToolStatus,
+  Chunk,
+  ToolExecutionChunk,
+} from "@/features/agents/lib/types"
+import {
+  formatPathDisplayParts,
+  formatToolDisplayParts,
+} from "@/features/agents/components/chat/toolExecutionDisplay"
+import { countLineChanges } from "@/features/agents/utils/diffStats"
+import { Thought } from "@/features/agents/components/messages/thought"
+
+export type WorkEntryIconName =
+  | "bot"
+  | "brain"
+  | "check"
+  | "circle-alert"
+  | "eye"
+  | "globe"
+  | "hammer"
+  | "message-circle"
+  | "square-pen"
+  | "terminal"
+  | "wrench"
+  | "zap"
+
+export interface WorkEntryView {
+  icon: WorkEntryIconName
+  heading: string
+  /** Dimmed argument shown after the heading; null when it would just repeat it. */
+  preview: string | null
+  previewTooltip?: string
+  destinationHref?: string
+  destinationLabel?: string
+  diffStats?: { additions: number; deletions: number }
+  status: AcpToolStatus | "unknown"
+  /** The call's output as plain text, for rows that render nothing richer. */
+  expandedText: string | null
+  /**
+   * Fetches the rest of the output when the row is expanded, for sources whose
+   * transcript holds only a preview. Null when there is nothing more to get.
+   */
+  loadExpandedText: (() => Promise<string>) | null
+}
+
+function iconForChunk(chunk: ToolExecutionChunk): WorkEntryIconName {
+  if (chunk.diffs?.length || chunk.diffData) return "square-pen"
+
+  switch (chunk.toolKind) {
+    case "execute":
+    case "background":
+      return "terminal"
+    case "read":
+      return "eye"
+    case "search":
+      return "eye"
+    case "edit":
+    case "delete":
+    case "move":
+      return "square-pen"
+    case "fetch":
+      return "globe"
+    case "think":
+      return "bot"
+    case "slack":
+    case "linear":
+      return "message-circle"
+    case "task":
+      return "hammer"
+    default:
+      return "wrench"
+  }
+}
+
+function firstLocationPath(
+  chunk: ToolExecutionChunk,
+  repoPath?: string
+): string | null {
+  const locations = chunk.locations ?? []
+  const first = locations[0]
+  if (!first) return null
+  const display = stripRepoPath(first.path, repoPath)
+  return locations.length === 1
+    ? display
+    : `${display} +${locations.length - 1} more`
+}
+
+function stripRepoPath(path: string, repoPath?: string): string {
+  if (!repoPath || !path.startsWith(repoPath)) return path
+  return path.slice(repoPath.length).replace(/^\/+/, "") || "."
+}
+
+function normalizeForCompare(value: string): string {
+  return value.trim().replace(/\s+/g, " ").toLowerCase()
+}
+
+/**
+ * Truncated so a runaway tool output can't blow up the row; the full text stays
+ * reachable through the lazy load or the tool's own renderer.
+ */
+const MAX_EXPANDED_TEXT_LENGTH = 4000
+
+function expandedTextForChunk(
+  chunk: ToolExecutionChunk,
+  repoPath?: string
+): string | null {
+  const output = (chunk.output ?? "").trim()
+  if (!output) {
+    const locations = chunk.locations ?? []
+    return locations.length > 0
+      ? locations.map((loc) => stripRepoPath(loc.path, repoPath)).join("\n")
+      : null
+  }
+  const json = formatJsonToolResult(chunk.output ?? "")
+  if (json !== null) return json
+  return output.length > MAX_EXPANDED_TEXT_LENGTH
+    ? `${output.slice(0, MAX_EXPANDED_TEXT_LENGTH)}\n…`
+    : output
+}
+
+/** Whether a call's input/output body would show anything when expanded. */
+export function hasToolCallDetail(
+  chunk: ToolExecutionChunk,
+  hasInput: boolean
+): boolean {
+  return (
+    hasInput ||
+    Boolean(chunk.output || chunk.loadOutput) ||
+    chunk.status === "in_progress" ||
+    chunk.status === "pending"
+  )
+}
+
+/** The diff a tool call ultimately produced — the last one wins when a call touched a file repeatedly. */
+export function latestDiff(chunk: ToolExecutionChunk) {
+  return chunk.diffs?.length
+    ? chunk.diffs[chunk.diffs.length - 1]
+    : chunk.diffData
+}
+
+export function routedMessageHref(
+  chunk: ToolExecutionChunk
+): string | undefined {
+  const name = (
+    chunk.toolName ?? chunk.title.trim().split(/\s+/, 1)[0]
+  )?.toLowerCase()
+  if (
+    chunk.status !== "completed" ||
+    !(
+      name === "message_task_thread" ||
+      (name === "manage_thread" && chunk.input?.action === "send_message")
+    )
+  )
+    return undefined
+  try {
+    const result: unknown = JSON.parse(chunk.output ?? "")
+    if (
+      typeof result === "object" &&
+      result !== null &&
+      "success" in result &&
+      result.success === true &&
+      "recipient_thread_id" in result &&
+      typeof result.recipient_thread_id === "string" &&
+      /^[0-9a-f-]{36}$/i.test(result.recipient_thread_id)
+    )
+      return `/agents/${result.recipient_thread_id}`
+  } catch {
+    return undefined
+  }
+  return undefined
+}
+
+export function describeWorkEntry(
+  chunk: ToolExecutionChunk,
+  repoPath?: string
+): WorkEntryView {
+  const diff = latestDiff(chunk)
+  if (diff && chunk.status !== "error") {
+    const heading =
+      chunk.status === "completed"
+        ? diff.isNewFile
+          ? "Created"
+          : "Edited"
+        : "Editing"
+    const pathDisplay = formatPathDisplayParts(heading, diff.filePath)
+    return {
+      icon: "square-pen",
+      ...pathDisplay,
+      diffStats: countLineChanges(
+        diff.originalContent,
+        diff.newContent,
+        diff.filePath
+      ),
+      status: chunk.status,
+      // The diff itself is the body; a text dump alongside it would be noise.
+      expandedText: null,
+      loadExpandedText: null,
+    }
+  }
+
+  const { heading, preview, previewTooltip } = formatToolDisplayParts(
+    chunk.title,
+    chunk.toolKind,
+    chunk.input,
+    repoPath
+  )
+  const resolvedPreview = preview ?? firstLocationPath(chunk, repoPath)
+
+  return {
+    icon: iconForChunk(chunk),
+    heading,
+    preview:
+      resolvedPreview &&
+      normalizeForCompare(resolvedPreview) !== normalizeForCompare(heading)
+        ? resolvedPreview
+        : null,
+    previewTooltip,
+    destinationHref: routedMessageHref(chunk),
+    status: chunk.status,
+    expandedText: expandedTextForChunk(chunk, repoPath),
+    loadExpandedText: chunk.loadOutput ?? null,
+  }
+}
+
+function toolActivityVerb(chunk: ToolExecutionChunk): string {
+  const active = chunk.status === "in_progress" || chunk.status === "pending"
+
+  switch (chunk.toolKind) {
+    case "read":
+    case "search":
+      return active ? "Exploring" : "Explored"
+    case "sql":
+      return active ? "Querying" : "Queried"
+    case "execute":
+      return active ? "Running" : "Ran"
+    case "background":
+      return active ? "Starting in background" : "Started in background"
+    case "edit":
+    case "delete":
+    case "move":
+      return active ? "Editing" : "Updated"
+    case "fetch":
+      return active ? "Researching" : "Researched"
+    case "task":
+      return active ? "Delegating" : "Delegated"
+    case "code":
+      return active ? "Running code" : "Ran code"
+    case "think":
+      return "Thinking"
+    case "slack":
+    case "linear":
+      return "Sending update"
+    case "managed-tools":
+      return "Offering connection"
+    case "other":
+      return describeWorkEntry(chunk).heading
+  }
+}
+
+export function liveActivityLabel(
+  chunks: Array<Chunk>,
+  repoPath?: string
+): string {
+  for (let index = chunks.length - 1; index >= 0; index -= 1) {
+    let chunk = chunks[index]
+    if (!chunk) continue
+
+    if (chunk.kind === "reasoning") {
+      const label = new Thought(chunk.text).liveLabel
+      return label ? `${label}…` : "Thinking…"
+    }
+    if (chunk.kind === "text") {
+      if (chunk.text.trim()) return "Writing response…"
+      continue
+    }
+    if (chunk.kind === "error") return "Recovering from an error…"
+    if (
+      chunk.kind === "code" ||
+      chunk.kind === "list" ||
+      chunk.kind === "image"
+    ) {
+      return "Preparing response…"
+    }
+    if (chunk.kind === "todo") return "Planning next steps…"
+    if (chunk.kind === "task-event") return "Thinking…"
+
+    if (chunk.status === "completed") {
+      const activeTool = chunks.findLast(
+        (candidate): candidate is ToolExecutionChunk =>
+          candidate.kind === "tool-execution" &&
+          (candidate.status === "in_progress" || candidate.status === "pending")
+      )
+      if (!activeTool) return "Thinking…"
+      chunk = activeTool
+    }
+
+    // A running `eval` is doing whatever the call its code is waiting on does.
+    if (chunk.toolKind === "code") {
+      chunk =
+        chunk.calls?.findLast(
+          (call) => call.status === "in_progress" || call.status === "pending"
+        ) ?? chunk
+    }
+
+    if (chunk.status === "pending") return "Waiting for approval…"
+    if (chunk.status === "error") return "Recovering from an error…"
+    if (chunk.display?.type === "output_iframe") return "Preparing preview…"
+
+    const entry = describeWorkEntry(chunk, repoPath)
+    const verb = toolActivityVerb(chunk)
+    return entry.preview ? `${verb} · ${entry.preview}` : `${verb}…`
+  }
+
+  return "Working…"
+}

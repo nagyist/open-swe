@@ -1,0 +1,218 @@
+import type { AcpToolKind } from "@/features/agents/lib/types"
+import { humanizeToolName } from "@/features/agents/lib/toolNames"
+
+function pathName(path: string): string {
+  const withoutTrailingSeparators = path.replace(/[\\/]+$/, "")
+  if (!withoutTrailingSeparators) return path
+  return withoutTrailingSeparators.split(/[\\/]/).at(-1) || path
+}
+
+export function formatPathDisplayParts(
+  heading: string,
+  path: string
+): ToolDisplayParts {
+  return {
+    heading,
+    preview: pathName(path),
+    previewTooltip: path,
+  }
+}
+
+function firstStringArg(
+  input: Record<string, unknown> | undefined,
+  keys: Array<string>
+): string | undefined {
+  if (!input) return undefined
+  for (const key of keys) {
+    const value = input[key]
+    if (typeof value === "string" && value.trim()) return value.trim()
+  }
+  return undefined
+}
+
+const TEXT_ARGUMENTS = [
+  "reason",
+  "problem_description",
+  "keep_approval_reason",
+  "inline_summary",
+  "summary",
+  "description",
+  "message",
+  "comment",
+  "note",
+  "evidence",
+  "details",
+  "suggestion",
+  "instructions",
+  "prompt",
+  "custom_prompt",
+  "analysis_summary",
+  "body",
+  "content",
+  "text",
+  "query",
+  "title",
+]
+
+function toolTextArguments(
+  input: Record<string, unknown> | undefined
+): Array<[string, string]> {
+  return TEXT_ARGUMENTS.flatMap((key) => {
+    const value = input?.[key]
+    return typeof value === "string" && value.trim()
+      ? [[key, value] as [string, string]]
+      : []
+  })
+}
+
+export function formatShellCommand(command: string): string {
+  let display = command.trim()
+  const leadingCd =
+    /^cd[\t ]+(?:--[\t ]+)?(?:'[^']*'|"(?:\\[^\r\n]|[^"\\$`])*"|\\[^\r\n]|[^\s'"\\;&|<>()$`])+[\t ]*(?:&&|;(?![;&])|\r?\n)\s*/
+  while (true) {
+    const rest = display.replace(leadingCd, "")
+    if (!rest || rest === display) return display
+    display = rest
+  }
+}
+
+function truncateMiddle(value: string, maxLength: number): string {
+  return value.length > maxLength ? `${value.slice(0, maxLength)}...` : value
+}
+
+function normalizedToolName(title: string): string {
+  return title.trim().split(/\s+/, 1)[0]?.toLowerCase() ?? ""
+}
+
+function humanizeToolTitle(title: string): string {
+  const trimmed = title.trim()
+  if (!trimmed) return "Tool"
+
+  const [name, ...rest] = trimmed.split(/\s+/)
+  const suffix = rest.join(" ")
+  if (name && suffix && /^(?:[./~]|[a-z]+:\/\/)/i.test(suffix)) {
+    return `${humanizeToolName(name)} ${suffix}`
+  }
+  return humanizeToolName(trimmed)
+}
+
+/**
+ * A tool call split into the verb ("Read", "Shell") and its argument
+ * ("src/app.ts", "pnpm test"). The timeline styles the two differently — the
+ * heading carries weight, the preview dims out — so they have to stay separable
+ * rather than being pre-joined into one string.
+ */
+export interface ToolDisplayParts {
+  heading: string
+  preview: string | null
+  previewTooltip?: string
+}
+
+const DISPLAY_DESCRIPTION = "display_description"
+
+/** A described call reads as its description; what it would have shown moves to the tooltip. */
+export function formatToolDisplayParts(
+  title: string,
+  toolKind: AcpToolKind,
+  input: Record<string, unknown> | undefined,
+  repoPath?: string
+): ToolDisplayParts {
+  const parts = toolDisplayParts(title, toolKind, input, repoPath)
+  const description = firstStringArg(input, [DISPLAY_DESCRIPTION])
+  if (!description) return parts
+  return {
+    heading: parts.heading,
+    preview: truncateMiddle(description, 80),
+    previewTooltip: parts.previewTooltip ?? parts.preview ?? description,
+  }
+}
+
+function toolDisplayParts(
+  title: string,
+  toolKind: AcpToolKind,
+  input: Record<string, unknown> | undefined,
+  _repoPath?: string
+): ToolDisplayParts {
+  const toolName = normalizedToolName(title)
+  const path = firstStringArg(input, ["path", "file_path", "target_file"])
+  const pattern = firstStringArg(input, ["pattern"])
+  const query = firstStringArg(input, ["query"])
+  const url = firstStringArg(input, ["url"])
+  const command = firstStringArg(input, ["command"])
+  const text = toolTextArguments(input)[0]?.[1]
+  const plain = (heading: string): ToolDisplayParts => ({
+    heading,
+    preview: text ? truncateMiddle(text.trim(), 80) : null,
+    ...(text ? { previewTooltip: text } : {}),
+  })
+
+  switch (toolKind) {
+    case "read": {
+      if (path) {
+        return formatPathDisplayParts(toolName === "ls" ? "List" : "Read", path)
+      }
+      return plain(humanizeToolTitle(title))
+    }
+    case "search": {
+      if (pattern)
+        return {
+          heading: "Search",
+          preview: `"${truncateMiddle(pattern, 40)}"`,
+        }
+      if (query)
+        return { heading: "Search", preview: `"${truncateMiddle(query, 40)}"` }
+      if (path) return formatPathDisplayParts("Search", path)
+      return plain(humanizeToolTitle(title))
+    }
+    case "fetch": {
+      if (url) return { heading: "Fetch", preview: truncateMiddle(url, 50) }
+      return plain(humanizeToolTitle(title))
+    }
+    case "execute":
+    case "background": {
+      if (command)
+        return {
+          heading: toolKind === "background" ? "Background" : "Shell",
+          preview: truncateMiddle(formatShellCommand(command), 60),
+        }
+      return plain(humanizeToolTitle(title))
+    }
+    case "sql":
+      return {
+        heading: "SQL query",
+        preview: query ? truncateMiddle(query, 60) : null,
+      }
+    case "edit":
+      if (path) return formatPathDisplayParts("Edit", path)
+      return plain(humanizeToolTitle(title))
+    case "delete":
+      if (path) return formatPathDisplayParts("Delete", path)
+      return plain(humanizeToolTitle(title))
+    case "move":
+      if (path) return formatPathDisplayParts("Move", path)
+      return plain(humanizeToolTitle(title))
+    case "think":
+      return plain("Thinking...")
+    default: {
+      if (toolName === "ls" && path) {
+        return formatPathDisplayParts("List", path)
+      }
+      return plain(humanizeToolTitle(title))
+    }
+  }
+}
+
+export function formatToolDisplay(
+  title: string,
+  toolKind: AcpToolKind,
+  input: Record<string, unknown> | undefined,
+  repoPath?: string
+): string {
+  const { heading, preview } = formatToolDisplayParts(
+    title,
+    toolKind,
+    input,
+    repoPath
+  )
+  return preview ? `${heading} ${preview}` : heading
+}

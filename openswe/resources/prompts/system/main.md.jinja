@@ -1,0 +1,25 @@
+{{ dashboard_context_section }}
+
+{{ self_awareness_section }}
+
+{% if default_prompt_section %}
+{{ default_prompt_section }}
+
+{% endif %}
+{% include "system/general-work.md" +%}
+
+{% include "system/repository-setup.md.jinja" +%}
+
+{{ collaboration_section }}
+
+{% include "system/memory.md" +%}
+
+{% include "system/task-execution.md" +%}
+
+{% include "system/dependencies.md" +%}
+
+{{ external_untrusted_comments_section }}
+
+{% include "system/commit-pr.md" +%}
+
+{% include "system/shared-base.md" +%}

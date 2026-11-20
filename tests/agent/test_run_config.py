@@ -1,0 +1,76 @@
+from openswe.run_config import RunConfig
+
+
+def test_unlinked_github_cannot_enable_github_credentials():
+    cfg = RunConfig.parse(
+        {
+            "github_linked": False,
+            "github_login": "admin",
+            "github_user_id": 123,
+            "repo": {"owner": "private", "name": "repo"},
+        }
+    )
+    assert cfg.github_login is None
+    assert cfg.github_user_id is None
+    assert cfg.repo is None
+    assert cfg.repo_explicitly_none is True
+    assert cfg.dump()["auth_provider"] == "langsmith"
+    assert RunConfig.parse(cfg.dump()).github_linked is False
+
+
+def test_legacy_langsmith_auth_provider_means_unlinked():
+    raw = {"auth_provider": "langsmith", "github_login": "admin"}
+    assert RunConfig.unlinked(raw)
+    cfg = RunConfig.parse(raw)
+    assert cfg.github_linked is False
+    assert cfg.github_login is None
+    assert cfg.dump()["auth_provider"] == "langsmith"
+
+
+def test_github_login_is_preserved():
+    cfg = RunConfig.parse({"github_login": "octocat"})
+    assert cfg.github_login == "octocat"
+
+
+def test_parse_drops_only_the_malformed_field():
+    cfg = RunConfig.parse({"thread_id": "t1", "pr_number": {"not": "an int"}})
+    assert cfg.thread_id == "t1"
+    assert cfg.pr_number is None
+
+
+def test_invocation_id_rejects_conflicting_fields():
+    cfg = RunConfig.parse({"invocation_id": "inv-1", "prepare_run_id": "inv-2"})
+    assert cfg.invocation_id is None
+    assert cfg.prepare_run_id is None
+
+
+def test_bools_are_not_accepted_as_integers():
+    """Pydantic treats bool as int, which would make ``pr_number=True`` mean PR 1."""
+    cfg = RunConfig.parse(
+        {
+            "pr_number": True,
+            "thread_id": "t1",
+        }
+    )
+    assert cfg.pr_number is None
+    assert cfg.thread_id == "t1"
+
+
+def test_dump_drops_extras_that_cannot_be_json_encoded():
+    class ProxyUser:
+        pass
+
+    cfg = RunConfig.parse(
+        {
+            "thread_id": "t1",
+            "github_login": "octocat",
+            "langgraph_auth_user": ProxyUser(),
+            "nested": {"user": ProxyUser()},
+            "custom": {"a": 1},
+        }
+    )
+    assert cfg.dump() == {
+        "thread_id": "t1",
+        "github_login": "octocat",
+        "custom": {"a": 1},
+    }

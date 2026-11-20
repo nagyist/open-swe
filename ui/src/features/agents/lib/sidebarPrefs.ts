@@ -1,0 +1,267 @@
+import { useCallback, useSyncExternalStore } from "react"
+
+import { DEFAULT_SIDEBAR_FILTERS } from "./sidebarFilter"
+import type { SidebarFilters } from "./sidebarFilter"
+
+export const SIDEBAR_PREFS_STORAGE_KEY = "open-swe.agents.sidebar-prefs"
+const STORAGE_KEY = SIDEBAR_PREFS_STORAGE_KEY
+
+const ORGANIZE_MODES = ["date", "repo"] as const
+
+export type OrganizeMode = (typeof ORGANIZE_MODES)[number]
+export type ChatSort = "created" | "updated"
+
+export interface SidebarPrefs {
+  filters: SidebarFilters
+  /** Repositories pinned into the sidebar's Pinned section. Client-side only. */
+  pinnedRepoKeys: Array<string>
+  collapsedRepoKeys: Array<string>
+  expandedRepoKeys: Array<string>
+  /** Which of "pinned" | "repos" | "recents" are collapsed. */
+  collapsedSectionKeys: Array<string>
+  /** Nav links moved into the "More" menu. */
+  hiddenNavItems: Array<string>
+  organize: OrganizeMode
+}
+
+export const DEFAULT_SIDEBAR_PREFS: SidebarPrefs = {
+  filters: DEFAULT_SIDEBAR_FILTERS,
+  pinnedRepoKeys: [],
+  collapsedRepoKeys: [],
+  expandedRepoKeys: [],
+  collapsedSectionKeys: [],
+  hiddenNavItems: ["/agents/skills", "/agents/reviews"],
+  organize: "date",
+}
+
+function asStringArray(value: unknown): Array<string> {
+  return Array.isArray(value)
+    ? value.filter((v): v is string => typeof v === "string")
+    : []
+}
+
+/** localStorage is untrusted: anything not in the allow-list falls back. */
+function asEnum<T extends string>(
+  value: unknown,
+  allowed: ReadonlyArray<T>,
+  fallback: T
+): T {
+  return typeof value === "string" &&
+    (allowed as ReadonlyArray<string>).includes(value)
+    ? (value as T)
+    : fallback
+}
+
+function sanitizeFilters(value: unknown): SidebarFilters {
+  const raw =
+    value && typeof value === "object" ? (value as Record<string, unknown>) : {}
+  return {
+    sources: asStringArray(raw.sources) as SidebarFilters["sources"],
+    includeAutomations:
+      typeof raw.includeAutomations === "boolean"
+        ? raw.includeAutomations
+        : DEFAULT_SIDEBAR_FILTERS.includeAutomations,
+    includeResolved:
+      typeof raw.includeResolved === "boolean"
+        ? raw.includeResolved
+        : DEFAULT_SIDEBAR_FILTERS.includeResolved,
+    ownedOnly:
+      typeof raw.ownedOnly === "boolean"
+        ? raw.ownedOnly
+        : DEFAULT_SIDEBAR_FILTERS.ownedOnly,
+    includeSlack:
+      typeof raw.includeSlack === "boolean"
+        ? raw.includeSlack
+        : DEFAULT_SIDEBAR_FILTERS.includeSlack,
+  }
+}
+
+/**
+ * Stored keys predate repositories replacing "projects" in the sidebar: pins
+ * and folds were saved under `project:` keys and a `"project"` organize mode.
+ * Read them once under their new names so nobody loses their layout. The
+ * `"list"` and `"none"` modes were earlier forms of `"date"`.
+ */
+const LEGACY_ORGANIZE_MODES: Record<string, OrganizeMode> = {
+  project: "repo",
+  workspace: "repo",
+  list: "date",
+  none: "date",
+}
+
+function migrateRepoKey(key: string): string {
+  if (key === "project:no-project") return "repo:no-repo"
+  return key.startsWith("project:")
+    ? `repo:${key.slice("project:".length)}`
+    : key
+}
+
+function repoKeys(
+  raw: Record<string, unknown>,
+  key: string,
+  legacyKey: string
+): Array<string> {
+  return asStringArray(raw[key] ?? raw[legacyKey]).map(migrateRepoKey)
+}
+
+function sanitizePrefs(value: unknown): SidebarPrefs {
+  const raw =
+    value && typeof value === "object" ? (value as Record<string, unknown>) : {}
+  return {
+    filters: sanitizeFilters(raw.filters),
+    pinnedRepoKeys: repoKeys(raw, "pinnedRepoKeys", "pinnedProjectKeys"),
+    collapsedRepoKeys: repoKeys(
+      raw,
+      "collapsedRepoKeys",
+      "collapsedProjectKeys"
+    ),
+    expandedRepoKeys: repoKeys(raw, "expandedRepoKeys", "expandedProjectKeys"),
+    collapsedSectionKeys: asStringArray(raw.collapsedSectionKeys).map((key) =>
+      key === "projects" ? "repos" : key
+    ),
+    hiddenNavItems: Array.isArray(raw.hiddenNavItems)
+      ? asStringArray(raw.hiddenNavItems)
+      : DEFAULT_SIDEBAR_PREFS.hiddenNavItems,
+    organize: asEnum(
+      (typeof raw.organize === "string" &&
+        LEGACY_ORGANIZE_MODES[raw.organize]) ||
+        raw.organize,
+      ORGANIZE_MODES,
+      DEFAULT_SIDEBAR_PREFS.organize
+    ),
+  }
+}
+
+function toggleMembership(values: Array<string>, value: string): Array<string> {
+  return values.includes(value)
+    ? values.filter((entry) => entry !== value)
+    : [...values, value]
+}
+
+let cachedRaw: string | null | undefined
+let cachedPrefs = DEFAULT_SIDEBAR_PREFS
+const listeners = new Set<() => void>()
+
+function getSnapshot(): SidebarPrefs {
+  if (typeof window === "undefined") return DEFAULT_SIDEBAR_PREFS
+  try {
+    const raw = window.localStorage.getItem(STORAGE_KEY)
+    if (raw !== cachedRaw) {
+      cachedRaw = raw
+      cachedPrefs = DEFAULT_SIDEBAR_PREFS
+      if (raw) cachedPrefs = sanitizePrefs(JSON.parse(raw))
+    }
+  } catch {}
+  return cachedPrefs
+}
+
+function notifyListeners() {
+  listeners.forEach((listener) => listener())
+}
+
+function onStorage(event: StorageEvent) {
+  if (event.key === STORAGE_KEY || event.key === null) notifyListeners()
+}
+
+function subscribe(listener: () => void) {
+  if (listeners.size === 0) window.addEventListener("storage", onStorage)
+  listeners.add(listener)
+  return () => {
+    listeners.delete(listener)
+    if (listeners.size === 0) window.removeEventListener("storage", onStorage)
+  }
+}
+
+function setPrefs(update: (prev: SidebarPrefs) => SidebarPrefs) {
+  cachedPrefs = update(getSnapshot())
+  try {
+    const raw = JSON.stringify(cachedPrefs)
+    window.localStorage.setItem(STORAGE_KEY, raw)
+    cachedRaw = raw
+  } catch {}
+  notifyListeners()
+}
+
+/**
+ * False until hydration finishes, because the server render cannot read the
+ * stored preferences. Requests keyed by a preference must wait for this, or the
+ * placeholder defaults fetch a page the user never asked for.
+ */
+export function useSidebarPrefsHydrated(): boolean {
+  return useSyncExternalStore(
+    subscribe,
+    () => true,
+    () => false
+  )
+}
+
+export function useSidebarPrefs() {
+  const prefs = useSyncExternalStore(
+    subscribe,
+    getSnapshot,
+    () => DEFAULT_SIDEBAR_PREFS
+  )
+
+  const setFilters = useCallback(
+    (filters: SidebarFilters) => setPrefs((prev) => ({ ...prev, filters })),
+    []
+  )
+  const toggleRepoPin = useCallback(
+    (key: string) =>
+      setPrefs((prev) => ({
+        ...prev,
+        pinnedRepoKeys: toggleMembership(prev.pinnedRepoKeys, key),
+      })),
+    []
+  )
+  const toggleRepoCollapsed = useCallback(
+    (key: string) =>
+      setPrefs((prev) => ({
+        ...prev,
+        collapsedRepoKeys: toggleMembership(prev.collapsedRepoKeys, key),
+      })),
+    []
+  )
+  const expandRepo = useCallback(
+    (key: string) =>
+      setPrefs((prev) =>
+        prev.expandedRepoKeys.includes(key)
+          ? prev
+          : { ...prev, expandedRepoKeys: [...prev.expandedRepoKeys, key] }
+      ),
+    []
+  )
+
+  const toggleSectionCollapsed = useCallback(
+    (key: string) =>
+      setPrefs((prev) => ({
+        ...prev,
+        collapsedSectionKeys: toggleMembership(prev.collapsedSectionKeys, key),
+      })),
+    []
+  )
+  const toggleNavItemHidden = useCallback(
+    (to: string) =>
+      setPrefs((prev) => ({
+        ...prev,
+        hiddenNavItems: toggleMembership(prev.hiddenNavItems, to),
+      })),
+    []
+  )
+  const setView = useCallback(
+    (patch: Partial<Pick<SidebarPrefs, "organize">>) =>
+      setPrefs((prev) => ({ ...prev, ...patch })),
+    []
+  )
+
+  return {
+    prefs,
+    setFilters,
+    toggleRepoPin,
+    toggleRepoCollapsed,
+    toggleSectionCollapsed,
+    expandRepo,
+    toggleNavItemHidden,
+    setView,
+  }
+}

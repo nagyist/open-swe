@@ -1,0 +1,147 @@
+"""Provider-aware dashboard identity, independent of a GitHub handle."""
+
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from typing import Literal
+from uuid import UUID
+
+from fastapi import HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from openswe.users import User
+
+
+class AuthorizedClaims(dict[str, object]):
+    """Verified cookie claims carrying the person resolved during this request."""
+
+    def __init__(self, claims: Mapping[str, object], user: User) -> None:
+        super().__init__(claims)
+        self.user = user
+
+
+@dataclass(frozen=True)
+class DashboardPrincipal:
+    provider: Literal["github", "langsmith"]
+    subject: str
+    user_id: UUID | None
+    langsmith_subject: str | None = None
+    resolved_user: User | None = field(default=None, repr=False, compare=False)
+
+    @classmethod
+    def from_session(cls, session: Mapping[str, object]) -> DashboardPrincipal:
+        provider = session.get("provider", "github")
+        subject = session.get("sub")
+        if (
+            provider not in {"github", "langsmith"}
+            or not isinstance(subject, str)
+            or not subject.strip()
+        ):
+            raise HTTPException(401, "invalid session identity")
+        raw_id = session.get("user_id")
+        try:
+            user_id = UUID(raw_id) if isinstance(raw_id, str) else None
+        except ValueError as exc:
+            if provider == "langsmith":
+                raise HTTPException(401, "invalid session user") from exc
+            user_id = None
+        external_id = session.get("langsmith_subject")
+        if provider == "langsmith" and (
+            user_id is None
+            or (subject.startswith("user:") and subject != f"user:{user_id}")
+            or not isinstance(external_id, str)
+            or not external_id
+        ):
+            raise HTTPException(401, "invalid LangSmith session")
+        return cls(
+            "langsmith" if provider == "langsmith" else "github",
+            subject,
+            user_id,
+            external_id if isinstance(external_id, str) else None,
+            session.user if isinstance(session, AuthorizedClaims) else None,
+        )
+
+    @property
+    def github_login(self) -> str | None:
+        """The GitHub login the session acts as; a LangSmith session has one once linked."""
+        return None if self.subject.startswith("user:") else self.subject
+
+    def authorize_path(self, path: str, method: str) -> None:
+        if self.github_login is not None:
+            return
+        prefix = "/dashboard/api/"
+        relative = path.removeprefix(prefix).rstrip("/") if path.startswith(prefix) else ""
+        personal = (
+            "me",
+            "profile",
+            "my-mcps",
+            "my-managed-tools",
+            "my-credentials/langsmith",
+            "threads",
+            "projects",
+            "bridges",
+            "skills",
+            "notifications",
+            "schedules",
+            "github/login",
+            "github/desktop/exchange",
+            "slack/login",
+            "slack/callback",
+            "slack/desktop/exchange",
+            "trace-flight",
+        )
+        if any(relative == group or relative.startswith(group + "/") for group in personal):
+            return
+        if relative == "plugins" and method == "GET":
+            return
+        if relative in {
+            "info",
+            "options",
+            "desktop/environments",
+            "client-errors",
+            "ui-invalidations",
+            "auth/logout",
+            "auth/callback",
+        }:
+            return
+        if method in {"GET", "HEAD"}:
+            if relative in {
+                "settings",
+                "team-settings",
+                "routing",
+                "organization-skills",
+                "analytics/gateway-spend",
+            }:
+                return
+            parts = relative.split("/")
+            if len(parts) == 2 and parts[0] == "plan":
+                return
+        raise HTTPException(403, "This operation requires a linked GitHub account")
+
+    async def user(self, *, session: AsyncSession | None = None) -> User | None:
+        if self.resolved_user is not None:
+            return self.resolved_user
+        if self.provider == "github":
+            return await User.for_session(self.user_id, self.subject, session=session)
+        user = await User.get(self.user_id, session=session) if self.user_id is not None else None
+        if (
+            user is None
+            or not any(
+                identity.provider == "langsmith" and identity.external_id == self.langsmith_subject
+                for identity in user.identities
+            )
+        ) and self.langsmith_subject:
+            # Linking GitHub may have moved the LangSmith identity to the account's person.
+            user = await User.for_identity("langsmith", self.langsmith_subject, session=session)
+        if user is None:
+            raise HTTPException(401, "LangSmith account not found — sign in again")
+        if self.github_login is not None and user.github_login.lower() != self.github_login.lower():
+            raise HTTPException(401, "Your linked GitHub account changed — sign in again")
+        return user
+
+    async def authorize(self, *, path: str | None = None) -> None:
+        from openswe.dashboard.langsmith_login import LangSmithLogin
+
+        user = await self.user()
+        if user is None:
+            raise HTTPException(401, "Sign in with LangSmith to use Robin")
+        await LangSmithLogin().authorize_user(user)

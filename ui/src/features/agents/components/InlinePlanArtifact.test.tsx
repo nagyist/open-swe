@@ -1,0 +1,93 @@
+/** @vitest-environment jsdom */
+
+import { TooltipProvider } from "@langchain/macaw-components/Tooltip"
+import { cleanup, fireEvent, render, screen } from "@testing-library/react"
+import { afterEach, describe, expect, it, vi } from "vitest"
+
+import { productAnalytics } from "@/lib/analytics"
+
+import { InlinePlanArtifact } from "./InlinePlanArtifact"
+
+vi.mock("@/lib/analytics", () => ({
+  productAnalytics: { featureOpened: vi.fn() },
+}))
+
+const mocks = vi.hoisted(() => ({
+  status: "ready",
+}))
+
+vi.mock("@tanstack/react-query", () => ({
+  useQuery: () => ({
+    data: {
+      status: mocks.status,
+      html: "<h1>Report</h1>",
+      markdown: "",
+    },
+  }),
+  useMutation: () => ({ isPending: false, mutate: vi.fn() }),
+  useQueryClient: () => ({}),
+}))
+vi.mock("@tanstack/react-router", () => ({
+  useNavigate: () => vi.fn(),
+}))
+vi.mock("@/features/agents/components/PlanArtifactFrame", () => ({
+  PlanArtifactFrame: ({ title }: { title: string }) => <div title={title} />,
+}))
+
+afterEach(() => {
+  cleanup()
+  mocks.status = "ready"
+  vi.mocked(productAnalytics.featureOpened).mockClear()
+})
+
+describe("InlinePlanArtifact", () => {
+  it("opens the artifact beside the conversation when a panel opener is provided", () => {
+    const onOpen = vi.fn()
+    render(<InlinePlanArtifact threadId="thread-1" onOpen={onOpen} />, {
+      wrapper: TooltipProvider,
+    })
+    fireEvent.click(
+      screen.getByRole("button", { name: "Open artifact in the conversation" })
+    )
+    expect(onOpen).toHaveBeenCalledOnce()
+  })
+
+  it("uses artifact terminology for shared HTML reports", () => {
+    mocks.status = "shared"
+    render(<InlinePlanArtifact threadId="thread-1" />, {
+      wrapper: TooltipProvider,
+    })
+
+    expect(
+      screen.getByRole("button", { name: "Open artifact in the conversation" })
+        .textContent
+    ).toContain("Open artifact")
+    expect(screen.getByTitle("Artifact preview")).toBeTruthy()
+    expect(productAnalytics.featureOpened).not.toHaveBeenCalled()
+    fireEvent.click(
+      screen.getByRole("button", { name: "Open artifact in the conversation" })
+    )
+    expect(productAnalytics.featureOpened).toHaveBeenCalledExactlyOnceWith(
+      "artifact"
+    )
+  })
+
+  it("uses artifact terminology for legacy implementation plans", () => {
+    render(<InlinePlanArtifact threadId="thread-1" />, {
+      wrapper: TooltipProvider,
+    })
+
+    expect(
+      screen.getByRole("button", { name: "Open artifact in the conversation" })
+        .textContent
+    ).toContain("Open artifact")
+    expect(screen.getByTitle("Artifact preview")).toBeTruthy()
+    expect(productAnalytics.featureOpened).not.toHaveBeenCalled()
+    fireEvent.click(
+      screen.getByRole("button", { name: "Open artifact in the conversation" })
+    )
+    expect(productAnalytics.featureOpened).toHaveBeenCalledExactlyOnceWith(
+      "artifact"
+    )
+  })
+})

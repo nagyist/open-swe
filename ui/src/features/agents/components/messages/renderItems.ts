@@ -1,0 +1,453 @@
+import { parseSqlResult } from "../chat/SqlResultTable"
+import { Thought } from "./thought"
+import { routedMessageHref } from "./timeline/workEntry"
+import {
+  parseManagedToolsCard,
+  type ManagedToolsCardOffer,
+} from "@/features/agents/lib/managedToolsCard"
+import type {
+  AnyImageChunk,
+  Chunk,
+  ToolExecutionChunk,
+} from "@/features/agents/lib/types"
+
+export type RenderItem =
+  | { type: "text-chunk"; key: string; chunk: Chunk }
+  | { type: "reasoning-item"; key: string; chunk: Chunk }
+  /**
+   * One or more `task` (subagent) tool calls collapsed into a single group so
+   * they can be rendered side by side as a card grid (see subagents/SubagentGroup).
+   */
+  | {
+      type: "subagent-group"
+      key: string
+      id: string
+      chunks: Array<ToolExecutionChunk>
+    }
+  | { type: "edit-item"; key: string; chunk: ToolExecutionChunk }
+  | { type: "shell-item"; key: string; chunk: ToolExecutionChunk }
+  /** A code-mode `eval` call, with the tool calls its code made nested inside. */
+  | { type: "code-item"; key: string; chunk: ToolExecutionChunk }
+  | { type: "reply-item"; key: string; chunk: ToolExecutionChunk }
+  | {
+      type: "managed-tools-item"
+      key: string
+      chunk: ToolExecutionChunk
+      offer: ManagedToolsCardOffer
+    }
+  | { type: "iframe-item"; key: string; chunk: ToolExecutionChunk }
+  /** A tool call that returned images, shown outside the fold so they are seen. */
+  | {
+      type: "image-item"
+      key: string
+      chunk: ToolExecutionChunk
+      images: Array<AnyImageChunk>
+    }
+  | { type: "sql-item"; key: string; chunk: ToolExecutionChunk }
+  | { type: "tool-item"; key: string; chunk: ToolExecutionChunk }
+  | { type: "routed-message-item"; key: string; chunk: ToolExecutionChunk }
+  | { type: "worker-launch-item"; key: string; chunk: ToolExecutionChunk }
+  | {
+      type: "task-event-item"
+      key: string
+      chunk: Extract<Chunk, { kind: "task-event" }>
+    }
+
+const REPLY_ITEM_TYPES = new Set<RenderItem["type"]>([
+  "text-chunk",
+  "reply-item",
+  "managed-tools-item",
+  "iframe-item",
+  "routed-message-item",
+  "image-item",
+])
+
+/** A run of work that folds behind one row, or a reply shown between such runs. */
+export type TurnSegment =
+  | { type: "reply"; item: RenderItem }
+  | { type: "work"; key: string; items: Array<RenderItem> }
+
+/** Splits a turn at every reply so each stretch of work folds in order. */
+export function segmentTurn(items: Array<RenderItem>): Array<TurnSegment> {
+  const segments: Array<TurnSegment> = []
+  items.forEach((item) => {
+    if (REPLY_ITEM_TYPES.has(item.type)) {
+      segments.push({ type: "reply", item })
+      return
+    }
+    const last = segments.at(-1)
+    if (last?.type === "work") last.items.push(item)
+    else segments.push({ type: "work", key: `work-${item.key}`, items: [item] })
+  })
+  return segments
+}
+
+function toolNeedsAttention(
+  chunk: ToolExecutionChunk,
+  includeUnfinished: boolean
+): boolean {
+  return (
+    chunk.status === "pending" ||
+    (includeUnfinished && chunk.status === "in_progress")
+  )
+}
+
+function attentionItems(
+  item: RenderItem,
+  includeUnfinished: boolean
+): Array<RenderItem> {
+  if (item.type === "subagent-group") {
+    return item.chunks
+      .filter((chunk) => toolNeedsAttention(chunk, includeUnfinished))
+      .map((chunk) => ({
+        type: "tool-item" as const,
+        key: `attention-${chunk.toolCallId}`,
+        chunk,
+      }))
+  }
+
+  if (
+    item.type === "edit-item" ||
+    item.type === "shell-item" ||
+    item.type === "tool-item"
+  ) {
+    return toolNeedsAttention(item.chunk, includeUnfinished) ? [item] : []
+  }
+
+  if (item.type === "code-item") {
+    const chunks = [item.chunk, ...(item.chunk.calls ?? [])]
+    return chunks.some((chunk) => toolNeedsAttention(chunk, includeUnfinished))
+      ? [item]
+      : []
+  }
+
+  if (item.type === "worker-launch-item" || item.type === "task-event-item") {
+    return [item]
+  }
+
+  if (item.type === "text-chunk" && item.chunk.kind === "error") {
+    return [item]
+  }
+
+  return []
+}
+
+/** The entries of a folded stretch of work that stay visible: approvals, errors, and optionally unfinished calls. */
+export function collapsedWorkItems(
+  items: Array<RenderItem>,
+  includeUnfinished = false
+): Array<RenderItem> {
+  return items.flatMap((item) => attentionItems(item, includeUnfinished))
+}
+
+/** One entry of a live work tail: a thought's latest passage, or a tool call. */
+export type WorkTailEntry =
+  | {
+      kind: "reasoning"
+      key: string
+      heading: string | null
+      body: string
+    }
+  | { kind: "tool"; key: string; chunk: ToolExecutionChunk }
+
+/** The latest thought and tool call, leaving history inside the work fold. */
+export class WorkTail {
+  readonly entries: Array<WorkTailEntry>
+
+  constructor(items: Array<RenderItem>) {
+    const all = items.flatMap(WorkTail.entriesOf)
+    const thought = all
+      .slice(-10)
+      .findLast((entry) => entry.kind === "reasoning")
+    const tool = all.findLast((entry) => entry.kind === "tool")
+    this.entries = [...(thought ? [thought] : []), ...(tool ? [tool] : [])]
+  }
+
+  private static entriesOf(this: void, item: RenderItem): Array<WorkTailEntry> {
+    switch (item.type) {
+      case "reasoning-item": {
+        if (item.chunk.kind !== "reasoning") return []
+        const { heading, body } = new Thought(item.chunk.text).passage
+        if (!heading && !body) return []
+        return [
+          {
+            kind: "reasoning",
+            key: item.key,
+            heading,
+            body,
+          },
+        ]
+      }
+      case "subagent-group":
+        return WorkTail.toolEntries(item.key, item.chunks)
+      case "code-item":
+        return WorkTail.toolEntries(
+          item.key,
+          item.chunk.calls?.length ? item.chunk.calls : [item.chunk]
+        )
+      case "edit-item":
+      case "shell-item":
+      case "sql-item":
+      case "tool-item":
+        return WorkTail.toolEntries(item.key, [item.chunk])
+      default:
+        return []
+    }
+  }
+
+  private static toolEntries(
+    itemKey: string,
+    chunks: Array<ToolExecutionChunk>
+  ): Array<WorkTailEntry> {
+    return chunks.flatMap((chunk, index) =>
+      chunk.status === "pending"
+        ? []
+        : [
+            {
+              kind: "tool" as const,
+              key: chunk.toolCallId || `${itemKey}-${index}`,
+              chunk,
+            },
+          ]
+    )
+  }
+}
+
+export function countWorkActions(items: Array<RenderItem>): number {
+  return items.reduce((count, item) => {
+    if (item.type === "subagent-group") {
+      return count + item.chunks.length
+    }
+    if (
+      item.type === "edit-item" ||
+      item.type === "shell-item" ||
+      item.type === "sql-item" ||
+      item.type === "tool-item" ||
+      item.type === "worker-launch-item"
+    ) {
+      return count + 1
+    }
+    if (item.type === "code-item") {
+      return count + 1 + (item.chunk.calls?.length ?? 0)
+    }
+    return count
+  }, 0)
+}
+
+function getChunkRenderKey(chunk: Chunk, sourceIndex: number): string {
+  switch (chunk.kind) {
+    case "tool-execution":
+      return `tool-${chunk.toolCallId}`
+    case "text":
+      return `text-${sourceIndex}`
+    case "reasoning":
+      return `reasoning-${sourceIndex}`
+    case "code":
+      return `code-${sourceIndex}`
+    case "error":
+      return `error-${sourceIndex}`
+    case "list":
+      return `list-${sourceIndex}`
+    case "image":
+      return `image-${sourceIndex}`
+    default:
+      return `chunk-${sourceIndex}`
+  }
+}
+
+function isEditTool(chunk: ToolExecutionChunk): boolean {
+  const kind = chunk.toolKind
+  if (kind === "edit" || kind === "delete" || kind === "move") return true
+  if (chunk.diffs?.length) return true
+  if (chunk.diffData) return true
+  return false
+}
+
+function isShellTool(chunk: ToolExecutionChunk): boolean {
+  return chunk.toolKind === "execute" || chunk.toolKind === "background"
+}
+
+function isSqlResult(chunk: ToolExecutionChunk): boolean {
+  return (
+    chunk.toolKind === "sql" &&
+    chunk.status === "completed" &&
+    parseSqlResult(chunk.output) !== null
+  )
+}
+
+function isReplyTool(chunk: ToolExecutionChunk): boolean {
+  return chunk.toolKind === "slack" || chunk.toolKind === "linear"
+}
+
+/**
+ * Whether a tool chunk represents a spawned subagent. Subagents are launched
+ * via deepagents' `task` tool, which the transcript builder
+ * (`streamMessagesToUi.ts`) tags as `toolKind: "task"`.
+ * These are grouped and rendered as cards instead of a plain tool line.
+ */
+function isSubagentTool(chunk: ToolExecutionChunk): boolean {
+  return chunk.toolKind === "task"
+}
+
+export function buildRenderItems(
+  chunks: Array<Chunk>,
+  messageId?: string
+): Array<RenderItem> {
+  const items: Array<RenderItem> = []
+  let subagentBuffer: Array<ToolExecutionChunk> = []
+  let subagentStartIndex = -1
+
+  const flushSubagents = () => {
+    if (subagentBuffer.length === 0) return
+    const firstId = subagentBuffer[0]?.toolCallId
+    const id = `subagents-${firstId || subagentStartIndex}`
+    items.push({
+      type: "subagent-group",
+      key: id,
+      id,
+      chunks: [...subagentBuffer],
+    })
+    subagentBuffer = []
+    subagentStartIndex = -1
+  }
+
+  for (let i = 0; i < chunks.length; i += 1) {
+    const chunk = chunks[i]
+    if (!chunk) continue
+
+    if (chunk.kind === "tool-execution") {
+      if (routedMessageHref(chunk)) {
+        flushSubagents()
+        items.push({
+          type: "routed-message-item",
+          key: `tool-${chunk.toolCallId}`,
+          chunk,
+        })
+        continue
+      }
+      if (chunk.toolName === "start_async_task") {
+        flushSubagents()
+        items.push({
+          type: "worker-launch-item",
+          key: `tool-${chunk.toolCallId}`,
+          chunk,
+        })
+        continue
+      }
+      if (chunk.display?.type === "output_iframe") {
+        flushSubagents()
+        items.push({
+          type: "iframe-item",
+          key: `tool-${chunk.toolCallId}`,
+          chunk,
+        })
+        continue
+      }
+
+      if (chunk.images?.length) {
+        flushSubagents()
+        items.push({
+          type: "image-item",
+          key: `tool-${chunk.toolCallId}`,
+          chunk,
+          images: chunk.images,
+        })
+        continue
+      }
+
+      if (isSubagentTool(chunk)) {
+        if (subagentBuffer.length === 0) subagentStartIndex = i
+        subagentBuffer.push(chunk)
+        continue
+      }
+
+      flushSubagents()
+      const offer =
+        chunk.toolKind === "managed-tools"
+          ? parseManagedToolsCard(chunk.output)
+          : null
+
+      if (chunk.toolKind === "code") {
+        items.push({
+          type: "code-item",
+          key: `tool-${chunk.toolCallId}`,
+          chunk,
+        })
+      } else if (isEditTool(chunk)) {
+        items.push({
+          type: "edit-item",
+          key: `tool-${chunk.toolCallId}`,
+          chunk,
+        })
+      } else if (isShellTool(chunk)) {
+        items.push({
+          type: "shell-item",
+          key: `tool-${chunk.toolCallId}`,
+          chunk,
+        })
+      } else if (isSqlResult(chunk)) {
+        items.push({
+          type: "sql-item",
+          key: `tool-${chunk.toolCallId}`,
+          chunk,
+        })
+      } else if (offer) {
+        items.push({
+          type: "managed-tools-item",
+          key: `tool-${chunk.toolCallId}`,
+          chunk,
+          offer,
+        })
+      } else if (isReplyTool(chunk)) {
+        items.push({
+          type: "reply-item",
+          key: `tool-${chunk.toolCallId}`,
+          chunk,
+        })
+      } else {
+        items.push({
+          type: "tool-item",
+          key: `tool-${chunk.toolCallId}`,
+          chunk,
+        })
+      }
+      continue
+    }
+
+    if (chunk.kind === "text" && !chunk.text.trim()) continue
+
+    if (chunk.kind === "task-event") {
+      flushSubagents()
+      items.push({
+        type: "task-event-item",
+        key: `task-event-${chunk.messageId}`,
+        chunk,
+      })
+      continue
+    }
+
+    if (chunk.kind === "reasoning") {
+      flushSubagents()
+      items.push({
+        type: "reasoning-item",
+        key: messageId
+          ? `${messageId}-${getChunkRenderKey(chunk, i)}`
+          : getChunkRenderKey(chunk, i),
+        chunk,
+      })
+      continue
+    }
+
+    flushSubagents()
+    items.push({
+      type: "text-chunk",
+      key: messageId
+        ? `${messageId}-${getChunkRenderKey(chunk, i)}`
+        : getChunkRenderKey(chunk, i),
+      chunk,
+    })
+  }
+
+  flushSubagents()
+  return items
+}

@@ -1,0 +1,896 @@
+import asyncio
+import sys
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock
+
+import httpx2
+import pytest
+from runtime_api.operations import PullRequestHead
+
+import openswe.tools.open_pull_request  # noqa: F401
+from openswe.agent_api.git_metadata import collect_pr_targets
+from tests.conftest import serve_threads_from
+
+opr = sys.modules["openswe.tools.open_pull_request"]
+
+
+class _FakeRequest:
+    def __init__(self, method: str, url: str) -> None:
+        self.method = method
+        self.url = url
+
+
+class _FakeResponse:
+    def __init__(
+        self,
+        status_code: int,
+        payload: Any = None,
+        text: str = "",
+        headers: dict[str, str] | None = None,
+        request: _FakeRequest | None = None,
+    ) -> None:
+        self.status_code = status_code
+        self._payload = payload
+        self.text = text
+        self.headers = headers or {}
+        self.request = request
+
+    def json(self) -> Any:
+        return self._payload
+
+
+class _FakeClient:
+    def __init__(self, *, post: _FakeResponse, get: _FakeResponse | None = None) -> None:
+        self._post = post
+        self._get = get
+        self.post_calls: list[dict[str, Any]] = []
+        self.get_calls: list[dict[str, Any]] = []
+
+    async def __aenter__(self) -> _FakeClient:
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        return None
+
+    async def post(
+        self, url: str, *, headers: dict[str, str], json: dict[str, Any]
+    ) -> _FakeResponse:
+        self.post_calls.append({"url": url, "headers": headers, "json": json})
+        return self._post
+
+    async def get(
+        self, url: str, *, headers: dict[str, str], params: dict[str, str] | None = None
+    ) -> _FakeResponse:
+        self.get_calls.append({"url": url, "headers": headers, "params": params})
+        if url.endswith("/installation/repositories"):
+            return _FakeResponse(200, {"repositories": [{"full_name": "langchain-ai/open-swe"}]})
+        if self._get is not None:
+            return self._get
+        return _FakeResponse(200, {"name": "ok"})
+
+
+class _RoutingClient:
+    """Fake httpx2 client that routes GETs by URL substring."""
+
+    def __init__(self, *, post: _FakeResponse, get_routes: dict[str, _FakeResponse]) -> None:
+        self._post = post
+        self._get_routes = get_routes
+        self.post_calls: list[dict[str, Any]] = []
+        self.get_calls: list[dict[str, Any]] = []
+
+    async def __aenter__(self) -> _RoutingClient:
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        return None
+
+    async def post(
+        self, url: str, *, headers: dict[str, str], json: dict[str, Any]
+    ) -> _FakeResponse:
+        self.post_calls.append({"url": url, "headers": headers, "json": json})
+        return self._post
+
+    async def get(
+        self, url: str, *, headers: dict[str, str], params: dict[str, str] | None = None
+    ) -> _FakeResponse:
+        self.get_calls.append({"url": url, "headers": headers, "params": params})
+        for needle, resp in self._get_routes.items():
+            if needle in url:
+                return resp
+        return _FakeResponse(200, {"name": "ok"})
+
+
+def _install_client(monkeypatch: pytest.MonkeyPatch, client: _FakeClient | _RoutingClient) -> None:
+    monkeypatch.setattr(opr.httpx2, "AsyncClient", lambda **_kwargs: client)
+
+
+def _set_config(
+    monkeypatch: pytest.MonkeyPatch,
+    configurable: dict[str, Any],
+    *,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    configurable.setdefault("thread_id", "pr-thread")
+    metadata = (
+        metadata
+        if metadata is not None
+        else (
+            {"visibility": "public"}
+            if configurable.get("source") == "github"
+            else {"visibility": "private", "owner_login": configurable.get("github_login")}
+        )
+    )
+    serve_threads_from(monkeypatch, AsyncMock(return_value={"metadata": metadata}))
+    monkeypatch.setattr("openswe.run_config.get_config", lambda: {"configurable": configurable})
+    monkeypatch.setattr(opr, "get_config", lambda: {"configurable": configurable}, raising=False)
+
+
+def _open(base: str = "main") -> dict[str, Any]:
+    return asyncio.run(
+        opr._open_pull_request(
+            owner="langchain-ai",
+            repo="open-swe",
+            head="open-swe/feature",
+            base=base,
+            title="feat: x",
+            body="body",
+            draft=True,
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "installation_access", ["allowed", "other_account", "unavailable", "no_token"]
+)
+@pytest.mark.parametrize("requester_access", [True, False])
+def test_public_pr_cannot_use_requester_authority_outside_installation(
+    monkeypatch: pytest.MonkeyPatch, installation_access: str, requester_access: bool
+) -> None:
+    _set_config(
+        monkeypatch,
+        {"source": "slack", "github_login": "bob"},
+        metadata={"visibility": "public", "owner_type": "user", "owner_login": "Alice"},
+    )
+    monkeypatch.setattr(
+        "openswe.dashboard.profiles.get_valid_access_token",
+        AsyncMock(side_effect={"Alice": "alice-token", "bob": "bob-token"}.get),
+    )
+    monkeypatch.setattr(
+        opr,
+        "get_github_app_installation_token",
+        AsyncMock(return_value=None if installation_access == "no_token" else "installation-token"),
+    )
+    monkeypatch.setattr(opr, "_record_pr_telemetry", AsyncMock())
+    monkeypatch.setattr(opr, "get_plan_content", AsyncMock(return_value=None))
+    requests: list[httpx2.Request] = []
+
+    async def github(request: httpx2.Request) -> httpx2.Response:
+        requests.append(request)
+        if request.url.path == "/installation/repositories":
+            assert request.headers["Authorization"] == "Bearer installation-token"
+            if installation_access == "unavailable":
+                return httpx2.Response(503)
+            if request.url.params["page"] == "1":
+                return httpx2.Response(
+                    200,
+                    json={"repositories": [{"full_name": f"acme/repo-{i}"} for i in range(100)]},
+                )
+            full_name = (
+                "langchain-ai/open-swe" if installation_access == "allowed" else "other/open-swe"
+            )
+            return httpx2.Response(200, json={"repositories": [{"full_name": full_name}]})
+        # OAuth has broader access, including branches already pushed by someone else.
+        assert request.headers["Authorization"] == "Bearer alice-token"
+        if not requester_access:
+            return httpx2.Response(403, json={"message": "Resource not accessible"})
+        if request.method == "POST":
+            return httpx2.Response(201, json={"number": 1, "user": {"login": "Alice"}})
+        return httpx2.Response(200, json={"name": "existing-branch", "private": False})
+
+    client = httpx2.AsyncClient(transport=httpx2.MockTransport(github))
+    monkeypatch.setattr(opr.httpx2, "AsyncClient", lambda **kwargs: client)
+    result = _open()
+
+    if installation_access == "allowed" and requester_access:
+        assert result["success"] is True
+        assert result["author"] == "Alice"
+        assert result["token_kind"] == "user"
+        assert any(request.method == "POST" for request in requests)
+    else:
+        assert result["success"] is False
+        assert ("403" if installation_access == "allowed" else "installation") in result["error"]
+        assert not any(request.method == "POST" for request in requests)
+        assert all(request.headers["Authorization"] != "Bearer bob-token" for request in requests)
+
+
+def test_profile_draft_preference_overrides_tool_argument(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_config(monkeypatch, {"source": "slack", "github_login": "johannes117", "draft_prs": False})
+    _stub_token(monkeypatch)
+    client = _FakeClient(
+        post=_FakeResponse(
+            201,
+            {"html_url": "https://x/pull/1", "number": 1, "user": {"login": "johannes117"}},
+        )
+    )
+    _install_client(monkeypatch, client)
+
+    result = _open()
+
+    assert result["success"] is True
+    assert client.post_calls[0]["json"]["draft"] is False
+
+
+@pytest.mark.parametrize(("argument", "draft"), [({"draft": False}, False), ({}, True)])
+async def test_run_without_sender_profile_takes_draft_argument(
+    monkeypatch: pytest.MonkeyPatch, argument: dict[str, bool], draft: bool
+) -> None:
+    _set_config(monkeypatch, {"source": "api", "draft_prs": None})
+    _stub_token(monkeypatch)
+    client = _FakeClient(post=_FakeResponse(201, {"html_url": "u", "number": 1, "user": {}}))
+    _install_client(monkeypatch, client)
+
+    result = await opr.open_pull_request(
+        owner="langchain-ai",
+        repo="open-swe",
+        head="feature",
+        base="main",
+        title="fix: x",
+        body="body",
+        **argument,
+    )
+
+    assert result["success"] is True
+    assert client.post_calls[0]["json"]["draft"] is draft
+
+
+@pytest.mark.parametrize("stored", [True, False, None, "slow", "error"])
+def test_draft_preference_refresh_never_waits(
+    monkeypatch: pytest.MonkeyPatch, stored: bool | str | None
+) -> None:
+    _set_config(monkeypatch, {"source": "slack", "github_login": "johannes117", "draft_prs": True})
+    _stub_token(monkeypatch)
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def profile(login: str) -> dict[str, bool] | None:
+        assert login == "johannes117"
+        started.set()
+        if stored == "slow":
+            try:
+                await asyncio.Future()
+            finally:
+                cancelled.set()
+        if stored == "error":
+            raise RuntimeError("profile unavailable")
+        return {"draft_prs": stored} if isinstance(stored, bool) else None
+
+    async def preflight(**_kwargs: object) -> None:
+        await started.wait()
+
+    monkeypatch.setattr("openswe.dashboard.profiles.PROFILES.get", profile)
+    monkeypatch.setattr(opr, "_preflight_pr_access", preflight)
+    client = _FakeClient(post=_FakeResponse(201, {"html_url": "u", "number": 1, "user": {}}))
+    _install_client(monkeypatch, client)
+
+    async def open_pr() -> dict[str, object]:
+        result = await asyncio.wait_for(
+            opr._open_pull_request(
+                owner="langchain-ai",
+                repo="open-swe",
+                head="feature",
+                base="main",
+                title="fix: x",
+                body="body",
+                draft=True,
+            ),
+            timeout=1,
+        )
+        if stored == "slow":
+            await asyncio.wait_for(cancelled.wait(), timeout=1)
+        return result
+
+    result = asyncio.run(open_pr())
+
+    assert result["success"] is True
+    assert client.post_calls[0]["json"]["draft"] is (stored is not False)
+
+
+@pytest.mark.parametrize("ask", [False, True])
+def test_person_authored_pr_requires_user_token(monkeypatch: pytest.MonkeyPatch, ask: bool) -> None:
+    _set_config(
+        monkeypatch,
+        {"source": "slack", "github_login": "johannes117"},
+        metadata={"visibility": "public", "owner_type": "user", "owner_login": "johannes117"}
+        if ask
+        else None,
+    )
+    monkeypatch.setattr(
+        opr.GitHubCredentialScope, "is_public_listening_channel", AsyncMock(return_value=ask)
+    )
+
+    from openswe.dashboard import profiles
+
+    monkeypatch.setattr(profiles, "get_valid_access_token", AsyncMock(return_value=None))
+    bot = AsyncMock(return_value="bot-tok")
+    monkeypatch.setattr(opr, "get_github_app_installation_token", bot)
+
+    client = _FakeClient(post=_FakeResponse(201, {"html_url": "u", "number": 3, "user": {}}))
+    _install_client(monkeypatch, client)
+
+    with pytest.raises(opr.GitHubUserAuthRequired):
+        _open()
+    bot.assert_not_awaited()
+    assert not client.post_calls
+
+
+def test_returns_existing_pr_on_422(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_config(
+        monkeypatch,
+        {"source": "slack", "github_login": "bob"},
+        metadata={"visibility": "public", "owner_type": "user", "owner_login": "alice"},
+    )
+
+    from openswe.dashboard import profiles
+
+    monkeypatch.setattr(
+        profiles,
+        "get_valid_access_token",
+        AsyncMock(side_effect={"alice": "alice-token", "bob": "bob-token"}.get),
+    )
+    monkeypatch.setattr(opr, "get_github_app_installation_token", lambda: _coro("bot"))
+
+    client = _FakeClient(
+        post=_FakeResponse(422, text="A pull request already exists"),
+        get=_FakeResponse(
+            200, [{"html_url": "https://x/pull/9", "number": 9, "user": {"login": "johannes117"}}]
+        ),
+    )
+    _install_client(monkeypatch, client)
+
+    result = _open()
+
+    assert result["success"] is True
+    assert result["created"] is False
+    assert result["number"] == 9
+    assert result["author"] == "johannes117"
+    assert client.post_calls[0]["headers"]["Authorization"] == "Bearer alice-token"
+    pr_lookup = [call for call in client.get_calls if call["url"].endswith("/pulls")]
+    assert pr_lookup[0]["params"] == {
+        "head": "langchain-ai:open-swe/feature",
+        "state": "open",
+    }
+
+
+def test_404_create_returns_actionable_access_diagnostic(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    _set_config(monkeypatch, {"source": "slack", "github_login": "johannes117", "thread_id": "t1"})
+    _stub_token(monkeypatch)
+    client = _FakeClient(post=_FakeResponse(404, {"message": "Not Found"}))
+    _install_client(monkeypatch, client)
+
+    result = _open()
+
+    assert result["success"] is False
+    assert "Branch pushed: langchain-ai/open-swe:open-swe/feature (yes)" in result["error"]
+    assert "PR created: no" in result["error"]
+    assert "not installed on, granted access" in result["error"]
+    assert (
+        "open_pull_request_failed code=github_app_access_missing_or_repo_not_found" in caplog.text
+    )
+
+
+def test_preflight_head_branch_404_reports_branch_not_pushed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_config(monkeypatch, {"source": "slack", "github_login": "johannes117"})
+    _stub_token(monkeypatch)
+    client = _RoutingClient(
+        post=_FakeResponse(201, {"html_url": "u", "number": 1, "user": {}}),
+        get_routes={
+            "/repos/langchain-ai/open-swe/branches/main": _FakeResponse(200, {"name": "main"}),
+            "/repos/langchain-ai/open-swe/branches/open-swe%2Ffeature": _FakeResponse(
+                404, {"message": "Branch not found"}
+            ),
+            "/repos/langchain-ai/open-swe": _FakeResponse(200, {"private": True}),
+        },
+    )
+    _install_client(monkeypatch, client)
+
+    result = _open()
+
+    assert result["success"] is False
+    assert "head branch `open-swe/feature`" in result["error"]
+    assert "Branch pushed: langchain-ai/open-swe:open-swe/feature (no)" in result["error"]
+    assert client.post_calls == []
+
+
+def test_preflight_base_branch_redirect_surfaces_raw_github_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_config(monkeypatch, {"source": "slack", "github_login": "johannes117"})
+    _stub_token(monkeypatch)
+    redirect = _FakeResponse(
+        301,
+        {"message": "Moved Permanently"},
+        text='{"message":"Moved Permanently"}',
+        headers={"location": "https://api.github.com/repos/langchain-ai/open-swe/branches/main"},
+        request=_FakeRequest(
+            "GET", "https://api.github.com/repos/langchain-ai/open-swe/branches/master"
+        ),
+    )
+    client = _RoutingClient(
+        post=_FakeResponse(201, {"html_url": "u", "number": 1, "user": {}}),
+        get_routes={
+            "/repos/langchain-ai/open-swe/branches/master": redirect,
+            "/repos/langchain-ai/open-swe": _FakeResponse(200, {"private": True}),
+        },
+    )
+    _install_client(monkeypatch, client)
+
+    result = _open(base="master")
+
+    assert result["success"] is False
+    error = result["error"]
+    assert (
+        "GitHub responded to GET "
+        "https://api.github.com/repos/langchain-ai/open-swe/branches/master with 301" in error
+    )
+    assert "location: https://api.github.com/repos/langchain-ai/open-swe/branches/main" in error
+    assert 'response body: {"message":"Moved Permanently"}' in error
+    assert client.post_calls == []
+
+
+async def _coro(value: Any) -> Any:
+    return value
+
+
+def _open_with_body(body: str, state: dict[str, Any] | None = None) -> dict[str, Any]:
+    return asyncio.run(
+        opr._open_pull_request(
+            owner="langchain-ai",
+            repo="open-swe",
+            head="open-swe/feature",
+            base="main",
+            title="feat: x",
+            body=body,
+            draft=True,
+            state=state,
+        )
+    )
+
+
+async def _passthrough_body(body: str, _state: dict[str, Any] | None = None) -> str:
+    return body
+
+
+def _stub_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        opr.GitHubCredentialScope, "is_public_listening_channel", AsyncMock(return_value=False)
+    )
+    monkeypatch.setattr(opr, "private_credential_login", AsyncMock(return_value="test-owner"))
+    monkeypatch.setattr(opr, "pr_author_login", AsyncMock(return_value="alice"))
+    monkeypatch.setattr(opr, "_resolve_pr_author_token", lambda *_a, **_k: _coro(("tok", "user")))
+    # Footer stamping has its own test; here the body under assertion stays the caller's.
+    monkeypatch.setattr(opr, "_stamp_attribution_footer", _passthrough_body)
+
+
+def _stub_plan(monkeypatch: pytest.MonkeyPatch, plan: dict[str, Any] | None) -> None:
+    monkeypatch.setattr(opr, "get_plan_content", lambda *_a, **_k: _coro(plan))
+
+
+def test_plan_reference_survives_source_reference_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DASHBOARD_BASE_URL", "https://dashboard.example")
+    _set_config(
+        monkeypatch,
+        {
+            "source": "slack",
+            "thread_id": "thread-1",
+            "slack_thread": {"channel_id": "C123", "thread_ts": "1700000000.000100"},
+        },
+    )
+    _stub_token(monkeypatch)
+    _stub_plan(
+        monkeypatch,
+        {
+            "html": "<html><head><title>Plan</title></head><body>step 1</body></html>",
+            "status": "ready",
+        },
+    )
+
+    async def fail_permalink(*_args: Any, **_kwargs: Any) -> str:
+        raise RuntimeError("slack failed")
+
+    monkeypatch.setattr(opr, "get_slack_permalink", fail_permalink)
+    client = _FakeClient(post=_FakeResponse(201, {"html_url": "u", "number": 1, "user": {}}))
+    _install_client(monkeypatch, client)
+
+    _open_with_body("body")
+
+    sent_body = client.post_calls[0]["json"]["body"]
+    assert "- [Plan](https://dashboard.example/agents/thread-1/plan)" in sent_body
+    assert client.post_calls
+
+
+@pytest.mark.parametrize(
+    ("environment", "environment_label"),
+    [
+        (None, ""),
+        ("staging", " (staging)"),
+        ("production", ""),
+        ("preview", " (preview)"),
+        ("local", ""),
+    ],
+)
+@pytest.mark.parametrize("footer_name", ["Robin", "Open SWE"])
+def test_public_repo_appends_plan_and_slack_reference(
+    monkeypatch: pytest.MonkeyPatch,
+    footer_name: str,
+    environment: str | None,
+    environment_label: str,
+) -> None:
+    if environment is None:
+        monkeypatch.delenv("OPENSWE_ENV", raising=False)
+    else:
+        monkeypatch.setenv("OPENSWE_ENV", environment)
+    stamp_footer = opr._stamp_attribution_footer
+    monkeypatch.setenv("DASHBOARD_BASE_URL", "https://dashboard.example")
+    _set_config(
+        monkeypatch,
+        {
+            "source": "slack",
+            "thread_id": "thread-1",
+            "slack_thread": {"channel_id": "C123", "thread_ts": "1700000000.000100"},
+        },
+    )
+    _stub_token(monkeypatch)
+    _stub_plan(
+        monkeypatch,
+        {
+            "html": "<html><head><title>Plan</title></head><body>step 1</body></html>",
+            "status": "ready",
+        },
+    )
+    monkeypatch.setattr(
+        opr, "get_slack_permalink", lambda *_a, **_k: _coro("https://slack.example/p1")
+    )
+
+    client = _RoutingClient(
+        post=_FakeResponse(201, {"html_url": "u", "number": 1, "user": {}}),
+        get_routes={"/repos/langchain-ai/open-swe": _FakeResponse(200, {"private": False})},
+    )
+    _install_client(monkeypatch, client)
+
+    monkeypatch.setattr(opr, "_stamp_attribution_footer", stamp_footer)
+    _open_with_body(
+        f"body\n\nMade by [{footer_name}](https://example.com/old)",
+        state={"selected_model_id": "test-model"},
+    )
+
+    sent_body = client.post_calls[0]["json"]["body"]
+    assert "- [Plan](https://dashboard.example/agents/thread-1/plan)" in sent_body
+    assert "- [Slack thread](https://slack.example/p1)" in sent_body
+    assert sent_body.count("Made by [") == 1
+    assert sent_body.splitlines()[-1] == (
+        "Made by [Robin](https://github.com/langchain-ai/open-swe)"
+        f"{environment_label} · [view thread](https://dashboard.example/agents/thread-1)"
+        " · test-model"
+    )
+    assert "https://example.com/old" not in sent_body
+
+
+@pytest.mark.parametrize("source", ["linear", "github_issue"])
+@pytest.mark.parametrize("private", [False, True])
+def test_issue_references_require_private_repo(
+    monkeypatch: pytest.MonkeyPatch, source: str, private: bool
+) -> None:
+    _set_config(
+        monkeypatch,
+        {
+            "source": source,
+            "linear_issue": {"identifier": "ENG-123", "url": "https://linear.app/issue/ENG-123"},
+            "github_issue": {"number": 123, "url": "https://github.com/org/private/issues/123"},
+        },
+    )
+    _stub_token(monkeypatch)
+    _stub_plan(monkeypatch, None)
+    client = _RoutingClient(
+        post=_FakeResponse(201, {"html_url": "u", "number": 1, "user": {}}),
+        get_routes={"/repos/langchain-ai/open-swe": _FakeResponse(200, {"private": private})},
+    )
+    _install_client(monkeypatch, client)
+
+    _open_with_body("body")
+
+    sent_body = client.post_calls[0]["json"]["body"]
+    reference = (
+        "- [Linear ticket ENG-123](https://linear.app/issue/ENG-123)"
+        if source == "linear"
+        else "- [GitHub issue #123](https://github.com/org/private/issues/123)"
+    )
+    assert sent_body == (f"body\n\n## References\n{reference}" if private else "body")
+
+
+def test_does_not_duplicate_existing_references(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_config(
+        monkeypatch,
+        {
+            "source": "slack",
+            "slack_thread": {"channel_id": "C123", "thread_ts": "1700000000.000100"},
+        },
+    )
+    _stub_token(monkeypatch)
+
+    client = _FakeClient(post=_FakeResponse(201, {"html_url": "u", "number": 1, "user": {}}))
+    _install_client(monkeypatch, client)
+
+    _open_with_body("body\n\n## References\n- existing")
+
+    assert client.post_calls[0]["json"]["body"] == "body\n\n## References\n- existing"
+    assert client.post_calls
+
+
+def test_existing_pr_does_not_record_later_run_as_opening(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_config(monkeypatch, {"source": "github", "github_login": "johannes117"})
+    monkeypatch.setattr(opr, "get_github_app_installation_token", AsyncMock(return_value="bot-tok"))
+    record_telemetry = AsyncMock()
+    monkeypatch.setattr(opr, "_record_pr_telemetry", record_telemetry)
+    existing = {"html_url": "https://x/pull/4", "number": 4, "user": {"login": "octo"}}
+    _install_client(
+        monkeypatch,
+        _RoutingClient(
+            post=_FakeResponse(422, {"message": "already exists"}),
+            get_routes={"/pulls": _FakeResponse(200, [existing])},
+        ),
+    )
+
+    result = _open()
+
+    assert result["created"] is False
+    assert record_telemetry.await_args is not None
+    assert record_telemetry.await_args.kwargs["record_opening"] is False
+
+
+@pytest.mark.parametrize(
+    "retitle_thread,record_opening", [(True, True), (False, True), (True, False)]
+)
+@pytest.mark.parametrize("concierge", [False, True])
+async def test_record_pr_telemetry_retitles_only_new_prs_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+    retitle_thread: bool,
+    record_opening: bool,
+    concierge: bool,
+) -> None:
+    _set_config(
+        monkeypatch,
+        {
+            "source": "slack",
+            "thread_id": "t1",
+            "github_login": "octo",
+            "resolved_agent_model_id": "openai:gpt-5.6-sol",
+            "run_id": "run-1",
+            "slack_thread": {
+                "channel_id": "D1" if concierge else "C1",
+                "thread_ts": "0" if concierge else "1.0",
+                "channel_context": {"is_im": concierge},
+            },
+        },
+    )
+    record_usage = AsyncMock()
+    monkeypatch.setattr(opr, "record_agent_pr_usage", record_usage)
+    monkeypatch.setattr(opr, "get_active_slack_thread", AsyncMock(return_value=None))
+    langgraph = MagicMock()
+    langgraph.threads.get = AsyncMock(return_value={"metadata": {}})
+    monkeypatch.setattr(opr, "get_client", lambda: langgraph)
+    update = AsyncMock()
+    monkeypatch.setattr(opr.THREADS, "update", update)
+    retitle = AsyncMock()
+    monkeypatch.setattr(opr.THREADS, "retitle", retitle)
+    details = {
+        "html_url": "https://github.com/langchain-ai/open-swe/pull/3",
+        "number": 3,
+        "state": "open",
+        "draft": True,
+        "merged": False,
+        "title": "feat: x",
+        "user": {"login": "octo"},
+        "head": {"ref": "Actual/PR-head"},
+    }
+    client = _FakeClient(post=_FakeResponse(201, {}), get=_FakeResponse(200, details))
+
+    with collect_pr_targets() as targets:
+        await opr._record_pr_telemetry(
+            client=client,  # type: ignore[arg-type]
+            token="tok",
+            owner="langchain-ai",
+            repo="open-swe",
+            head="open-swe/feature",
+            base="main",
+            pr=details,
+            retitle_thread=retitle_thread,
+            record_opening=record_opening,
+            # The model the run's preparation routed it to, not the one it started with.
+            run_state={"selected_model_id": "anthropic:claude-opus-5-5"},
+        )
+    assert targets == [PullRequestHead(repo="langchain-ai/open-swe", branch="Actual/PR-head")]
+    assert record_usage.await_args is not None
+    assert record_usage.await_args.kwargs["model_id"] == "anthropic:claude-opus-5-5"
+
+    if concierge:
+        update.assert_not_awaited()
+        retitle.assert_not_awaited()
+        return
+    update.assert_awaited_once()
+    if retitle_thread and record_opening:
+        retitle.assert_awaited_once_with("t1", "feat: x")
+    else:
+        retitle.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_link_pull_request_rejects_concierge_before_github(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_config(
+        monkeypatch,
+        {
+            "thread_id": "dm-thread",
+            "slack_thread": {
+                "channel_id": "D1",
+                "thread_ts": "0",
+                "channel_context": {"is_im": True},
+            },
+        },
+    )
+    token = AsyncMock()
+    monkeypatch.setattr(opr, "_resolve_pr_author_token", token)
+
+    result = await opr.link_pull_request("https://github.com/langchain-ai/open-swe/pull/3")
+
+    assert result["success"] is False
+    assert "concierge DM" in result["error"]
+    token.assert_not_awaited()
+
+
+def test_preflight_401_revokes_user_token(monkeypatch: pytest.MonkeyPatch, user_records) -> None:
+    from cryptography.fernet import Fernet
+
+    from openswe.dashboard import profiles
+
+    monkeypatch.setenv("TOKEN_ENCRYPTION_KEY", Fernet.generate_key().decode())
+    _set_config(monkeypatch, {"source": "slack", "github_login": "johannes117"})
+    _stub_token(monkeypatch)
+    monkeypatch.setattr(opr, "pr_author_login", AsyncMock(return_value="johannes117"))
+    asyncio.run(profiles.upsert_access_token("johannes117", "j@x.dev", "tok"))
+    _install_client(monkeypatch, _FakeClient(post=_FakeResponse(201), get=_FakeResponse(401)))
+
+    result = _open()
+
+    assert "sign in with GitHub again" in result["error"]
+    assert asyncio.run(profiles.get_valid_access_token("johannes117")) is None
+    assert asyncio.run(profiles.has_access_token_record("johannes117")) is True
+
+
+@pytest.mark.parametrize("background", [False, True])
+def test_an_accountless_ask_request_cannot_borrow_a_participant_or_use_the_app(
+    monkeypatch, background
+):
+    _set_config(
+        monkeypatch,
+        {"thread_id": "guest-thread", "source": "slack", "background_task_completion": background},
+        metadata={"visibility": "public", "owner_type": "system", "participant_logins": ["bob"]},
+    )
+    monkeypatch.setattr(
+        opr.GitHubCredentialScope, "is_public_listening_channel", AsyncMock(return_value=True)
+    )
+    personal = AsyncMock(return_value="bob-token")
+    app = AsyncMock(return_value="app-token")
+    monkeypatch.setattr("openswe.dashboard.profiles.get_valid_access_token", personal)
+    monkeypatch.setattr(opr, "get_github_app_installation_token", app)
+
+    with pytest.raises(RuntimeError, match="authenticated requester"):
+        asyncio.run(opr._resolve_pr_author_token())
+
+    personal.assert_not_awaited()
+    app.assert_not_awaited()
+
+
+@pytest.mark.parametrize("allowed", [True, False])
+@pytest.mark.parametrize("background", [False, True])
+def test_ask_pr_uses_requesters_authorization(
+    monkeypatch: pytest.MonkeyPatch, allowed: bool, background: bool
+) -> None:
+    login = "bob"
+    _set_config(
+        monkeypatch,
+        {
+            "thread_id": "thread-1",
+            "github_login": login,
+            "draft_prs": False,
+            "background_task_completion": background,
+        },
+        metadata={
+            "visibility": "public",
+            "owner_type": "user",
+            "owner_login": "alice",
+            "participant_logins": ["alice", "bob"],
+        },
+    )
+    monkeypatch.setattr(
+        opr.GitHubCredentialScope, "is_public_listening_channel", AsyncMock(return_value=True)
+    )
+    monkeypatch.setattr(
+        "openswe.dashboard.profiles.get_valid_access_token",
+        AsyncMock(side_effect={"alice": "alice-token", "bob": "bob-token"}.get),
+    )
+    record_requester = AsyncMock(return_value=True)
+    monkeypatch.setattr(opr.PullRequestApproval, "record_requesters", record_requester)
+    monkeypatch.setattr(opr, "_record_pr_telemetry", AsyncMock())
+    monkeypatch.setattr(opr, "_stamp_attribution_footer", _passthrough_body)
+    monkeypatch.setattr(opr, "get_plan_content", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        opr, "get_github_app_installation_token", AsyncMock(return_value="app-token")
+    )
+    client = _FakeClient(
+        post=_FakeResponse(201, {"html_url": "u", "number": 1, "user": {"login": login}}),
+        get=None if allowed else _FakeResponse(403, {"message": "Forbidden"}),
+    )
+    _install_client(monkeypatch, client)
+
+    result = asyncio.run(
+        opr._open_pull_request(
+            owner="langchain-ai",
+            repo="open-swe",
+            head="feature",
+            base="main",
+            title="fix: x",
+            body="body",
+            draft=False,
+        )
+    )
+    preflight_headers = [
+        call["headers"]["Authorization"]
+        for call in client.get_calls
+        if not call["url"].endswith("/installation/repositories")
+    ]
+    assert preflight_headers and all(
+        header == f"Bearer {login}-token" for header in preflight_headers
+    )
+    if allowed:
+        assert result["success"] is True
+        assert result["author"] == login
+        assert result["token_kind"] == "user"
+        assert client.post_calls[0]["headers"]["Authorization"] == f"Bearer {login}-token"
+        assert client.post_calls[0]["json"]["draft"] is True
+        record_requester.assert_awaited_once_with("langchain-ai", "open-swe", 1, {login})
+    else:
+        assert result["success"] is False
+        assert "403" in result["error"]
+        assert not client.post_calls
+        record_requester.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_link_pr_reads_as_the_thread_owner(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_config(monkeypatch, {"thread_id": "thread-1", "background_task_completion": True})
+    _stub_token(monkeypatch)
+    token = AsyncMock(return_value=("owner-token", "user"))
+    monkeypatch.setattr(opr, "_resolve_pr_author_token", token)
+    monkeypatch.setattr(
+        opr,
+        "_fetch_pr_details",
+        AsyncMock(
+            return_value={
+                "html_url": "https://github.com/langchain-ai/open-swe/pull/3",
+                "number": 3,
+            }
+        ),
+    )
+    monkeypatch.setattr(opr, "_record_pr_telemetry", AsyncMock())
+    result = await opr.link_pull_request("https://github.com/langchain-ai/open-swe/pull/3")
+    assert result["success"] is True
+    token.assert_awaited_once_with()

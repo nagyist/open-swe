@@ -1,31 +1,42 @@
 {
-  "$schema": "https://turbo.build/schema.json",
-  "globalDependencies": ["**/.env"],
+  "$schema": "https://turborepo.com/schema.json",
   "tasks": {
+    "dev": {
+      "cache": false,
+      "persistent": true,
+      "env": [
+        "DASHBOARD_API_URL",
+        "DASHBOARD_BASE_PATH",
+        "OPEN_SWE_DEV_SESSION",
+        "PORT",
+        "E2E_HARNESS",
+        "VITE_*"
+      ]
+    },
     "build": {
       "dependsOn": ["^build"],
-      "outputs": ["dist/**", ".next/**", "!.next/cache/**"]
+      "outputs": [
+        ".output/**",
+        ".vercel/output/**",
+        "build/**"
+      ],
+      "env": [
+        "DASHBOARD_API_URL",
+        "SOURCE_COMMIT",
+        "VERCEL",
+        "E2E_HARNESS",
+        "VITE_*"
+      ]
     },
-    "lint": {
-      "dependsOn": ["^lint"]
-    },
-    "lint:fix": {
-      "dependsOn": ["^lint:fix"]
-    },
-    "format": {
-      "dependsOn": ["^format"]
-    },
-    "format:check": {
-      "dependsOn": ["^format:check"]
-    },
-    "dev": {
-      "dependsOn": ["^dev"]
+    "typecheck": {
+      "dependsOn": ["^build"]
     },
     "test": {
-      "dependsOn": ["^test"]
+      "dependsOn": ["^build"]
     },
-    "clean": {
-      "dependsOn": ["^clean"]
+    "check": {
+      "dependsOn": ["^build"],
+      "cache": false
     }
   }
 }

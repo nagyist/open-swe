@@ -1,0 +1,39 @@
+{
+  "endOfLine": "lf",
+  "semi": false,
+  "singleQuote": false,
+  "tabWidth": 2,
+  "trailingComma": "es5",
+  "printWidth": 80,
+  "sortPackageJson": false,
+  "sortTailwindcss": {
+    "stylesheet": "ui/src/styles.css",
+    "functions": [
+      "cn"
+    ]
+  },
+  "ignorePatterns": [
+    "**/node_modules/**",
+    ".venv/**",
+    "vendor/**",
+    "**/*.md",
+    "**/*.json",
+    "**/*.jsonc",
+    "**/*.yaml",
+    "**/*.yml",
+    "**/*.toml",
+    "**/*.css",
+    "**/*.html",
+    "ui/.output/**",
+    "ui/.nitro/**",
+    "ui/.tanstack/**",
+    "ui/dev-dist/**",
+    "ui/dist/**",
+    "desktop/build/**",
+    "mobile/ios/**",
+    "mobile/android/**",
+    "mobile/.expo/**",
+    "ui/src/routeTree.gen.ts",
+    "plugins/docs/src/routeTree.gen.ts"
+  ]
+}

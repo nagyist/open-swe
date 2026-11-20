@@ -1,0 +1,369 @@
+import {
+  ChatMessage,
+  ChatMessageBody,
+} from "@langchain/macaw-components/ChatMessage"
+import { Button } from "@langchain/macaw-components/Button"
+import { CopyIconButton } from "@langchain/macaw-components/CopyButton"
+import { Link } from "@langchain/macaw-components/Link"
+import { Tooltip } from "@langchain/macaw-components/Tooltip"
+import { CopyIcon } from "@phosphor-icons/react/dist/ssr/Copy"
+import { WarningCircleIcon } from "@phosphor-icons/react/dist/ssr/WarningCircle"
+import { PaperclipIcon } from "@phosphor-icons/react/dist/ssr/Paperclip"
+import { RobotIcon } from "@phosphor-icons/react/dist/ssr/Robot"
+import { SlackLogoIcon } from "@phosphor-icons/react/dist/ssr/SlackLogo"
+import { useEffect, useRef, useState } from "react"
+import { toast } from "sonner"
+
+import { SkillPromptText } from "../SkillBadge"
+import { CodeBlock } from "@/features/agents/components/chat/CodeBlock"
+import { parseExcerpts } from "@/features/agents/utils/codeExcerpt"
+import { MessageImage } from "./MessageImage"
+import { MessageTimestamp } from "./MessageTimestamp"
+import { Banner } from "@langchain/macaw-components/Banner"
+import { TaskEventMessage } from "./TaskEventMessage"
+import { SlackMrkdwn } from "./SlackMrkdwn"
+import type { Message } from "@/features/agents/lib/types"
+import type { PassageReply } from "@/features/agents/utils/passageReply"
+import { cn } from "@/lib/utils"
+
+const COLLAPSED_MAX_HEIGHT_PX = 250
+
+type UserMessageProps = { message: Message; threadId?: string }
+
+export function UserMessage({ message, threadId }: UserMessageProps) {
+  if (message.taskEvent) {
+    return (
+      <TaskEventMessage
+        event={message.taskEvent}
+        messageId={message.id}
+        timestamp={message.timestampIsFallback ? undefined : message.timestamp}
+      />
+    )
+  }
+  return <StandardUserMessage message={message} threadId={threadId} />
+}
+
+/** A passage the sender replied to, shown as they selected it, then their comment. */
+export function SentReply({ reply }: { reply: PassageReply }) {
+  return (
+    <div className="mb-space-2 flex flex-col gap-space-1 text-sm leading-[1.6]">
+      {reply.file ? (
+        <CodeBlock
+          title={`${reply.file}:${reply.lines ?? ""}`}
+          language={reply.file.split(".").pop() ?? ""}
+          text={reply.selection}
+        />
+      ) : (
+        <blockquote className="border-l-2 border-default pl-space-3 [overflow-wrap:anywhere] whitespace-pre-wrap text-secondary">
+          {reply.part && (
+            <span className="block text-xxs text-tertiary">{reply.part}</span>
+          )}
+          {reply.selection}
+        </blockquote>
+      )}
+      {reply.comment && (
+        <p className="[overflow-wrap:anywhere] whitespace-pre-wrap text-primary">
+          {reply.comment}
+        </p>
+      )}
+    </div>
+  )
+}
+
+function StandardUserMessage({ message, threadId }: UserMessageProps) {
+  const isSystem = message.structuredSenderKind === "system"
+  const isSlack = message.structuredSurface === "slack"
+  const content = message.chunks
+    .filter((c) => c.kind === "text")
+    .map((c) => c.text)
+    .join("")
+  const { excerpts, text } = parseExcerpts(content)
+
+  const images = message.chunks.filter((c) => c.kind === "image")
+  const replies = message.replies ?? []
+  const copyText = [
+    ...replies.flatMap((reply) => [reply.selection, reply.comment]),
+    content,
+  ]
+    .filter(Boolean)
+    .join("\n\n")
+  const canCopy = !isSystem && Boolean(copyText.trim())
+  const hasBody =
+    Boolean(text) ||
+    images.length > 0 ||
+    excerpts.length > 0 ||
+    replies.length > 0
+  const [expanded, setExpanded] = useState(false)
+  const [isTruncated, setIsTruncated] = useState(false)
+  const textRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    const el = textRef.current
+    if (!el) return
+    const measure = () =>
+      setIsTruncated(el.scrollHeight > COLLAPSED_MAX_HEIGHT_PX + 1)
+    measure()
+    const observer = new ResizeObserver(measure)
+    observer.observe(el)
+    return () => observer.disconnect()
+  }, [text])
+
+  const body = (
+    <>
+      {hasBody && (
+        <div className={cn("relative max-w-full overflow-hidden")}>
+          {excerpts.map((excerpt, i) => (
+            <CodeBlock
+              key={i}
+              title={excerpt.location}
+              language={excerpt.language}
+              text={excerpt.code}
+            />
+          ))}
+          {replies.map((reply, i) => (
+            <SentReply key={i} reply={reply} />
+          ))}
+          {images.length > 0 && (
+            <div className="mb-space-2 grid max-w-[420px] grid-cols-2 gap-space-2">
+              {images.map((img, i) => (
+                <div
+                  key={i}
+                  className="overflow-hidden rounded-lg border border-default bg-surface-level-1"
+                >
+                  <MessageImage
+                    chunk={img}
+                    fill
+                    className="block h-auto max-h-[220px] w-full object-cover"
+                  />
+                </div>
+              ))}
+            </div>
+          )}
+          {text && (
+            <div
+              ref={textRef}
+              className={cn(
+                "text-sm leading-[1.6] [overflow-wrap:anywhere] whitespace-pre-wrap text-primary",
+                !isSystem && !expanded && "overflow-hidden"
+              )}
+              style={
+                !isSystem && !expanded
+                  ? { maxHeight: COLLAPSED_MAX_HEIGHT_PX }
+                  : undefined
+              }
+            >
+              {isSlack ? (
+                <SlackMrkdwn text={text} />
+              ) : (
+                <SkillPromptText text={text} />
+              )}
+            </div>
+          )}
+          {!isSystem && isTruncated && (
+            <Button
+              color="secondary"
+              variant="plain"
+              size="sm"
+              aria-label={expanded ? "Show less" : "Show more"}
+              type="button"
+              onClick={() => setExpanded((value) => !value)}
+              aria-expanded={expanded}
+              data-testid="user-message-show-more"
+              className="mt-space-1 h-auto border-0 px-0 text-secondary hover:text-primary focus-visible:ring-2 focus-visible:ring-focus focus-visible:outline-none"
+            >
+              {expanded ? "Show less" : "Show more"}
+            </Button>
+          )}
+        </div>
+      )}
+      {message.contextLabel && (
+        <span
+          className={cn(
+            "flex max-w-full items-center gap-space-1 pr-space-1 text-xxs text-tertiary",
+            isSystem && "pl-space-1"
+          )}
+          title="Sent with what you had open, for the agent; not part of your message"
+        >
+          <PaperclipIcon size={11} className="shrink-0" />
+          <span className="truncate">{message.contextLabel}</span>
+        </span>
+      )}
+    </>
+  )
+
+  return (
+    <ChatMessage
+      message={{
+        id: message.id,
+        role: isSystem ? "system" : "user",
+        status:
+          message.deliveryStatus === "failed"
+            ? "failed"
+            : message.deliveryStatus
+              ? "submitting"
+              : "completed",
+        content: [],
+      }}
+      className="group/turn my-space-4"
+      data-testid="user-message"
+      data-message-id={message.id}
+      data-message-delivery-status={message.deliveryStatus}
+      data-message-sender-kind={message.structuredSenderKind}
+      data-message-surface={message.structuredSurface}
+      footer={
+        (canCopy || !message.timestampIsFallback) && (
+          <div
+            className={cn(
+              "mt-space-1 flex items-center gap-space-1 pr-space-1",
+              !isSystem && "justify-end"
+            )}
+          >
+            {canCopy && (
+              <CopyIconButton copy={copyText} label="Copy message" size="xs" />
+            )}
+            {!message.timestampIsFallback && (
+              <MessageTimestamp
+                timestamp={message.timestamp}
+                align={isSystem ? "left" : "right"}
+              />
+            )}
+          </div>
+        )
+      }
+    >
+      {!isSystem &&
+        (message.structuredSenderName ||
+          isSlack ||
+          message.structuredSenderIsBot) && (
+          <div className="mb-space-1 flex items-center gap-space-1 px-space-1 text-xxs font-medium text-secondary">
+            {isSlack &&
+              (message.slackMessageUrl ? (
+                <Link
+                  href={message.slackMessageUrl}
+                  variant="xs"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  aria-label={
+                    message.structuredSenderName
+                      ? `View message from ${message.structuredSenderName} in Slack`
+                      : "View message in Slack"
+                  }
+                  leftDecorator={SlackLogoIcon}
+                  iconWeight="fill"
+                  className="gap-space-1"
+                >
+                  {message.structuredSenderName || "Slack"}
+                </Link>
+              ) : (
+                <SlackLogoIcon
+                  size={12}
+                  weight="fill"
+                  role="img"
+                  aria-label="Slack"
+                />
+              ))}
+            {message.structuredSenderIsBot && (
+              <RobotIcon
+                size={12}
+                weight="regular"
+                role="img"
+                aria-label="Bot"
+                data-testid="user-message-bot-icon"
+              />
+            )}
+            {message.structuredSenderName &&
+              !(isSlack && message.slackMessageUrl) && (
+                <span>{message.structuredSenderName}</span>
+              )}
+            {message.structuredSenderNote && (
+              <span className="font-normal text-tertiary">
+                {" · "}
+                {message.structuredSenderNote}
+              </span>
+            )}
+          </div>
+        )}
+      {isSystem ? (
+        <Banner
+          intent="neutral"
+          title={message.structuredSenderName || "Notice"}
+        >
+          {body}
+        </Banner>
+      ) : (
+        <ChatMessageBody
+          blocks={[
+            {
+              id: `${message.id}:body`,
+              type: "custom",
+              appearance: "bubble",
+              content: body,
+            },
+          ]}
+        />
+      )}
+      {message.deliveryStatus && (
+        <div
+          className={cn(
+            "mt-space-1 pr-space-1 text-right text-xxs leading-4",
+            message.deliveryStatus === "failed"
+              ? "text-error-secondary"
+              : "text-secondary"
+          )}
+        >
+          {message.deliveryStatus !== "failed" ? (
+            "Sending"
+          ) : (
+            <Tooltip
+              title="Click to copy debug details"
+              description={message.deliveryError}
+              align="end"
+              tooltipClassName="[overflow-wrap:anywhere] whitespace-pre-wrap"
+            >
+              <Button
+                color="error"
+                variant="plain"
+                size="xs"
+                type="button"
+                aria-label="Failed to send · Copy debug details"
+                leftDecorator={WarningCircleIcon}
+                rightDecorator={CopyIcon}
+                data-testid="user-message-delivery-error"
+                className="max-w-full border-0"
+                onClick={async () => {
+                  try {
+                    await navigator.clipboard.writeText(
+                      JSON.stringify(
+                        {
+                          url: threadId
+                            ? new URL(
+                                `${import.meta.env.BASE_URL.replace(/\/$/, "")}/agents/${encodeURIComponent(threadId)}`,
+                                window.location.origin
+                              ).href
+                            : undefined,
+                          message_id: message.id,
+                          turn_id: message.deliveryTurnId,
+                          timestamp: message.timestamp,
+                          error: message.deliveryError,
+                        },
+                        null,
+                        2
+                      )
+                    )
+                    toast.success("Debug details copied")
+                  } catch {
+                    toast.error(
+                      "Unable to copy debug details. Check clipboard permissions."
+                    )
+                  }
+                }}
+              >
+                Failed to send
+              </Button>
+            </Tooltip>
+          )}
+        </div>
+      )}
+    </ChatMessage>
+  )
+}

@@ -1,0 +1,93 @@
+/*
+ * Agents-surface density and motion. Colour comes from Macaw tokens; nothing
+ * here redefines them.
+ */
+
+.agents-ui {
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+/*
+ * Base density for unclassed text. Deliberately NOT on `html` — the root font
+ * size is what every rem-based Tailwind utility scales off.
+ *
+ * No `background` here either: this file is unlayered, so it outranks every
+ * Tailwind utility and would silently beat the `bg-*` class on the same
+ * element. Surfaces pick their own background via utilities.
+ */
+.agents-ui {
+  color: var(--text-primary);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.agents-ui * {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--text-primary) 18%, transparent) transparent;
+}
+
+.sidebar-content:has([data-sidebar-loading]) ~ * {
+  visibility: hidden;
+}
+
+.sidebar-content > [data-sidebar-loading] ~ *,
+.sidebar-content .sidebar-groups > .sidebar-group[data-sidebar-loading] ~ .sidebar-group {
+  visibility: hidden;
+}
+
+.shimmer-text {
+  color: var(--text-secondary);
+}
+
+@media (prefers-reduced-motion: no-preference) and (forced-colors: none) {
+  .shimmer-text {
+    background: linear-gradient(90deg, transparent, var(--text-primary), transparent)
+      -4.5rem 0 / 4.5rem 100% no-repeat var(--text-secondary);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    animation: agents-shimmer 2.2s linear infinite;
+  }
+}
+
+@keyframes agents-shimmer {
+  to {
+    background-position: calc(100% + 4.5rem) 0;
+  }
+}
+
+/*
+ * Skeletons sweep a highlight across the block instead of pulsing, like
+ * LangSmith's. Unlayered, so it replaces Macaw's `animate-pulse`; the sweep is
+ * fixed to the viewport so stacked placeholders shimmer as one surface.
+ */
+.skeleton-shimmer {
+  animation: none;
+}
+
+@media (prefers-reduced-motion: no-preference) and (forced-colors: none) {
+  .skeleton-shimmer {
+    background-image: linear-gradient(
+      100deg,
+      transparent 40%,
+      var(--skeleton-highlight) 50%,
+      transparent 60%
+    );
+    background-size: 200vw 100%;
+    background-attachment: fixed;
+    background-repeat: no-repeat;
+    animation: skeleton-shimmer 1.6s ease-in-out infinite;
+  }
+}
+
+@keyframes skeleton-shimmer {
+  from {
+    background-position: -120vw 0;
+  }
+  to {
+    background-position: 20vw 0;
+  }
+}

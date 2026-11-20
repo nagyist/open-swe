@@ -1,0 +1,630 @@
+"""Shared pytest fixtures."""
+
+import asyncio
+import hashlib
+import os
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from types import ModuleType
+from typing import Any
+from unittest.mock import AsyncMock
+from uuid import UUID
+
+import httpx
+import httpx2
+import pytest
+from fastapi import HTTPException
+from langgraph_sdk.errors import NotFoundError
+from pydantic import JsonValue, TypeAdapter
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from openswe.dashboard import langsmith_api_keys
+from openswe.dashboard.langsmith_login import LangSmithLogin
+from openswe.dashboard.principal import DashboardPrincipal
+from openswe.github.changed_files import CHANGED_FILES
+from openswe.sandboxes.state import SANDBOX_BACKENDS, SANDBOX_CONNECTIONS
+from openswe.slack.allowed_bots import AllowedSlackBot
+from openswe.threads import access, diffs, handlers, index, listing, proxy, runs, summary
+from openswe.threads.index import IndexedThread
+from openswe.threads.store import CommandReply, ThreadStore
+from openswe.tools import access as tool_access
+from openswe.users import User
+from openswe.users.models import Provider, UserIdentity
+from openswe.users.records import UserRecords
+from openswe.utils import ttl_cache
+from openswe.utils.json_types import JsonObject
+from openswe.utils.thread_ops import langgraph_url
+from openswe.webhooks import common as webhook_common
+from tests.support.postgres import MigratedTemplate, isolated_database
+
+# What `langgraph dev` sets for its in-memory runtime; langgraph_api.config reads them on import.
+os.environ.setdefault("REDIS_URI", "fake")
+os.environ.setdefault("DATABASE_URI", ":memory:")
+# A test that wants the stall watchdog turns it back on.
+os.environ.setdefault("EVENT_LOOP_STALL_MS", "0")
+
+_THREAD_MODULES: tuple[ModuleType, ...] = (access, diffs, handlers, listing, proxy, runs, summary)
+_MAX_PARAM_ID_CHARS = 40
+
+
+def pytest_make_parametrize_id(config: pytest.Config, val: object, argname: str) -> str | None:
+    """Keep node IDs short; a 100 KB ID line truncates `gh run view --log-failed` output."""
+    if isinstance(val, str) and len(val) > _MAX_PARAM_ID_CHARS:
+        return f"{argname}-{hashlib.sha256(val.encode()).hexdigest()[:8]}"
+    return None
+
+
+def patch_thread_module(monkeypatch: pytest.MonkeyPatch, name: str, value: Any) -> None:
+    """Rebind ``name`` in every dashboard thread module that imports it.
+
+    The thread endpoints are split across modules that each hold their own
+    binding, so patching one would leave the others pointing at the real thing.
+    """
+    modules = [module for module in _THREAD_MODULES if hasattr(module, name)]
+    if not modules:
+        raise AttributeError(f"no dashboard thread module defines {name!r}")
+    for module in modules:
+        monkeypatch.setattr(module, name, value)
+
+
+class ThreadStoreOverClient(ThreadStore):
+    """The thread store, kept by whichever fake Agent Server client a test patched in.
+
+    Lets tests describe one fake thread for both the code that still reads threads
+    through ``langgraph_client`` and the code that reads them from the store.
+    """
+
+    async def get(self, thread_id: str) -> IndexedThread | None:
+        try:
+            raw = await proxy.langgraph_client().threads.get(thread_id)
+        except NotFoundError:
+            return None
+        if raw is None:
+            return None
+        return self.indexed(thread_id, raw)
+
+    @staticmethod
+    def indexed(thread_id: str, raw: Mapping[str, object]) -> IndexedThread:
+        """A fake client's thread as the index keeps it."""
+        now = datetime.now(UTC)
+        metadata = raw.get("metadata")
+        return IndexedThread(
+            thread_id=thread_id,
+            runtime="mda",
+            metadata=dict(metadata) if isinstance(metadata, Mapping) else {},
+            status=index.as_status(raw.get("status")) or "idle",
+            created_at=now,
+            updated_at=now,
+        )
+
+    async def update(self, thread_id: str, metadata: Mapping[str, Any]) -> IndexedThread | None:
+        # The code under test ignores the updated thread, and some fakes cannot read one back.
+        await proxy.langgraph_client().threads.update(thread_id=thread_id, metadata=dict(metadata))
+        return None
+
+    async def state(self, thread_id: str) -> dict[str, Any] | None:
+        return await proxy.langgraph_client().threads.get_state(thread_id)
+
+    async def state_of(
+        self,
+        thread: IndexedThread,
+        *,
+        select: list[str] | None = None,
+        timings: dict[str, float] | None = None,
+    ) -> dict[str, JsonValue]:
+        state = await proxy.langgraph_client().threads.get_state(thread.thread_id)
+        return TypeAdapter(dict[str, JsonValue]).validate_python(dict(state))
+
+    async def command(
+        self,
+        thread_id: str,
+        body: bytes,
+        *,
+        user_id: str | None = None,
+        trace_headers: Mapping[str, str] | None = None,
+    ) -> CommandReply:
+        response = await proxy.langgraph_client().http.client.post(
+            f"/threads/{thread_id}/commands",
+            content=body,
+            headers={"Content-Type": "application/json", **(trace_headers or {})},
+        )
+        return CommandReply(
+            response.status_code, response.content, response.headers.get("content-type")
+        )
+
+
+class LangSmithUsers:
+    """Explicit test people with linked, currently authorized LangSmith accounts."""
+
+    def __init__(self) -> None:
+        self.people: dict[UUID, User] = {}
+        self.revoked: set[UUID] = set()
+        self.original_get = User.get
+        self.original_for_login = User.for_login
+        self.original_for_identity = User.for_identity
+        self.original_for_session = User.for_session
+
+    def add(self, login: str, *, user_id: UUID | None = None) -> User:
+        user = User(identities=[UserIdentity(provider="langsmith", external_id=f"ls-{login}")])
+        if user_id is not None:
+            user.id = user_id
+        if not login.startswith("user:"):
+            user.identities.append(UserIdentity(provider="github", external_id=login, login=login))
+        self.people[user.id] = user
+        return user
+
+    async def get(self, user_id: UUID, *, session: AsyncSession | None = None) -> User | None:
+        return self.people.get(user_id) or await self.original_get(user_id, session=session)
+
+    async def for_session(
+        self, user_id: UUID | None, login: str, *, session: AsyncSession | None = None
+    ) -> User | None:
+        if user_id is not None and user_id in self.people:
+            return self.people[user_id]
+        user = next((user for user in self.people.values() if user.github_login == login), None)
+        return user or await self.original_for_session(user_id, login, session=session)
+
+    async def for_login(
+        self, provider: Provider, login: str, *, session: AsyncSession | None = None
+    ) -> User | None:
+        user = next(
+            (
+                user
+                for user in self.people.values()
+                if any(
+                    item.provider == provider and item.login == login for item in user.identities
+                )
+            ),
+            None,
+        )
+        return user or await self.original_for_login(provider, login, session=session)
+
+    async def for_identity(
+        self, provider: Provider, external_id: str, *, session: AsyncSession | None = None
+    ) -> User | None:
+        user = next(
+            (
+                user
+                for user in self.people.values()
+                if any(
+                    item.provider == provider and item.external_id == external_id
+                    for item in user.identities
+                )
+            ),
+            None,
+        )
+        return user or await self.original_for_identity(provider, external_id, session=session)
+
+    @asynccontextmanager
+    async def authorized_person(
+        self, principal: DashboardPrincipal
+    ) -> AsyncIterator[tuple[AsyncSession, User]]:
+        from openswe.database import postgres
+
+        user = await principal.user()
+        if user is None:
+            raise HTTPException(401, "Sign in with LangSmith to use Robin")
+        await LangSmithLogin().authorize_user(user)
+        scope = postgres.session() if os.environ.get("POSTGRES_URI") else AsyncSession()
+        async with scope as session:
+            yield session, user
+
+    async def authorize_session(
+        self, principal: DashboardPrincipal, *, user: User | None = None
+    ) -> str:
+        user = self.people.get(principal.user_id) if principal.user_id else None
+        if (
+            user is None
+            or user.id in self.revoked
+            or not any(
+                identity.provider == "langsmith"
+                and identity.external_id == principal.langsmith_subject
+                for identity in user.identities
+            )
+        ):
+            raise HTTPException(401, "LangSmith login expired — sign in again")
+        return "langsmith-test-token"
+
+
+@pytest.fixture
+def langsmith_users(monkeypatch: pytest.MonkeyPatch) -> LangSmithUsers:
+    """Fake only explicitly seeded people and the external LangSmith authorization check."""
+    users = LangSmithUsers()
+    monkeypatch.setattr(User, "get", users.get)
+    monkeypatch.setattr(User, "for_session", users.for_session)
+    monkeypatch.setattr(User, "for_login", users.for_login)
+    monkeypatch.setattr(User, "for_identity", users.for_identity)
+    monkeypatch.setattr(LangSmithLogin, "authorize_session", users.authorize_session)
+    monkeypatch.setattr(LangSmithLogin, "authorized_person", users.authorized_person)
+    return users
+
+
+class FakeUserRecords:
+    """In-memory stand-in for every ``UserRecords`` kind, keyed like PostgreSQL resolves logins."""
+
+    def __init__(self) -> None:
+        self.items: dict[tuple[str, str, str], dict[str, Any]] = {}
+
+    def seed(self, kind: str, login: str, value: dict[str, Any], key: str = "") -> None:
+        self.items[(kind, login.strip().lower(), key)] = dict(value)
+
+    def get(self, kind: str, login: str, key: str = "") -> dict[str, Any]:
+        return self.items[(kind, login.strip().lower(), key)]
+
+    def pop(self, kind: str, login: str, key: str = "") -> dict[str, Any] | None:
+        return self.items.pop((kind, login.strip().lower(), key), None)
+
+
+@pytest.fixture
+def user_records(monkeypatch: pytest.MonkeyPatch) -> FakeUserRecords:
+    """Route every ``UserRecords`` access to an in-memory table for this test."""
+    fake = FakeUserRecords()
+
+    async def get(
+        self: UserRecords, login: str, key: str = "", *, session: AsyncSession | None = None
+    ) -> dict[str, Any] | None:
+        value = fake.items.get((self.kind, login.strip().lower(), key))
+        return None if value is None else dict(value)
+
+    async def for_keys(
+        self: UserRecords, login: str, keys: list[str], *, session: AsyncSession | None = None
+    ) -> dict[str, JsonObject]:
+        return {
+            key: dict(value)
+            for (kind, person, key), value in fake.items.items()
+            if kind == self.kind and person == login.strip().lower() and key in keys
+        }
+
+    async def put(
+        self: UserRecords,
+        login: str,
+        value: dict[str, Any],
+        key: str = "",
+        *,
+        session: AsyncSession | None = None,
+    ) -> None:
+        fake.seed(self.kind, login, value, key)
+
+    async def pop(self: UserRecords, login: str, key: str = "") -> dict[str, Any] | None:
+        return fake.pop(self.kind, login, key)
+
+    monkeypatch.setattr(UserRecords, "get", get)
+    monkeypatch.setattr(UserRecords, "for_keys", for_keys)
+    monkeypatch.setattr(UserRecords, "put", put)
+    monkeypatch.setattr(UserRecords, "delete", pop)
+    monkeypatch.setattr(UserRecords, "pop", pop)
+    return fake
+
+
+@pytest.fixture
+def grant_tool_access(monkeypatch: pytest.MonkeyPatch) -> Callable[..., None]:
+    """Resolve every gated tool call to ``Access(**fields)`` for this test."""
+
+    def grant(**fields: bool) -> None:
+        resolved = tool_access.Access(**fields)
+        monkeypatch.setattr(tool_access, "resolve_access", AsyncMock(return_value=resolved))
+
+    return grant
+
+
+def serve_threads_from(monkeypatch: pytest.MonkeyPatch, get: Any) -> None:
+    """Serve the thread store's reads (``THREADS.get``) from a test's ``threads.get`` mock.
+
+    The backend reads a thread's metadata from its index, as its own ``/threads`` routes
+    do; a test that fakes a LangGraph client's ``threads.get`` keeps its threads, and its
+    errors, that way, except a ``NotFoundError``: the index answers a missing thread with
+    ``None``.
+    """
+    from openswe.threads.store import THREADS  # noqa: PLC0415 - imports the app
+
+    async def indexed(thread_id: str) -> IndexedThread | None:
+        try:
+            thread = await get(thread_id)
+        except NotFoundError:
+            return None
+        if not isinstance(thread, dict):
+            return None
+        return ThreadStoreOverClient.indexed(thread_id, thread)
+
+    monkeypatch.setattr(THREADS, "get", indexed)
+
+
+def serve_runs_from(monkeypatch: pytest.MonkeyPatch, client: Any) -> None:
+    """Serve thread reads and run checks from a test's fake LangGraph ``client``.
+
+    The backend reads the thread from its index (``THREADS``) and asks the thread's
+    runtime whether a run is still pending or running; both come from ``client`` here,
+    and ``client.threads.get`` counts only the metadata reads.
+    """
+    from openswe.slack import thinking  # noqa: PLC0415 - imports the app
+
+    serve_threads_from(monkeypatch, client.threads.get)
+
+    async def has_active_run(thread_id: str) -> bool:
+        for status in ("pending", "running"):
+            if await client.runs.list(thread_id, status=status, limit=1):
+                return True
+        return False
+
+    monkeypatch.setattr(thinking, "_thread_has_active_runs", has_active_run)
+
+
+def register_github_logins(monkeypatch: pytest.MonkeyPatch, *logins: str) -> None:
+    """Treat ``logins`` as registered Open SWE users."""
+    from openswe.users import User
+
+    registered = {login.lower() for login in logins}
+
+    async def known_logins(candidates: Sequence[str]) -> frozenset[str]:
+        return frozenset(c.lower() for c in candidates if c.lower() in registered)
+
+    monkeypatch.setattr(User, "known_logins", known_logins)
+
+
+_TEST_POSTGRES_URI_SETTING = "TEST_ANALYTICS_POSTGRES_URI"
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    asyncio.run(MigratedTemplate.drop())
+
+
+@pytest.fixture
+async def registry_db(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[None]:
+    """A migrated PostgreSQL schema for pull request and repository rows."""
+    uri = os.environ.get(_TEST_POSTGRES_URI_SETTING)
+    if not uri:
+        pytest.skip(f"{_TEST_POSTGRES_URI_SETTING} is required for PostgreSQL regressions")
+    async with isolated_database(uri, monkeypatch):
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _execution_defaults(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """DB-less tests use global defaults unless they supply a configuration."""
+    if {"registry_db", "analytics_db", "deployment_db"}.intersection(request.fixturenames):
+        return
+    from openswe.dashboard.execution_defaults import EXECUTION_DEFAULTS, ExecutionDefaults
+    from openswe.execution import SANDBOX_EXECUTION
+    from openswe.execution_images import EXECUTION_IMAGES, ImageState
+
+    monkeypatch.setattr(EXECUTION_DEFAULTS, "load", AsyncMock(return_value=ExecutionDefaults()))
+    monkeypatch.setattr(EXECUTION_IMAGES, "state", AsyncMock(return_value=ImageState()))
+    monkeypatch.setattr(SANDBOX_EXECUTION, "bound", AsyncMock(return_value=None))
+
+
+@pytest.fixture
+def no_local_threads(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every thread takes new activity itself, for tests without the thread index."""
+
+    async def itself(thread_id: str) -> str:
+        return thread_id
+
+    monkeypatch.setattr(index, "live_thread_id", itself)
+
+
+@pytest.fixture
+def findings_from_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Serve dashboard findings from thread metadata, as for threads not yet in PostgreSQL."""
+    from openswe.review import reviews
+    from openswe.review.findings import Finding, coerce_findings
+
+    async def read(metadata_by_thread: Mapping[str, dict[str, Any]]) -> dict[str, list[Finding]]:
+        return {
+            thread_id: coerce_findings(metadata.get("findings"))
+            for thread_id, metadata in metadata_by_thread.items()
+        }
+
+    monkeypatch.setattr(reviews, "findings_by_thread", read)
+
+
+@pytest.fixture
+async def allowed_bot(registry_db: None) -> AllowedSlackBot:
+    bot = AllowedSlackBot(
+        team_id="T123",
+        bot_id="B123",
+        user_id="U123",
+        app_id="A123",
+        name="Release bot",
+        created_by="alice",
+        created_at=datetime(2026, 9, 9, tzinfo=UTC),
+    )
+    await bot.add(None)
+    return bot
+
+
+_LOOPBACK = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def _refusal(url: httpx.URL | httpx2.URL) -> str | None:
+    """Why a test may not reach ``url``: another machine, or the LangGraph server a
+    developer may have running on ``LANGGRAPH_URL``."""
+    if url.host not in _LOOPBACK:
+        reason = "tests never leave this machine"
+    elif (langgraph := httpx.URL(langgraph_url())).host in _LOOPBACK and url.port == langgraph.port:
+        reason = "that is LANGGRAPH_URL, where a developer's LangGraph server may be running"
+    else:
+        return None
+    return f"Refused {url}: {reason}. Fake the boundary this test reaches."
+
+
+@pytest.fixture(autouse=True)
+def _offline(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Refuse real network requests; MockTransport, ASGITransport and local fakes still work."""
+    send_async = httpx.AsyncHTTPTransport.handle_async_request
+    send = httpx.HTTPTransport.handle_request
+    send_async2 = httpx2.AsyncHTTPTransport.handle_async_request
+    send2 = httpx2.HTTPTransport.handle_request
+
+    async def guarded_async(
+        self: httpx.AsyncHTTPTransport, request: httpx.Request
+    ) -> httpx.Response:
+        if refusal := _refusal(request.url):
+            raise httpx.ConnectError(refusal, request=request)
+        return await send_async(self, request)
+
+    def guarded(self: httpx.HTTPTransport, request: httpx.Request) -> httpx.Response:
+        if refusal := _refusal(request.url):
+            raise httpx.ConnectError(refusal, request=request)
+        return send(self, request)
+
+    async def guarded_async2(
+        self: httpx2.AsyncHTTPTransport, request: httpx2.Request
+    ) -> httpx2.Response:
+        if refusal := _refusal(request.url):
+            raise httpx2.ConnectError(refusal, request=request)
+        return await send_async2(self, request)
+
+    def guarded2(self: httpx2.HTTPTransport, request: httpx2.Request) -> httpx2.Response:
+        if refusal := _refusal(request.url):
+            raise httpx2.ConnectError(refusal, request=request)
+        return send2(self, request)
+
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", guarded_async)
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", guarded)
+    monkeypatch.setattr(httpx2.AsyncHTTPTransport, "handle_async_request", guarded_async2)
+    monkeypatch.setattr(httpx2.HTTPTransport, "handle_request", guarded2)
+
+
+@pytest.fixture(autouse=True)
+def _default_github_login_allowlist(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ALLOWED_GITHUB_USERS", "test-user,trusted-user,reviewer")
+
+
+@pytest.fixture(autouse=True)
+def _no_bundled_dashboard(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Serve no dashboard build by default, whatever ``ui/.output`` holds locally."""
+    monkeypatch.setenv("DASHBOARD_STATIC_DIR", str(tmp_path / "no-dashboard-build"))
+
+
+@pytest.fixture(autouse=True)
+async def _close_http_pool() -> AsyncIterator[None]:
+    """Each test runs on its own event loop, which takes its connection pool down with it."""
+    from openswe.utils.http_pool import close_pool
+
+    yield
+    await close_pool()
+
+
+@pytest.fixture(autouse=True)
+def _token_encryption_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every deployment has one: it encrypts sign-ins and the cached managed tools listings."""
+    from cryptography.fernet import Fernet
+
+    monkeypatch.setenv("TOKEN_ENCRYPTION_KEY", Fernet.generate_key().decode())
+
+
+@pytest.fixture(autouse=True)
+async def _reset_ttl_cache() -> AsyncIterator[None]:
+    """Keep the process-global caches from leaking settings, MCP catalogs and PR files between tests."""
+    from langgraph_api import cache
+    from langgraph_api.feature_flags import IS_POSTGRES_OR_GRPC_BACKEND
+
+    async def clear() -> None:
+        ttl_cache.clear()
+        await CHANGED_FILES.clear()
+        langsmith_api_keys.LANGSMITH_API_KEYS.clear()
+        # The postgres edition caches over gRPC and has no in-process store to clear.
+        if not IS_POSTGRES_OR_GRPC_BACKEND:
+            cache._CACHE.clear()
+
+    await clear()
+    yield
+    await clear()
+
+
+@pytest.fixture(autouse=True)
+def _reset_sandbox_registries() -> Iterator[None]:
+    """Both sandbox registries are process globals; a leaked handle would let one
+    test's sandbox answer for the next test's thread."""
+    SANDBOX_BACKENDS.clear()
+    SANDBOX_CONNECTIONS.clear()
+    yield
+    SANDBOX_BACKENDS.clear()
+    SANDBOX_CONNECTIONS.clear()
+
+
+@pytest.fixture(autouse=True)
+def _default_enable_auto_review(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Treat automatic reviews as enabled for every repo by default.
+
+    The dashboard's opt-in list (loaded by :func:`openswe.review.enabled_repos.is_review_repo_enabled`)
+    is empty in the test environment.
+
+    Tests targeting the automatic-review gate should override this fixture or set
+    ``monkeypatch.setattr(webhook_common, "is_review_repo_enabled", ...)`` to a stricter stub.
+    """
+
+    async def _enabled(_owner: str, _name: str) -> bool:
+        return True
+
+    monkeypatch.setattr(webhook_common, "is_review_repo_enabled", _enabled)
+
+
+@pytest.fixture
+def github_app(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+    """The App installation token ``GitHubClient.as_app`` mints; ``return_value = None`` fails it."""
+    from openswe.github import app
+
+    monkeypatch.setattr(app, "get_github_app_installation_id_for_repo", AsyncMock(return_value=42))
+    token = AsyncMock(return_value="app-token")
+    monkeypatch.setattr(app, "get_github_app_installation_token", token)
+    return token
+
+
+@pytest.fixture(autouse=True)
+def _slack_api(monkeypatch: pytest.MonkeyPatch):
+    from openswe.slack import http
+    from tests.support.slack_api import slack_api_server
+
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "test-slack-token")
+    with slack_api_server() as api:
+        monkeypatch.setattr(http, "SLACK_API_BASE_URL", api.base_url)
+        api.handler = lambda *_: (200, {"ok": False, "error": "missing_scope"}, {})
+        yield api
+
+
+@pytest.fixture
+def slack_api(_slack_api):
+    _slack_api.handler = None
+    return _slack_api
+
+
+class MemoryEventClaims:
+    """``openswe.event_claims`` without PostgreSQL: claims held in memory, never lapsing."""
+
+    def __init__(self) -> None:
+        self.held: set[tuple[str, str]] = set()
+
+    async def claim(self, scope: str, key: str, *, ttl: timedelta) -> bool:
+        del ttl
+        if (scope, key) in self.held:
+            return False
+        self.held.add((scope, key))
+        return True
+
+    async def release(self, scope: str, key: str) -> None:
+        self.held.discard((scope, key))
+
+    async def is_held(self, scope: str, key: str) -> bool:
+        return (scope, key) in self.held
+
+
+@pytest.fixture
+def memory_event_claims(monkeypatch: pytest.MonkeyPatch) -> MemoryEventClaims:
+    from openswe import event_claims
+
+    claims = MemoryEventClaims()
+    monkeypatch.setattr(event_claims, "claim", claims.claim)
+    monkeypatch.setattr(event_claims, "release", claims.release)
+    monkeypatch.setattr(event_claims, "held", claims.is_held)
+    return claims
+
+
+@pytest.fixture(autouse=True)
+def _no_dropped_events(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tests see every event; the ones about ``DROPPED_EVENTS`` set it themselves."""
+    from openswe.webhooks import event_log
+
+    monkeypatch.setattr(event_log, "DROPPED_EVENTS", frozenset())

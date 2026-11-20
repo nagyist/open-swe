@@ -1,6 +1,4 @@
-# Run formatting on all PRs
-
-name: CI
+name: Agent CI
 
 permissions:
   contents: read
@@ -9,121 +7,541 @@ on:
   push:
     branches: ["main"]
   pull_request:
-  workflow_dispatch: # Allows triggering the workflow manually in GitHub UI
+  workflow_dispatch:
 
-# If another push to the same PR or branch happens while this workflow is still running,
-# cancel the earlier run in favor of the next run.
-#
-# There's no point in testing an outdated version of the code. GitHub only allows
-# a limited number of job runners to be active at the same time, so it's better to cancel
-# pointless jobs early so that more useful jobs can run sooner.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  format:
-    name: Check formatting
+  no-new-langgraph-client:
+    name: No new backend langgraph_client uses
+    if: ${{ github.event_name == 'pull_request' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v6
-      - name: Enable Corepack
-        run: corepack enable
-      - name: Use Node.js 22.x
-        uses: actions/setup-node@v6
+      - uses: actions/checkout@v7.0.1
         with:
-          node-version: 22.x
-          cache: "yarn"
-      - name: Install dependencies
-        run: yarn install --immutable --mode=skip-build
-      - name: Check formatting
-        run: yarn format:check
+          fetch-depth: 0
+      - name: Require MDA for new backend code
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: git diff --no-ext-diff --no-color --unified=0 "$BASE_SHA...HEAD" -- ':(glob)openswe/**/*.py' | python3 scripts/check_langgraph_client.py
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - name: Require httpx2 for owned HTTP clients
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: git diff --no-ext-diff --no-color --unified=0 "$BASE_SHA...HEAD" -- ':(glob)openswe/**/*.py' ':(glob)mda/rt/**/*.py' ':(glob)scripts/**/*.py' | uv run --no-project --python 3.14 scripts/check_httpx.py
 
   lint:
-    name: Check linting
+    name: Agent lint
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
-      - name: Enable Corepack
-        run: corepack enable
-      - name: Use Node.js 22.x
-        uses: actions/setup-node@v6
-        with:
-          node-version: 22.x
-          cache: "yarn"
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
       - name: Install dependencies
-        run: yarn install --immutable --mode=skip-build
-      - name: Check linting
-        run: yarn run lint
+        timeout-minutes: 5
+        run: uv sync --locked --extra dev
+      - name: Run lint
+        run: make lint
 
-  build:
-    name: Build
+  format:
+    name: Agent format check
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
-      - name: Enable Corepack
-        run: corepack enable
-      - name: Use Node.js 22.x
-        uses: actions/setup-node@v6
-        with:
-          node-version: 22.x
-          cache: "yarn"
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
       - name: Install dependencies
-        run: yarn install --immutable --mode=skip-build
-      - name: Build
-        run: yarn build
+        timeout-minutes: 5
+        run: uv sync --locked --extra dev
+      - name: Run format check
+        run: make format-check
 
-  readme-spelling:
-    name: Check README spelling
+  swagger:
+    name: Agent swagger check
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
-      - uses: codespell-project/actions-codespell@v2
-        with:
-          ignore_words_file: .codespellignore
-          path: README.md
-
-  check-spelling:
-    name: Check code spelling
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: codespell-project/actions-codespell@v2
-        with:
-          ignore_words_file: .codespellignore
-          path: apps/open-swe/src
-
-  dev-server-check:
-    name: Check dev server startup
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: apps/open-swe
-    steps:
-      - uses: actions/checkout@v6
-      - name: Enable Corepack
-        run: corepack enable
-        working-directory: .
-      - name: Use Node.js 22.x
-        uses: actions/setup-node@v6
-        with:
-          node-version: 22.x
-          cache: "yarn"
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
       - name: Install dependencies
-        run: yarn install --immutable --mode=skip-build
-        working-directory: .
-      - name: Build all packages
-        run: yarn build
-        working-directory: .
-      - name: Build dev server check script
-        run: yarn tsc --module commonjs --skipLibCheck --outDir ./dist/scripts ./scripts/check-dev-server.ts
-      - name: Rename compiled script to .cjs
-        run: mv ./dist/scripts/check-dev-server.js ./dist/scripts/check-dev-server.cjs
-      - name: Create .env file for dev server check
-        # .env needs to be in the apps/open-swe directory
-        run: touch .env
-      - name: Run dev server check
-        run: node ./dist/scripts/check-dev-server.cjs
+        timeout-minutes: 5
+        run: uv sync --locked --extra dev
+      - name: Regenerate swagger.json
+        run: make swagger
+      - name: Fail if swagger.json is stale
+        run: |
+          if ! git diff --exit-code --stat swagger.json; then
+            echo "::error file=swagger.json::swagger.json is out of date. Run 'make swagger' and commit the result."
+            exit 1
+          fi
+
+  typecheck:
+    name: Agent typecheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - name: Install dependencies
+        timeout-minutes: 5
+        run: uv sync --locked --extra dev
+      - name: Run typecheck
+        run: make typecheck
+
+  mda-typecheck:
+    name: MDA typecheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - name: Type-check the MDA project against its own environment
+        run: make mda-typecheck
+
+  agent-server-image-deps:
+    name: Agent Server image dependencies
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      # Deployments build on the newest Agent Server image langgraph.json allows and install
+      # this project under that image's /api/constraints.txt. Resolve it the same way, so a pin
+      # that conflicts with the image fails here instead of at deploy. Runs on every PR because a
+      # new image release can break the build without any change here.
+      - name: Resolve the project in the Agent Server image
+        run: |
+          cli_version=$(sed -n '/^name = "langgraph-cli"$/{n;s/^version = "\(.*\)"$/\1/p;}' uv.lock)
+          uvx --from "langgraph-cli==$cli_version" langgraph dockerfile -c langgraph.json "$RUNNER_TEMP/Dockerfile"
+          image=$(sed -n 's/^FROM //p' "$RUNNER_TEMP/Dockerfile" | head -n 1)
+          echo "Resolving against $image"
+          docker run --rm --entrypoint uv -v "$PWD:/deps/open-swe:ro" -w /deps/open-swe "$image" \
+            pip install --system --dry-run -c /api/constraints.txt -e .
+
+  unit-tests:
+    name: Agent unit tests
+    needs: e2e-changes
+    if: ${{ needs.e2e-changes.outputs.agent_unit_tests == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16
         env:
-          NODE_ENV: development
-        timeout-minutes: 2
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_ANALYTICS_POSTGRES_URI: postgresql+asyncpg://postgres:postgres@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - name: Install dependencies
+        timeout-minutes: 5
+        run: uv sync --locked --extra dev
+      # Every DROP DATABASE forces a checkpoint; without fsync, parallel workers stop queueing on them.
+      - name: Tune throwaway PostgreSQL for tests
+        run: >-
+          docker exec ${{ job.services.postgres.id }} psql -U postgres
+          -c "ALTER SYSTEM SET fsync = off"
+          -c "ALTER SYSTEM SET full_page_writes = off"
+          -c "SELECT pg_reload_conf()"
+      - name: Run unit tests
+        run: make test PYTEST_ARGS="-n auto"
+      - name: Run MDA unit tests
+        run: make mda-test
+
+  js-format:
+    name: JS format check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 26
+      - run: npm install --global pnpm@11.22.0
+      # oxfmt reads the files straight off disk, so only the root package's own
+      # devDependencies are needed here.
+      - name: Install dependencies
+        timeout-minutes: 5
+        run: pnpm install --frozen-lockfile --filter open-swe-dashboard... --filter open-swe
+      - name: Run format check
+        run: pnpm run format:check
+
+  js-lint:
+    name: JS lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 26
+      - run: npm install --global pnpm@11.22.0
+      - name: Install dependencies
+        timeout-minutes: 5
+        run: pnpm install --frozen-lockfile --filter open-swe-dashboard... --filter open-swe
+      - name: Run lint
+        run: pnpm run lint
+
+  ui-tests:
+    name: UI unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 26
+      - run: npm install --global pnpm@11.22.0
+      - name: Install dependencies
+        timeout-minutes: 5
+        run: pnpm install --frozen-lockfile --filter open-swe-dashboard... --filter open-swe
+      - name: Run tests
+        run: pnpm --filter open-swe-dashboard run test
+
+  ui-typecheck:
+    name: UI typecheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 26
+      - run: npm install --global pnpm@11.22.0
+      - uses: socketdev/action@ba6de6cc0565af1f42295590380973573297e31f
+        with:
+          mode: firewall-free
+      # Unfiltered so hoisting matches a local checkout: other packages' hoisted
+      # typings (e.g. cli's @types/bun) can leak into ui's tsc program.
+      - name: Install workspace dependencies
+        timeout-minutes: 5
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+        run: pnpm install --frozen-lockfile
+      # `js-lint` is oxlint and `build` is Vite, which strips types via esbuild
+      # without checking them, so this is the only job that runs tsc over ui/.
+      - name: Run typecheck
+        run: pnpm --filter open-swe-dashboard run typecheck
+
+  desktop:
+    name: Desktop checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 26
+      - run: npm install --global pnpm@11.22.0
+      - uses: socketdev/action@ba6de6cc0565af1f42295590380973573297e31f
+        with:
+          mode: firewall-free
+      - name: Install workspace dependencies
+        timeout-minutes: 5
+        env:
+          # `pnpm run check` only syntax-checks the sources, runs node tests, and
+          # builds the UI — none of it launches Electron, so downloading ~100 MB
+          # of binary here buys nothing and fails the job whenever the fetch does.
+          # The release workflow, which actually packages the app, still gets it.
+          ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+        run: pnpm install --frozen-lockfile
+      - name: Run desktop checks
+        run: pnpm run check --filter open-swe-desktop
+
+  cli:
+    name: CLI checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 26
+      - run: npm install --global pnpm@11.22.0
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Install dependencies
+        timeout-minutes: 5
+        run: pnpm install --frozen-lockfile --filter "open-swe-cli..." --filter open-swe-bridge-client --filter open-swe
+      - name: Run bridge client checks
+        run: pnpm --filter open-swe-bridge-client run check
+      - name: Run CLI checks
+        run: pnpm --filter open-swe-cli run check
+      - name: Build CLI binary
+        run: pnpm --filter open-swe-cli run build
+
+  plugins:
+    name: App checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 26
+      - run: npm install --global pnpm@11.22.0
+      - name: Install dependencies
+        timeout-minutes: 5
+        run: pnpm install --frozen-lockfile --filter "{./plugins/**}..."
+      - name: Run typecheck
+        run: pnpm --filter "./plugins/**" run --if-present typecheck
+      - name: Run tests
+        run: pnpm --filter "./plugins/**" run --if-present test
+      # Each app builds into the one HTML file that is published to Open SWE.
+      - name: Build apps
+        run: pnpm --filter "./plugins/**" run --if-present build
+
+  e2e-changes:
+    name: Detect E2E changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      agent_unit_tests: ${{ steps.changes.outputs.agent_unit_tests }}
+      browser: ${{ steps.changes.outputs.browser }}
+      desktop: ${{ steps.changes.outputs.desktop }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+      - id: changes
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if [ "${{ github.event_name }}" = workflow_dispatch ]; then
+            echo "agent_unit_tests=true" >> "$GITHUB_OUTPUT"
+            echo "browser=true" >> "$GITHUB_OUTPUT"
+            echo "desktop=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          agent_unit_test_paths=(openswe packages tests mda vendor/managed-deepagents-sdk vendor/langchain-quickjs pyproject.toml uv.lock langgraph.json Makefile .github/workflows/ci.yml ":(exclude)tests/e2e")
+          if git diff --quiet "$BASE_SHA" HEAD -- "${agent_unit_test_paths[@]}"; then
+            echo "agent_unit_tests=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "agent_unit_tests=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          paths=(openswe packages mda vendor/managed-deepagents-sdk vendor/langchain-quickjs ui tests/e2e package.json pnpm-lock.yaml pnpm-workspace.yaml pyproject.toml uv.lock langgraph.json Makefile .github/workflows/ci.yml)
+          if git diff --quiet "$BASE_SHA" HEAD -- "${paths[@]}"; then
+            echo "browser=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "browser=true" >> "$GITHUB_OUTPUT"
+          fi
+          if git diff --quiet "$BASE_SHA" HEAD -- "${paths[@]}" desktop bridge-client; then
+            echo "desktop=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "desktop=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  browser-e2e:
+    name: Browser E2E (${{ matrix.shard }}/6)
+    needs: e2e-changes
+    if: ${{ needs.e2e-changes.outputs.browser == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6]
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      POSTGRES_URI: postgresql://postgres:postgres@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 26
+      - name: Install Python deps (langgraph dev runtime)
+        timeout-minutes: 5
+        run: uv sync --locked
+      - name: Install Python deps (Managed Deep Agents runtime)
+        timeout-minutes: 5
+        working-directory: mda
+        run: uv sync --locked
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - name: Cache the mda CLI
+        id: mda-cache
+        uses: actions/cache@v6
+        with:
+          path: vendor/managed-deepagents-sdk/packages/pypi/src/managed_deepagents/_binaries/mda
+          key: mda-cli-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Makefile', 'vendor/managed-deepagents-sdk/Cargo.*', 'vendor/managed-deepagents-sdk/UPSTREAM', 'vendor/managed-deepagents-sdk/crates/**') }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: steps.mda-cache.outputs.cache-hit != 'true'
+        with:
+          workspaces: vendor/managed-deepagents-sdk
+      - name: Build the mda CLI
+        timeout-minutes: 15
+        env:
+          CACHE_HIT: ${{ steps.mda-cache.outputs.cache-hit }}
+        run: |
+          if [ "$CACHE_HIT" = true ]; then
+            touch vendor/managed-deepagents-sdk/packages/pypi/src/managed_deepagents/_binaries/mda
+          else
+            make --always-make mda-cli
+          fi
+      - run: npm install --global pnpm@11.22.0
+      # Chromium and the dashboard build are identical across the six shards
+      # and change only with their own inputs, so all six restore them rather
+      # than each spending ~50s redoing the work. Both keys are computed before
+      # `pnpm install` writes ui/node_modules, which would otherwise dominate
+      # the ui/** hash and never hit.
+      - name: Cache Chromium
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('tests/e2e/package.json', 'pnpm-lock.yaml') }}
+      # The system packages Chromium needs come from the runner's Ubuntu mirror,
+      # which can stall mid-download until the install times out.
+      - name: Cache Chromium's system packages
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/apt-archives
+          key: playwright-apt-${{ runner.os }}-${{ env.ImageOS }}-${{ hashFiles('tests/e2e/package.json', 'pnpm-lock.yaml') }}
+      - name: Cache dashboard build
+        uses: actions/cache@v6
+        with:
+          path: ui/.output
+          key: ui-output-node26-${{ runner.os }}-${{ hashFiles('ui/**', 'pnpm-lock.yaml') }}
+      - name: Install workspace dependencies
+        timeout-minutes: 5
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+        run: pnpm install --frozen-lockfile --filter open-swe-dashboard... --filter open-swe --filter open-swe-e2e
+      - name: Install Chromium
+        timeout-minutes: 5
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/{azure-cli,google-chrome,microsoft-prod}.*
+          # Keep downloaded packages where the cache above restores them, and retry
+          # a stalled download instead of waiting out the step's timeout.
+          mkdir -p ~/.cache/apt-archives/partial
+          printf '%s\n' \
+            "Dir::Cache::Archives \"$HOME/.cache/apt-archives\";" \
+            'Acquire::Retries "3";' \
+            'Acquire::http::Timeout "20";' \
+            | sudo tee /etc/apt/apt.conf.d/99-ci-chromium >/dev/null
+          pnpm run test:e2e:install
+          # apt leaves its lock and partial/ readable only by root; the cache saves as the runner.
+          sudo chown -R "$(id -u):$(id -g)" ~/.cache/apt-archives
+      - name: Run browser E2E
+        run: pnpm run test:e2e --shard=${{ matrix.shard }}/6
+      - name: Upload Playwright report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-report-${{ matrix.shard }}
+          path: |
+            tests/e2e/playwright-report
+            tests/e2e/test-results
+          retention-days: 7
+
+  desktop-e2e:
+    name: Desktop E2E
+    needs: e2e-changes
+    if: ${{ needs.e2e-changes.outputs.desktop == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      POSTGRES_URI: postgresql://postgres:postgres@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 26
+      - name: Install Python deps (langgraph dev runtime)
+        timeout-minutes: 5
+        run: uv sync --locked
+      - name: Install Python deps (Managed Deep Agents runtime)
+        timeout-minutes: 5
+        working-directory: mda
+        run: uv sync --locked
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - name: Cache the mda CLI
+        id: mda-cache
+        uses: actions/cache@v6
+        with:
+          path: vendor/managed-deepagents-sdk/packages/pypi/src/managed_deepagents/_binaries/mda
+          key: mda-cli-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Makefile', 'vendor/managed-deepagents-sdk/Cargo.*', 'vendor/managed-deepagents-sdk/UPSTREAM', 'vendor/managed-deepagents-sdk/crates/**') }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: steps.mda-cache.outputs.cache-hit != 'true'
+        with:
+          workspaces: vendor/managed-deepagents-sdk
+      - name: Build the mda CLI
+        timeout-minutes: 15
+        env:
+          CACHE_HIT: ${{ steps.mda-cache.outputs.cache-hit }}
+        run: |
+          if [ "$CACHE_HIT" = true ]; then
+            touch vendor/managed-deepagents-sdk/packages/pypi/src/managed_deepagents/_binaries/mda
+          else
+            make --always-make mda-cli
+          fi
+      - run: npm install --global pnpm@11.22.0
+      - name: Install workspace dependencies
+        timeout-minutes: 5
+        run: pnpm install --frozen-lockfile
+      - name: Run Desktop E2E
+        run: xvfb-run --auto-servernum pnpm run test:e2e:desktop
+      - name: Upload Playwright report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-report-desktop
+          path: |
+            tests/e2e/playwright-report
+            tests/e2e/test-results
+          retention-days: 7
+
+  e2e:
+    name: Playwright E2E
+    if: ${{ !cancelled() }}
+    needs: [e2e-changes, browser-e2e, desktop-e2e]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      CHANGES_RESULT: ${{ needs.e2e-changes.result }}
+      BROWSER_RESULT: ${{ needs.browser-e2e.result }}
+      DESKTOP_RESULT: ${{ needs.desktop-e2e.result }}
+    steps:
+      - run: |
+          test "$CHANGES_RESULT" = success
+          test "$BROWSER_RESULT" = success || test "$BROWSER_RESULT" = skipped
+          test "$DESKTOP_RESULT" = success || test "$DESKTOP_RESULT" = skipped

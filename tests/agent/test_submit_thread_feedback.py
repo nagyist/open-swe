@@ -1,0 +1,96 @@
+import importlib
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import AsyncMock
+
+import pytest
+from langchain_core.tools import tool as make_tool
+
+from openswe.thread_feedback import FEEDBACK, Feedback
+from openswe.tools.submit_thread_feedback import submit_thread_feedback
+
+tool = importlib.import_module("openswe.tools.submit_thread_feedback")
+
+
+@pytest.fixture
+async def context(registry_db: None, monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+    export = AsyncMock(return_value=True)
+
+    @asynccontextmanager
+    async def unlocked(*args: object, **kwargs: object):
+        yield
+
+    monkeypatch.setattr(tool, "agent_thread_pr_state_lock", unlocked)
+    monkeypatch.setattr(tool, "create_langsmith_thread_feedback", export)
+    monkeypatch.setattr(tool, "record_feedback_submission", AsyncMock())
+    return export
+
+
+def test_tool_schema_hides_runtime_context() -> None:
+    schema = make_tool(submit_thread_feedback).tool_call_schema.model_json_schema()
+    assert set(schema["properties"]) == {"rating", "comment"}
+
+
+def _runtime(route: str = "performance") -> Any:
+    return SimpleNamespace(
+        config={"run_id": "run-1", "configurable": {"thread_id": "thread-1"}},
+        state={"model_route": route},
+    )
+
+
+async def test_submits_explicit_feedback_with_run_context(context: AsyncMock) -> None:
+    result = await submit_thread_feedback("bad", _runtime(), "  Needed a stronger model.  ")
+
+    assert result == {
+        "status": "completed",
+        "rating": "bad",
+        "comment": "Needed a stronger model.",
+        "export_status": "exported",
+    }
+    assert await FEEDBACK.get("thread-1") == Feedback(
+        status="completed",
+        event_id="tool:run-1",
+        answer_run_id="run-1",
+        rating="bad",
+        comment="Needed a stronger model.",
+    )
+    context.assert_awaited_once_with(
+        "thread-1",
+        "rating",
+        score=0.0,
+        comment="Needed a stronger model.",
+        source_info={
+            "source": "agent_thread_feedback_tool",
+            "run_id": "run-1",
+            "model_route": "performance",
+        },
+    )
+    tool.record_feedback_submission.assert_awaited_once_with(
+        feedback_key="thread:thread-1",
+        rating=1,
+        source="unknown",
+        run_key="run-1",
+        github_login=None,
+        user_email=None,
+        slack_user_id=None,
+    )
+
+
+async def test_updates_existing_feedback_submission(context: AsyncMock) -> None:
+    await FEEDBACK.put(
+        "thread-1", Feedback(status="completed", rating="good", comment="Already saved")
+    )
+
+    result = await submit_thread_feedback("bad", _runtime(), "Replace me")
+
+    assert result == {
+        "status": "completed",
+        "rating": "bad",
+        "comment": "Replace me",
+        "export_status": "exported",
+    }
+    assert await FEEDBACK.get("thread-1") == Feedback(
+        status="completed", rating="bad", comment="Replace me"
+    )
+    context.assert_awaited_once()

@@ -1,0 +1,343 @@
+"""Reconcile the live turn tree, including calls already sent to LangSmith."""
+
+import asyncio
+import logging
+import os
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from typing import Final
+
+from langchain.agents.middleware import AgentMiddleware, TracePolicy, omit_payload
+from langchain.agents.middleware.types import ModelRequest, ModelResponse
+from langchain_core.callbacks import AsyncCallbackManager, CallbackManager
+from langchain_core.runnables.config import ensure_config
+from langchain_core.tracers.langchain import LangChainTracer
+from langsmith import get_tracing_context, tracing_context
+from langsmith.run_trees import RunTree
+from pydantic import JsonValue
+
+logger = logging.getLogger(__name__)
+
+# Baggage that describes the span itself rather than where its children belong.
+_SPAN_ONLY_BAGGAGE: Final = ("langsmith-metadata=", "langsmith-tags=")
+# Turns whose trace is still being reconciled after their run ended.
+_ENDING: Final[set[asyncio.Task[None]]] = set()
+
+
+def span_headers(span: RunTree) -> dict[str, str]:
+    """Distributed-tracing headers that nest a call's spans under ``span``.
+
+    Only the trace position and destination travel: the span's metadata and tags stay
+    out, since the receiver sets its own and they can outgrow a header.
+    """
+    headers = span.to_headers()
+    headers["baggage"] = ",".join(
+        item
+        for item in headers.get("baggage", "").split(",")
+        if item and not item.startswith(_SPAN_ONLY_BAGGAGE)
+    )
+    return headers
+
+
+def _ended(task: asyncio.Task[None]) -> None:
+    _ENDING.discard(task)
+    if task.cancelled():
+        logger.warning("A turn's trace was not reconciled before the runtime stopped")
+
+
+MIDDLEWARE_TRACE_POLICY = TracePolicy(process_inputs=omit_payload)
+
+_ENVIRONMENTS: Final = {
+    "open-swe-mda-prod": "production",
+    "open-swe-mda-staging": "staging",
+    "open-swe-mda-preview": "preview",
+}
+
+
+def _deployment_provenance() -> dict[str, JsonValue]:
+    """The MDA code and deployment serving this turn.
+
+    Set on the root explicitly, since LangSmith only fills ``revision_id`` when the run's
+    metadata lacks one, and a queued run's metadata names the deployment that queued it.
+    """
+    provenance: dict[str, JsonValue] = {}
+    if revision := os.environ.get("LANGSMITH_REVISION_ID"):
+        provenance["revision_id"] = revision
+    if environment := _ENVIRONMENTS.get(os.environ.get("MDA_DEPLOYMENT_NAME", "")):
+        provenance["environment"] = environment
+    return provenance
+
+
+class TurnTrace:
+    """The actual runtime's turn trace, never a backend hook or a previous turn."""
+
+    def __init__(self) -> None:
+        self.root: RunTree | None = None
+        self._ending: asyncio.Task[None] | None = None
+        self._tool_calls = 0
+        self._failed_tool_calls = 0
+        self._nonzero_shell_exits = 0
+
+    @staticmethod
+    def current_root() -> RunTree | None:
+        """Find the live tree within this invocation, not its external tracing parent.
+
+        A run the backend started names its invocation. A worker deepagents launched names
+        none until it adopts a run token, so its turn is its own thread's runs: the
+        coordinator's span it nests under, rebuilt from trace headers, names no thread.
+        """
+        config = ensure_config()
+        metadata = config.get("metadata", {})
+        invocation_id = metadata.get("invocation_id")
+        thread_id = metadata.get("thread_id")
+        callbacks = config.get("callbacks")
+        if not isinstance(callbacks, (AsyncCallbackManager, CallbackManager)):
+            return None
+        if isinstance(invocation_id, str):
+            turn: tuple[str, str | None] = ("invocation_id", invocation_id)
+        elif isinstance(thread_id, str) and thread_id:
+            turn = ("thread_id", thread_id)
+        else:
+            return None
+        key, value = turn
+        for tracer in callbacks.handlers:
+            if not isinstance(tracer, LangChainTracer):
+                continue
+            current = tracer.run_map.get(str(callbacks.parent_run_id))
+            if current is None or current.metadata.get(key) != value:
+                continue
+            while current.parent_run_id is not None:
+                parent = tracer.run_map.get(str(current.parent_run_id))
+                if (
+                    parent is None
+                    or parent.trace_id != current.trace_id
+                    or parent.metadata.get(key) != value
+                ):
+                    break
+                current = parent
+            return current
+        return None
+
+    def start(self) -> None:
+        self.root = None
+        self._tool_calls = self._failed_tool_calls = self._nonzero_shell_exits = 0
+        try:
+            self.root = self.current_root()
+            self.update({})
+            self._count_tools()
+        except Exception:
+            logger.warning("Could not tag the turn trace", exc_info=True)
+
+    def update(self, metadata: Mapping[str, JsonValue]) -> None:
+        if self.root is not None:
+            self.root.metadata.update({**metadata, **_deployment_provenance()})
+            if self.root.metadata.get("created_by") == "system":
+                self.root.metadata.pop("created_by")
+
+    def tag(self, tags: Sequence[str]) -> None:
+        """Add ``tags`` to the turn's root trace."""
+        if self.root is not None and tags:
+            self.root.tags = [*(self.root.tags or []), *tags]
+
+    def record_model(self, model_id: str) -> None:
+        """Tag the turn with its most recently attempted model, without relabeling child calls."""
+        if self.root is not None:
+            self.root.metadata["model"] = model_id
+
+    @staticmethod
+    def record_output_limit(stop_reason: str) -> None:
+        try:
+            if (root := TurnTrace.current_root()) is not None:
+                tags = root.tags or []
+                if "model_output_limit" not in tags:
+                    root.tags = [*tags, "model_output_limit"]
+                root.metadata["model_output_limit"] = stop_reason
+        except Exception:
+            logger.warning("Could not tag the turn trace for a cut-off reply", exc_info=True)
+
+    def record_tool(self, *, errored: bool, nonzero_shell_exit: bool) -> None:
+        """Count a tool call the turn finished on its root.
+
+        Every call made at any level counts once: an ``eval`` and each tool its code calls,
+        a ``task`` and each call its subagent makes. ``failed_tool_calls`` counts the calls
+        that answered with an error and the shell commands that exited non-zero;
+        ``nonzero_shell_exits`` counts those commands alone, as a ``grep`` that matched
+        nothing exits 1. A call paused for the person to answer is not counted.
+
+        Written as each call ends, so a run cut off or failed still carries its counts. A
+        run resumed after a pause does not prepare again, finds no root, and carries none.
+        """
+        self._tool_calls += 1
+        self._failed_tool_calls += errored or nonzero_shell_exit
+        self._nonzero_shell_exits += nonzero_shell_exit
+        self._count_tools()
+
+    def _count_tools(self) -> None:
+        if self.root is not None:
+            self.root.metadata["tool_calls"] = self._tool_calls
+            self.root.metadata["failed_tool_calls"] = self._failed_tool_calls
+            self.root.metadata["nonzero_shell_exits"] = self._nonzero_shell_exits
+
+    @staticmethod
+    def current_headers() -> dict[str, str]:
+        """Distributed-tracing headers for the running call's span, so a backend hook nests under it.
+
+        Only the trace position and destination travel: the span's metadata and tags
+        stay out, since the backend sets its own and they can outgrow a header.
+        """
+        try:
+            config = ensure_config()
+            callbacks = config.get("callbacks")
+            if not isinstance(callbacks, (AsyncCallbackManager, CallbackManager)):
+                return {}
+            for tracer in callbacks.handlers:
+                if not isinstance(tracer, LangChainTracer):
+                    continue
+                span = tracer.run_map.get(str(callbacks.parent_run_id))
+                if (
+                    span is None
+                    or span.end_time is not None
+                    or span.extra.get("__disabled")
+                    or not span.trace_id
+                ):
+                    return {}
+                return span_headers(span)
+        except Exception:
+            logger.warning("Could not read the running span's trace headers", exc_info=True)
+        return {}
+
+    def end(
+        self,
+        metadata: Mapping[str, JsonValue],
+        evidence: Callable[[], Awaitable[Mapping[str, JsonValue]]],
+    ) -> None:
+        """Reconcile the turn's trace with ``metadata`` and what ``evidence`` finds, in the
+        background: the run ends, and its thread takes the next message, without waiting."""
+        if self.root is None:
+            return
+        self._ending = asyncio.ensure_future(self._end(self.root, metadata, evidence))
+        _ENDING.add(self._ending)
+        self._ending.add_done_callback(_ended)
+
+    async def ended(self) -> None:
+        """Wait for the turn's trace to be reconciled."""
+        if self._ending is not None:
+            await asyncio.shield(self._ending)
+
+    @staticmethod
+    async def _end(
+        root: RunTree,
+        metadata: Mapping[str, JsonValue],
+        evidence: Callable[[], Awaitable[Mapping[str, JsonValue]]],
+    ) -> None:
+        try:
+            found = await evidence()
+        except Exception:
+            logger.warning("Could not gather the turn's trace metadata", exc_info=True)
+            found = {}
+        await TurnTrace._reconcile(root, {**metadata, **found})
+
+    @staticmethod
+    async def _reconcile(root: RunTree, metadata: Mapping[str, JsonValue]) -> None:
+        try:
+            pending = [root]
+            runs: list[RunTree] = []
+            while pending:
+                run = pending.pop()
+                if run.trace_id != root.trace_id or run.metadata.get(
+                    "invocation_id"
+                ) != root.metadata.get("invocation_id"):
+                    continue
+                run.metadata.update(metadata)
+                if run is root and run.metadata.get("created_by") == "system":
+                    run.metadata.pop("created_by")
+                runs.append(run)
+                pending.extend(run.child_runs)
+
+            def patch() -> None:
+                for run in runs:
+                    if run.end_time is not None and not run.extra.get("__disabled"):
+                        run.patch(exclude_inputs=True)
+
+            await asyncio.to_thread(patch)
+        except Exception:
+            logger.warning("Could not reconcile turn trace metadata", exc_info=True)
+
+
+class RootAgentTraceMiddleware(AgentMiddleware):
+    """Trace the agent's own model calls as LangSmith's root agent (``ls_agent_type: root``).
+
+    LangSmith shows the calls so tagged as a thread's main conversation, across the
+    summaries that restart its history. Installed innermost, it leaves out the summary's
+    model call and the calls a tool makes. A call whose trace already names an agent type
+    keeps it, as deepagents tags a forked subagent ``subagent``. An async worker's calls
+    are tagged ``subagent`` while its run is nested in the coordinator's trace, so they
+    stay out of the coordinator's conversation; a run on a worker thread that has its own
+    trace is that trace's root agent.
+
+    A nested worker's calls also carry whom the worker bills to, from ``attribution``:
+    deepagents starts its run with none, and the backend settles it only as the worker
+    adopts its run token, after its run's metadata is fixed.
+    """
+
+    # Whom a call bills to, as the backend names it in a run's trace metadata.
+    _BILLING_KEYS: Final = (
+        "billing_bucket",
+        "billed_user_email",
+        "billed_robin_user_id",
+        "user_id",
+    )
+
+    def __init__(self, attribution: Callable[[], Mapping[str, JsonValue]] | None = None) -> None:
+        self._attribution = attribution
+
+    async def awrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
+    ) -> ModelResponse:
+        tracing = get_tracing_context()
+        metadata = tracing["metadata"] or {}
+        if "ls_agent_type" in metadata:
+            return await handler(request)
+        if self.is_nested_worker(ensure_config()):
+            tracing["metadata"] = {**metadata, **self._billing(), "ls_agent_type": "subagent"}
+        else:
+            tracing["metadata"] = {**metadata, "ls_agent_type": "root"}
+        with tracing_context(**tracing):
+            return await handler(request)
+
+    def _billing(self) -> dict[str, JsonValue]:
+        if self._attribution is None:
+            return {}
+        try:
+            attribution = self._attribution()
+        except Exception:
+            logger.warning("Could not read a worker's billing for its model call", exc_info=True)
+            return {}
+        return {key: attribution[key] for key in self._BILLING_KEYS if key in attribution}
+
+    @staticmethod
+    def is_nested_worker(config: Mapping[str, object]) -> bool:
+        """Whether the run is an async worker's, traced inside its coordinator's trace.
+
+        deepagents sends the lead thread as ``configurable.deepagents_parent``; the Agent
+        Server also copies the task thread's ``parent_thread_id`` into every run on it,
+        including runs deepagents didn't start. Only a run deepagents marked to nest under
+        its launching call is inside the coordinator's trace.
+        """
+        configurable = config.get("configurable")
+        if not isinstance(configurable, Mapping):
+            return False
+        trace_metadata = configurable.get("langsmith-metadata")
+        if not (
+            isinstance(configurable.get("langsmith-trace"), str)
+            and isinstance(trace_metadata, Mapping)
+            and trace_metadata.get("ls_nest_under_parent") is True
+        ):
+            return False
+        reference = configurable.get("deepagents_parent")
+        metadata = config.get("metadata")
+        return bool(
+            (isinstance(reference, Mapping) and reference.get("thread_id"))
+            or (isinstance(metadata, Mapping) and metadata.get("parent_thread_id"))
+        )

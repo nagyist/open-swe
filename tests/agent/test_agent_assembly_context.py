@@ -1,0 +1,1001 @@
+"""What the main agent's planner hands an MDA run: its tools, loop rules, models and subagents."""
+
+import json
+from types import SimpleNamespace
+from typing import Literal, cast
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+from langgraph.graph.state import RunnableConfig
+
+from openswe.agent_api.tokens import AGENT_TURN_KEY, AgentTurnSettings
+from openswe.dashboard.settings import Settings
+from openswe.mcp.runtime import MCPTools
+from openswe.sandboxes.state import SANDBOX_BACKENDS
+from openswe.sandboxes.tool_runtime import ModelChoice, SurfaceModels, ToolSurface
+from openswe.schedules.policy import AutomationPolicy
+from openswe.server import PrepareAgentRunMiddleware, _registered_tool_name, agent_catalog
+from openswe.threads import index
+from openswe.threads.inbox import ThreadInbox
+from openswe.threads.index import IndexedThread
+from openswe.utils import thread_reads
+from tests.conftest import ThreadStoreOverClient
+
+pytestmark = pytest.mark.usefixtures("registry_db")
+
+
+_MODEL_DEFAULTS = {
+    "default_agent_model": "openai:gpt-6.1-sol",
+    "default_agent_reasoning_effort": "medium",
+    "default_agent_subagent_model": "openai:gpt-6.1-sol",
+    "default_agent_subagent_reasoning_effort": "low",
+}
+
+
+@pytest.fixture(autouse=True)
+def saved_thread_scope(monkeypatch):
+    metadata = {"visibility": "private", "owner_login": "octocat"}
+
+    async def scope(thread_id: str) -> IndexedThread:
+        return ThreadStoreOverClient.indexed(thread_id, {"metadata": metadata})
+
+    monkeypatch.setattr(thread_reads, "THREADS", SimpleNamespace(get=scope))
+    return metadata
+
+
+@pytest.mark.parametrize(
+    "owner_type, enabled", [("user", True), ("user", False), ("system", True), (None, True)]
+)
+async def test_force_code_mode_follows_thread_owner(
+    owner_type: str | None, enabled: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    from openswe.users import User
+
+    owner = User(preferences={"experimental_force_code_mode": enabled})
+    await index.create(
+        "thread-ctx",
+        runtime="mda",
+        metadata={"owner_type": owner_type, "owner_user_id": str(owner.id)},
+    )
+    with patch.object(User, "get", new_callable=AsyncMock, return_value=owner):
+        captured = await _agent_catalog()
+    surface = captured["surface"]
+    assert isinstance(surface, ToolSurface)
+    assert surface.force_code_mode is (owner_type == "user" and enabled)
+    assert "Could not resolve code-mode experiment owner" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_public_agent_excludes_personal_skills_and_tools(saved_thread_scope):
+    saved_thread_scope["visibility"] = "public"
+    config = _base_config()
+    config["configurable"]["source"] = "dashboard"
+    with patch(
+        "openswe.server._mcp_tools_for",
+        new_callable=AsyncMock,
+        return_value=MCPTools(),
+    ) as mcps:
+        captured = await _agent_catalog(config)
+    assert captured["skills"] == ["/organization-skills/", "/bundled-skills/"]
+    tools = captured["tools"]
+    assert isinstance(tools, list)
+    tool_names = {_registered_tool_name(tool) for tool in tools}
+    assert not tool_names.intersection(
+        {
+            "save_user_instructions",
+            "save_user_settings",
+            "save_user_skill",
+            "delete_user_skill",
+            "read_user_settings",
+        }
+    )
+    mcps.assert_awaited_once_with(None, unattended=False)
+
+
+async def test_remote_agent_lists_personal_skills(monkeypatch: pytest.MonkeyPatch) -> None:
+    from runtime_api.operations import RunRequest
+    from runtime_api.skills import BUNDLED_SKILLS, RunSkills, SkillsRequest
+
+    from openswe.agent_api.agent import AgentKind
+    from openswe.agent_api.run_calls import TokenRun
+    from openswe.agent_api.tokens import RemoteRun
+    from openswe.skill_store.store import _record
+
+    monkeypatch.setattr(
+        "openswe.skill_store.backend.agent_skills",
+        AsyncMock(
+            side_effect=lambda login: (
+                [_record("personal-workflow", "A workflow", "Do it.")] if login else []
+            )
+        ),
+    )
+    captured = await _agent_catalog()
+    surface = cast(ToolSurface, captured["surface"])
+    configurable = dict(_base_config()["configurable"])
+    run = RemoteRun(thread_id="thread-ctx", assistant_id="agent", configurable=configurable)
+
+    # Listed from the run's token alone: no plan of the run is made for it.
+    listed = RunSkills.model_validate(
+        await TokenRun.answer(AgentKind(), run, "skills", RunRequest().model_dump())
+    )
+
+    personal = next(f for f in listed.files if f.path == "/skills/personal-workflow/SKILL.md")
+    assert "Do it." in personal.content
+    # The runtime answers reads of skills itself; the files API serves none of them.
+    assert not set(surface.skill_sources) & set(surface.backend_paths)
+    assert BUNDLED_SKILLS in surface.skill_sources
+    assert not any(f.path.startswith(BUNDLED_SKILLS) for f in listed.files)
+
+    # A runtime that serves them gets PostgreSQL's skills alone.
+    served = SkillsRequest(served=[BUNDLED_SKILLS]).model_dump()
+    own = RunSkills.model_validate(await TokenRun.answer(AgentKind(), run, "skills", served))
+    assert own.files and not any(f.path.startswith(BUNDLED_SKILLS) for f in own.files)
+
+
+@pytest.mark.parametrize("profile", [None, {"experimental_monitor": False}])
+async def test_monitor_is_available_without_opt_in(profile: dict[str, object] | None) -> None:
+    captured = await _agent_catalog(profile=profile)
+    tools = captured["tools"]
+    assert isinstance(tools, list)
+    assert "monitor" in {_registered_tool_name(tool) for tool in tools}
+
+
+async def test_offloaded_images_are_served_from_a_thread_scoped_store() -> None:
+    from deepagents.backends.store import StoreBackend
+
+    from openswe.run_config import RunConfig
+    from openswe.server import ThreadFiles
+    from openswe.skill_store.run_skills import RunSkillStores
+
+    config = _base_config()
+    captured = await _agent_catalog(config)
+    files = ThreadFiles("thread-ctx", RunConfig.from_config(config), skills=RunSkillStores(None))
+    blobs = files.routes["/blobs/"]
+    assert isinstance(blobs, StoreBackend)
+    assert blobs._namespace(MagicMock()) == ("thread_blobs", "thread-ctx")
+    surface = cast(ToolSurface, captured["surface"])
+    assert "/blobs/" in surface.backend_paths
+
+
+@pytest.mark.asyncio
+async def test_unknown_scope_omits_mcps():
+    with (
+        patch("openswe.server.private_credential_login", side_effect=TimeoutError),
+        patch("openswe.server._mcp_tools_for", new_callable=AsyncMock) as mcps,
+    ):
+        await _agent_catalog()
+    mcps.assert_not_awaited()
+
+
+def _base_config() -> RunnableConfig:
+    return {
+        "configurable": {
+            "__is_for_execution__": True,
+            "thread_id": "thread-ctx",
+            "github_login": "octocat",
+        },
+        "metadata": {},
+    }
+
+
+async def _agent_catalog(
+    config: RunnableConfig | None = None,
+    *,
+    profile: dict[str, object] | None = None,
+    thread_settings: dict[str, object] | None = None,
+    settings: Settings | None = None,
+) -> dict[str, object]:
+    """The run ``config`` plans, with the parts tests read pulled out of its surface."""
+
+    surface = ToolSurface()
+    config = config or _base_config()
+    thread_id = str((config.get("configurable") or {}).get("thread_id"))
+    await index.create(thread_id, runtime="mda", metadata={}, if_exists="do_nothing")
+
+    SANDBOX_BACKENDS.pop(thread_id, None)
+    with (
+        patch(
+            "openswe.server.resolve_github_token",
+            new_callable=AsyncMock,
+            return_value=("ghp", None),
+        ),
+        patch("openswe.server.resolve_triggering_user_identity", return_value=None),
+        patch(
+            "openswe.server.ensure_sandbox_for_thread",
+            new_callable=AsyncMock,
+            return_value=MagicMock(),
+        ),
+        patch(
+            "openswe.server.resolve_sandbox_work_dir",
+            new_callable=AsyncMock,
+            return_value="/workspace",
+        ),
+        patch(
+            "openswe.server.cached_settings",
+            new_callable=AsyncMock,
+            return_value=settings
+            or Settings(
+                {
+                    **_MODEL_DEFAULTS,
+                    "default_agent_routing_fast_model": "google_genai:gemini-4-hydrogen",
+                    "default_agent_routing_fast_reasoning_effort": "low",
+                    "default_agent_routing_balanced_model": "openai:gpt-6.1-sol",
+                    "default_agent_routing_balanced_reasoning_effort": "medium",
+                    "default_agent_routing_performance_model": "anthropic:claude-opus-5-5",
+                    "default_agent_routing_performance_reasoning_effort": "high",
+                    "model_routing_split": True,
+                }
+            ),
+        ),
+        patch("openswe.server.load_profile", new_callable=AsyncMock, return_value=profile),
+        patch(
+            "openswe.server.load_thread_settings",
+            new_callable=AsyncMock,
+            return_value=thread_settings or {},
+        ),
+        patch("openswe.server.construct_system_prompt", return_value="prompt"),
+    ):
+        await agent_catalog(config, surface)
+
+    SANDBOX_BACKENDS.pop(thread_id, None)
+    return {
+        "surface": surface,
+        "tools": list(surface.base_tools),
+        "subagents": list(surface.subagents),
+        "skills": list(surface.skill_sources),
+        "turn": AgentTurnSettings.model_validate(config["configurable"][AGENT_TURN_KEY]),
+    }
+
+
+def _models(agent: dict[str, object]) -> SurfaceModels:
+    models = cast(ToolSurface, agent["surface"]).models
+    assert models is not None
+    return models
+
+
+def _main_model(agent: dict[str, object]) -> ModelChoice:
+    return _models(agent).main
+
+
+@pytest.mark.asyncio
+async def test_existing_thread_reloads_sender_draft_preference_into_run_config(
+    saved_thread_scope,
+) -> None:
+    saved_thread_scope["owner_login"] = "draft-preference-owner"
+    config = _base_config()
+    configurable = config.get("configurable")
+    assert isinstance(configurable, dict)
+    configurable["github_login"] = "draft-preference-owner"
+
+    await _agent_catalog(
+        config,
+        profile={"draft_prs": False},
+        thread_settings={
+            "owner_login": "draft-preference-owner",
+            "model_id": "openai:gpt-6.1-sol",
+        },
+    )
+
+    assert configurable["draft_prs"] is False
+
+
+@pytest.mark.parametrize(
+    ("login", "profile", "expected"),
+    [
+        (None, None, None),
+        ("draft-preference-none", None, None),
+        ("draft-preference-unset", {}, True),
+    ],
+)
+async def test_sender_profile_decides_run_draft_preference(
+    saved_thread_scope,
+    login: str | None,
+    profile: dict[str, object] | None,
+    expected: bool | None,
+) -> None:
+    saved_thread_scope["owner_login"] = login
+    config = _base_config()
+    configurable = config["configurable"]
+    configurable["github_login"] = login
+
+    await _agent_catalog(config, profile=profile)
+
+    assert configurable["draft_prs"] is expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tier", "expected_model"),
+    [("balanced", "openai:gpt-6.1-sol"), ("performance", "anthropic:claude-opus-5-5")],
+)
+async def test_an_auto_thread_runs_on_its_experiment_tier_not_profile_default(
+    tier: str, expected_model: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("openswe.server.RoutingArm.tier", lambda _: tier)
+    config = _base_config()
+    config["configurable"].update(thread_id="thread-1", source="dashboard", model_selection="auto")
+    profile = {"default_model": "fireworks:accounts/fireworks/models/kimi-k3"}
+    agent = await _agent_catalog(config, profile=profile)
+
+    assert _main_model(agent).model_id == expected_model
+    loop = cast(ToolSurface, agent["surface"]).loop
+    # The split needs no classifier; the task-type evaluator labels the traces.
+    assert loop.routing is not None and loop.routing.mode is None and not loop.routing.shadow
+    assert loop.trace_tags == ["model_routing:inactive", f"model_experiment:{tier}"]
+
+
+async def test_adaptive_routing_sends_every_auto_thread_through_the_classifier() -> None:
+    config = _base_config()
+    config["configurable"].update(source="dashboard", model_selection="auto")
+    agent = await _agent_catalog(
+        config,
+        settings=Settings({**_MODEL_DEFAULTS, "model_routing_split": False}),
+    )
+
+    loop = cast(ToolSurface, agent["surface"]).loop
+    assert loop.routing is not None and loop.routing.mode == "auto"
+    assert loop.model_experiment is None
+    assert loop.trace_tags == ["model_routing:active"]
+    assert cast(dict[str, object], config["metadata"])["model_routing_mode"] == "auto"
+
+
+async def test_a_personal_automation_runs_on_auto_without_limits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        AutomationPolicy, "for_schedule", AsyncMock(return_value=AutomationPolicy(None))
+    )
+    config = _base_config()
+    config["configurable"].update(source="schedule", schedule_id="schedule-1")
+    with patch("openswe.server.store_thread_settings", new_callable=AsyncMock):
+        agent = await _agent_catalog(
+            config,
+            settings=Settings({**_MODEL_DEFAULTS, "model_routing_split": False}),
+        )
+
+    surface = cast(ToolSurface, agent["surface"])
+    # It runs as its creator and is billed to them, so like their own threads it is
+    # routed on Auto, may use subagents, and has no token budget of its own.
+    assert surface.loop.routing is not None and surface.loop.routing.mode == "auto"
+    assert surface.subagents
+
+
+@pytest.mark.parametrize(
+    "configurable",
+    [
+        {"source": "schedule", "schedule_id": "schedule-1"},
+        {"source": "api"},
+        {"source": "slack", "slack_thread": {"channel_id": "C1", "triggering_bot_id": "B1"}},
+    ],
+)
+async def test_an_automated_thread_is_left_out_of_the_experiment(
+    configurable: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("openswe.server.RoutingArm.tier", lambda _: "performance")
+    # A system automation keeps the global default; a personal one runs on Auto.
+    monkeypatch.setattr(
+        AutomationPolicy, "for_schedule", AsyncMock(return_value=AutomationPolicy(None, True))
+    )
+    config = _base_config()
+    config["configurable"].update(configurable)
+    with patch("openswe.server.store_thread_settings", new_callable=AsyncMock) as store:
+        agent = await _agent_catalog(config)
+
+    assert _main_model(agent).model_id == "openai:gpt-6.1-sol"
+    loop = cast(ToolSurface, agent["surface"]).loop
+    assert loop.model_experiment is None
+    assert loop.routing is not None and not loop.routing.shadow
+    # A person who follows up later stays out of it too.
+    assert cast(dict[str, object], store.call_args.args[2])["model_routing_enabled"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("legacy_thread", [False, True])
+async def test_admin_model_changes_only_affect_new_threads(legacy_thread: bool) -> None:
+    initial_settings = (
+        {"model_id": "openai:gpt-6.1-sol", "effort": "medium", "model_routing_enabled": True}
+        if legacy_thread
+        else {}
+    )
+    with patch("openswe.server.store_thread_settings", new_callable=AsyncMock) as store:
+        original = await _agent_catalog(
+            profile={"model_routing_enabled": True}, thread_settings=initial_settings
+        )
+    snapshot = json.loads(json.dumps(store.call_args.args[2]))
+    changed_defaults = Settings(
+        {
+            "default_agent_model": "google_genai:gemini-4-hydrogen",
+            "default_agent_reasoning_effort": "high",
+            "default_agent_subagent_model": "google_genai:gemini-4-hydrogen",
+            "default_agent_subagent_reasoning_effort": "high",
+            "default_thread_title_model": "google_genai:gemini-4-hydrogen",
+            "default_thread_title_reasoning_effort": "high",
+            "model_routing_enabled": True,
+            **{
+                f"default_agent_routing_{tier}_{field}": value
+                for tier in ("fast", "balanced", "performance")
+                for field, value in (
+                    ("model", "google_genai:gemini-4-hydrogen"),
+                    ("reasoning_effort", "high"),
+                )
+            },
+        }
+    )
+    existing = await _agent_catalog(thread_settings=snapshot, settings=changed_defaults)
+    fresh_config = _base_config()
+    fresh_config["configurable"]["thread_id"] = "new-thread"
+    fresh = await _agent_catalog(fresh_config, settings=changed_defaults)
+
+    original_models, existing_models, fresh_models = (
+        _models(agent) for agent in (original, existing, fresh)
+    )
+    titles = [cast(AgentTurnSettings, agent["turn"]) for agent in (original, existing, fresh)]
+    assert existing_models == original_models
+    # The title model is no thread setting: it follows the instance default.
+    assert titles[1].title_model_id == titles[2].title_model_id != titles[0].title_model_id
+    assert fresh_models != original_models
+    assert {
+        choice.model_id
+        for choice in (fresh_models.main, fresh_models.subagent, *fresh_models.routes.values())
+    } == {"google_genai:gemini-4-hydrogen"}
+
+
+@pytest.mark.parametrize(
+    "config_patch",
+    [
+        {"github_login": "someone-else"},
+        {"github_login": None},
+        {"background_task_completion": True},
+        {"source": "schedule"},
+    ],
+)
+async def test_personal_settings_tool_not_exposed_to_unauthorized_runs(
+    config_patch: dict[str, object],
+) -> None:
+    config = _base_config()
+    config["configurable"].update({"source": "dashboard", **config_patch})
+    captured = await _agent_catalog(config)
+    tools = captured["tools"]
+    assert isinstance(tools, list)
+    assert "save_user_settings" not in {_registered_tool_name(tool) for tool in tools}
+
+
+def _tool_names(tools: object) -> set[str]:
+    assert isinstance(tools, list)
+    return {_registered_tool_name(tool) for tool in tools}
+
+
+@pytest.mark.asyncio
+async def test_agent_includes_sql_only_on_private_admin_surfaces(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openswe.server import ADMIN_TOOLS
+    from openswe.tools import execute_database_sql, read_only_sql
+
+    monkeypatch.setenv("OPENSWE_ENV", "preview")
+    from openswe.tools.manage_feature_flags import manage_feature_flags
+
+    captured = await _agent_catalog()
+    tools = _tool_names(captured["tools"])
+    assert read_only_sql.__name__ not in tools
+    assert execute_database_sql.__name__ not in tools
+    assert manage_feature_flags.__name__ not in tools
+
+    monkeypatch.setenv("CONFIGURED_ADMINS", "octocat")
+    config = _base_config()
+    configurable = config.get("configurable")
+    assert isinstance(configurable, dict)
+    configurable["admin_thread"] = True
+    captured = await _agent_catalog(config)
+    tools = _tool_names(captured["tools"])
+    assert read_only_sql.__name__ in tools
+    assert execute_database_sql.__name__ in tools
+    assert manage_feature_flags.__name__ in tools
+    subagents = captured["subagents"]
+    assert isinstance(subagents, list)
+    general_purpose = next(item for item in subagents if item.name == "general-purpose")
+    assert general_purpose.tools is not None
+    # SQL needs the parent; the subagent keeps the rest.
+    assert read_only_sql.__name__ not in general_purpose.tools
+    assert execute_database_sql.__name__ not in general_purpose.tools
+    assert manage_feature_flags.__name__ in general_purpose.tools
+
+    configurable["source"] = "slack"
+    configurable["slack_thread"] = {
+        "channel_id": "D123",
+        "thread_ts": "1700000000.000100",
+        "triggering_user_id": "U123",
+        "channel_context": {"is_im": True},
+    }
+    captured = await _agent_catalog(config)
+    tools = _tool_names(captured["tools"])
+    assert read_only_sql.__name__ in tools
+    assert execute_database_sql.__name__ in tools
+    assert manage_feature_flags.__name__ in tools
+
+    assert all(tool.__name__ in tools for tool in ADMIN_TOOLS)
+
+    configurable["github_login"] = "not-an-admin"
+    captured = await _agent_catalog(config)
+    tools = _tool_names(captured["tools"])
+    assert read_only_sql.__name__ not in tools
+    assert execute_database_sql.__name__ not in tools
+    assert manage_feature_flags.__name__ not in tools
+    assert all(tool.__name__ not in tools for tool in ADMIN_TOOLS)
+
+    configurable["github_login"] = "octocat"
+    configurable["source"] = "schedule"
+    captured = await _agent_catalog(config)
+    tools = _tool_names(captured["tools"])
+    assert read_only_sql.__name__ not in tools
+    assert execute_database_sql.__name__ not in tools
+    assert manage_feature_flags.__name__ not in tools
+
+
+SLACK_TOOL_NAMES = {
+    "slack_add_reaction",
+    "slack_attach_html",
+    "slack_move_thread",
+    "slack_list_channel_members",
+    "slack_list_channels",
+    "slack_search_channel_directory",
+    "slack_no_reply_needed",
+    "slack_post_message",
+    "slack_breakout_thread",
+    "slack_reply",
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("source", "slack_thread", "slack_enabled"),
+    [
+        ("dashboard", {"channel_id": "C123", "thread_ts": "1700000000.000100"}, True),
+        ("github", {"channel_id": "C123", "thread_ts": "1700000000.000100"}, True),
+        ("github", None, False),
+        ("github", {}, False),
+        ("github", {"channel_id": "C123"}, False),
+        ("github", {"thread_ts": "1700000000.000100"}, False),
+    ],
+)
+async def test_web_reply_turns_require_slack_thread_context_for_slack_tools(
+    source: str, slack_thread: dict[str, str] | None, slack_enabled: bool
+) -> None:
+    """The tool set cannot move with the surface: that invalidates the cached prefix."""
+    config = _base_config()
+    configurable = config.get("configurable")
+    assert isinstance(configurable, dict)
+    configurable.update(
+        {
+            "source": source,
+            "slack_thread": slack_thread,
+        }
+    )
+
+    captured = await _agent_catalog(config)
+    tools = captured["tools"]
+    assert isinstance(tools, list)
+
+    tool_names = {getattr(tool, "name", None) or getattr(tool, "__name__", None) for tool in tools}
+    assert tool_names & SLACK_TOOL_NAMES == (SLACK_TOOL_NAMES if slack_enabled else set())
+    reply = cast(ToolSurface, captured["surface"]).loop.reply
+    assert reply is not None and reply.surface == "web"
+
+
+@pytest.mark.asyncio
+async def test_an_automation_run_can_post_to_a_channel_without_a_slack_thread() -> None:
+    config = _base_config()
+    configurable = config.get("configurable")
+    assert isinstance(configurable, dict)
+    configurable.update({"source": "schedule", "slack_thread": None})
+
+    captured = await _agent_catalog(config)
+    tools = captured["tools"]
+    assert isinstance(tools, list)
+
+    tool_names = {getattr(tool, "name", None) or getattr(tool, "__name__", None) for tool in tools}
+    # A prompt can ask it to report somewhere; the thread-bound tools stay out.
+    assert tool_names & SLACK_TOOL_NAMES == {
+        "slack_list_channels",
+        "slack_post_message",
+        "slack_search_channel_directory",
+    }
+
+
+@pytest.mark.asyncio
+async def test_general_purpose_subagent_cannot_use_slack_tools() -> None:
+
+    config = _base_config()
+    configurable = config.get("configurable")
+    assert isinstance(configurable, dict)
+    configurable.update(
+        {
+            "source": "slack",
+            "slack_thread": {"channel_id": "C123", "thread_ts": "1700000000.000100"},
+        }
+    )
+    captured = await _agent_catalog(config)
+    parent_tools = captured["tools"]
+    subagents = captured["subagents"]
+    assert isinstance(parent_tools, list)
+    assert isinstance(subagents, list)
+
+    gp = next(item for item in subagents if item.name == "general-purpose")
+    assert "cannot access Slack tools" in gp.description
+    assert gp.tools is not None
+    parent_names = {_registered_tool_name(tool) for tool in parent_tools}
+    subagent_names = set(gp.tools)
+    slack_names = {
+        "slack_add_reaction",
+        "slack_attach_html",
+        "slack_list_channel_members",
+        "slack_list_channels",
+        "slack_search_channel_directory",
+        "slack_move_thread",
+        "slack_post_message",
+        "slack_breakout_thread",
+        "slack_reply",
+    }
+
+    parent_only_names = {
+        *slack_names,
+        "background_execute",
+        "background_task",
+        "get_thread",
+        "list_threads",
+        "manage_thread",
+        "read_user_settings",
+        "save_user_settings",
+        "submit_thread_feedback",
+        "submit_review_assessment_feedback",
+    }
+    assert parent_only_names <= parent_names
+    assert not subagent_names & parent_only_names
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("thread_scope", "source", "channel_reads", "thread_reads"),
+    [
+        ("private", "slack", True, True),
+        ("public", "slack", True, True),
+        ("bot", "slack", True, True),
+        ("private", "dashboard", True, True),
+        ("public", "dashboard", True, True),
+    ],
+)
+async def test_slack_reads_are_always_bound_and_refuse_at_call_time(
+    thread_scope: str,
+    source: str,
+    channel_reads: bool,
+    thread_reads: bool,
+    saved_thread_scope: dict[str, object],
+) -> None:
+    saved_thread_scope["visibility"] = "private" if thread_scope == "private" else "public"
+    config = _base_config()
+    configurable = config.get("configurable")
+    assert isinstance(configurable, dict)
+    configurable["source"] = source
+    if source == "slack":
+        configurable["slack_thread"] = {"channel_id": "C123", "thread_ts": "1700000000.000100"}
+    if thread_scope == "bot":
+        slack_thread = {
+            "channel_id": "C123",
+            "thread_ts": "1700000000.000100",
+            "triggering_bot_id": "B1",
+        }
+        configurable.update(slack_thread=slack_thread, github_login=None)
+        saved_thread_scope.update(
+            owner_type="system", source_context={"slack_thread": slack_thread}
+        )
+
+    captured = await _agent_catalog(config)
+    tools = captured["tools"]
+    subagents = captured["subagents"]
+    assert isinstance(tools, list)
+    assert isinstance(subagents, list)
+
+    tool_names = {_registered_tool_name(tool) for tool in tools}
+    assert ("slack_read_channel_messages" in tool_names) is channel_reads
+    assert ("slack_read_thread_messages" in tool_names) is thread_reads
+
+    gp = next(item for item in subagents if item.name == "general-purpose")
+    assert ("slack_read_channel_messages" in (gp.tools or ())) is channel_reads
+    assert ("slack_read_thread_messages" in (gp.tools or ())) is thread_reads
+
+
+@pytest.fixture
+def pinned_settings() -> dict[str, object]:
+    return {
+        "model_id": "anthropic:claude-opus-5-5",
+        "effort": "high",
+        "requested_model": "anthropic:claude-opus-5-5",
+        "model_handoff_complete": True,
+        "model_routing_enabled": False,
+    }
+
+
+@pytest.mark.parametrize("followup_source", ["slack", "dashboard"])
+async def test_explicit_breakout_model_survives_startup_and_followup(
+    followup_source: str,
+) -> None:
+    from openswe.server import PrepareAgentRunMiddleware
+
+    config = _base_config()
+    config["configurable"].update(
+        source="slack",
+        slack_breakout=True,
+        model_selection="explicit",
+        agent_model_id="anthropic:claude-opus-5-5",
+        agent_effort="max",
+    )
+    with patch("openswe.server.store_thread_settings", new_callable=AsyncMock) as store:
+        initial = await _agent_catalog(config)
+    snapshot = cast(dict[str, object], store.call_args.args[2])
+    assert snapshot["model_handoff_complete"] is True
+    assert snapshot["model_routing_enabled"] is False
+    followup_config = _base_config()
+    followup_config["configurable"].update(source=followup_source, model_selection="auto")
+    followup = await _agent_catalog(followup_config, thread_settings=snapshot)
+    for agent in (initial, followup):
+        main = _main_model(agent)
+        assert main.model_id == "anthropic:claude-opus-5-5"
+        assert main.kwargs["effort"] == "max"
+        prepare = PrepareAgentRunMiddleware(
+            _base_config(), cast(AgentTurnSettings, agent["turn"]), repo_instructions=None
+        )
+        assert prepare._requested_models is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["dashboard", "slack"])
+async def test_requested_model_survives_auto_followups_but_explicit_selection_wins(
+    source: str,
+    pinned_settings: dict[str, object],
+) -> None:
+    config = _base_config()
+    configurable = config["configurable"]
+    configurable.update(
+        source=source,
+        model_selection="auto",
+        agent_model_id="openai:gpt-6.1-sol",
+        agent_effort="low",
+    )
+    await _agent_catalog(config, thread_settings=pinned_settings)
+    assert configurable["resolved_agent_model_id"] == "anthropic:claude-opus-5-5"
+    configurable.update(
+        model_selection="explicit", agent_model_id="openai:gpt-6.1-sol", agent_effort="low"
+    )
+    await _agent_catalog(config, thread_settings=pinned_settings)
+    assert configurable["resolved_agent_model_id"] == "openai:gpt-6.1-sol"
+
+
+@pytest.mark.parametrize("route", ["fast", "balanced", "performance"])
+async def test_text_only_adaptive_route_names_a_vision_model_after_handoff(
+    route: Literal["fast", "balanced", "performance"],
+) -> None:
+    model_id = "fireworks:accounts/fireworks/models/kimi-k3"
+    config = _base_config()
+    config["configurable"].update(source="dashboard", model_selection="auto")
+    planned = await _agent_catalog(
+        config,
+        thread_settings={
+            "model_id": "openai:gpt-6.1-sol",
+            "effort": "medium",
+            "model_handoff_complete": True,
+            "model_routing_enabled": True,
+            "routing_models": {
+                "fast": {"model_id": "openai:gpt-6.1-sol", "effort": "medium"},
+                route: {"model_id": model_id, "effort": "high"},
+            },
+        },
+    )
+    models = _models(planned)
+
+    assert models.routes[route].model_id == model_id
+    assert models.vision is not None and models.vision.model_id == "openai:gpt-6.1-sol"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("profile", "expected_model", "expected_effort"),
+    [
+        (None, "openai:gpt-6.1-sol", "medium"),
+        (
+            {"default_model": "anthropic:claude-opus-5-5", "reasoning_effort": "high"},
+            "openai:gpt-6.1-sol",
+            "medium",
+        ),
+    ],
+)
+async def test_explicit_auto_selection_clears_pin_and_keeps_its_tier_on_followups(
+    profile: dict[str, object] | None,
+    expected_model: str,
+    expected_effort: str,
+    pinned_settings: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openswe.server import PrepareAgentRunMiddleware
+
+    monkeypatch.setattr("openswe.server.RoutingArm.tier", lambda _: "balanced")
+    config = _base_config()
+    config["configurable"].update(
+        source="dashboard", model_selection="auto", model_selection_changed=True
+    )
+    with patch("openswe.server.store_thread_settings", new_callable=AsyncMock) as store:
+        captured = await _agent_catalog(config, thread_settings=pinned_settings, profile=profile)
+    snapshot = cast(dict[str, object], store.call_args.args[2])
+    assert snapshot["requested_model"] is None
+    assert snapshot["model_routing_enabled"] is True
+    assert snapshot["model_handoff_complete"] is True
+    assert snapshot["model_id"] == expected_model
+    assert snapshot["effort"] == expected_effort
+    assert snapshot["subagent_model_id"] == "openai:gpt-6.1-sol"
+    assert snapshot["subagent_effort"] == "low"
+
+    followup = _base_config()
+    followup["configurable"].update(source="dashboard", model_selection="auto")
+    followup_agent = await _agent_catalog(followup, thread_settings=snapshot)
+    for agent in (captured, followup_agent):
+        assert cast(ToolSurface, agent["surface"]).loop.model_experiment == "balanced"
+        assert _main_model(agent).model_id == expected_model
+        prepare = PrepareAgentRunMiddleware(
+            _base_config(), cast(AgentTurnSettings, agent["turn"]), repo_instructions=None
+        )
+        assert prepare._requested_models is None
+
+
+@pytest.mark.parametrize("tier", ["balanced", "performance"])
+@pytest.mark.parametrize("concierge", [True, False])
+async def test_a_picked_model_is_run_and_recorded(
+    tier: str, concierge: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("openswe.server.RoutingArm.tier", lambda _: tier)
+    monkeypatch.setattr("openswe.server._slack_concierge_run", lambda _cfg: concierge)
+    config = _base_config()
+    config["configurable"].update(
+        model_selection="explicit",
+        agent_model_id="fireworks:accounts/fireworks/models/kimi-k3",
+        agent_effort="high",
+    )
+    with patch("openswe.server.store_thread_settings", new_callable=AsyncMock) as store:
+        captured = await _agent_catalog(config)
+
+    assert _main_model(captured).model_id == "fireworks:accounts/fireworks/models/kimi-k3"
+    loop = cast(ToolSurface, captured["surface"]).loop
+    assert loop.model_experiment is None
+    assert loop.routing is not None and loop.routing.mode is None
+    metadata = cast(dict[str, object], config["metadata"])
+    assert metadata["user_model_choice"] == "fireworks:accounts/fireworks/models/kimi-k3"
+    assert metadata["user_effort_choice"] == "high"
+    # Later runs on the thread keep the pick until the person goes back to Auto.
+    snapshot = cast(dict[str, object], store.call_args.args[2])
+    followup = _base_config()
+    followup["configurable"].update(source="dashboard", model_selection="auto")
+    followup_agent = await _agent_catalog(followup, thread_settings=snapshot)
+    assert _main_model(followup_agent).model_id == "fireworks:accounts/fireworks/models/kimi-k3"
+
+
+@pytest.mark.parametrize("reply_thread_ts", ["", "123.456"])
+async def test_slack_question_joins_the_experiment_after_dashboard_handoff(
+    monkeypatch: pytest.MonkeyPatch, reply_thread_ts: str, langsmith_users
+) -> None:
+    langsmith_users.add("octocat")
+    from openswe.threads.runs import _build_dashboard_configurable
+
+    monkeypatch.setattr("openswe.threads.runs.resolve_run_email", AsyncMock(return_value=None))
+    monkeypatch.setattr("openswe.server.RoutingArm.tier", lambda _: "performance")
+    source_context = {
+        "slack_ask": True,
+        "slack_thread": {"channel_id": "C1", "triggering_user_id": "U1"},
+        "slack_by_the_way_thread_ts": reply_thread_ts,
+    }
+    for source in ("slack", "dashboard"):
+        config = _base_config()
+        config["configurable"].update(
+            await _build_dashboard_configurable(
+                "thread-ctx",
+                "octocat",
+                {"source": source, "source_context": source_context, "model_selection": "auto"},
+                profile={},
+            )
+        )
+        captured = await _agent_catalog(config, profile={"model_routing_enabled": True})
+        # A Slack question is in the experiment like any other message.
+        assert cast(ToolSurface, captured["surface"]).loop.model_experiment == "performance"
+
+
+async def test_queued_images_reach_vision_fallback_for_text_only_main_model(
+    registry_db: None,
+) -> None:
+    from langchain_core.messages import convert_to_messages
+
+    from openswe.message_queue import QueuedMessage
+
+    config = _base_config()
+    planned = await _agent_catalog(
+        config,
+        thread_settings={"model_id": "fireworks:accounts/fireworks/models/kimi-k3"},
+    )
+    url = "https://example.com/image.png"
+    image = {"type": "image_url", "image_url": {"url": url}}
+    await QueuedMessage.put("thread-ctx", {"text": "Explain this", "image_urls": [url]})
+    surface = cast(ToolSurface, planned["surface"])
+    assert surface.inbox is not None
+    with patch("openswe.threads.inbox.fetch_image_block", return_value=image):
+        taken = await ThreadInbox("thread-ctx").read("run-1", surface.inbox)
+    messages = convert_to_messages(taken.messages)
+    content = messages[-1].content
+    assert isinstance(content, list) and image in content
+    models = _models(planned)
+    assert models.vision is not None and models.vision.model_id != models.main.model_id
+
+
+@pytest.mark.asyncio
+async def test_historical_personal_models_and_routing_do_not_override_global_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("openswe.server.RoutingArm.tier", lambda _: "balanced")
+    captured = await _agent_catalog(
+        profile={
+            "default_model": "anthropic:claude-opus-5-5",
+            "reasoning_effort": "high",
+            "default_subagent_model": "anthropic:claude-opus-5-5",
+            "subagent_reasoning_effort": "high",
+            "model_routing_enabled": True,
+        }
+    )
+    main = _main_model(captured)
+    assert main.model_id == "openai:gpt-6.1-sol"
+    assert main.kwargs["reasoning"]["effort"] == "medium"
+
+
+async def test_anthropic_title_model_omits_thinking_without_affecting_agent() -> None:
+    captured = await _agent_catalog(
+        settings=Settings(
+            {
+                **_MODEL_DEFAULTS,
+                "default_agent_model": "anthropic:claude-opus-5-5",
+                "default_agent_reasoning_effort": "high",
+                "default_thread_title_model": "anthropic:claude-haiku-5-5",
+                "default_thread_title_reasoning_effort": "high",
+                "model_routing_enabled": False,
+            }
+        )
+    )
+    titled: list[tuple[str, dict[str, object]]] = []
+
+    def make_title_model(model_id: str, **kwargs: object) -> MagicMock:
+        titled.append((model_id, kwargs))
+        return MagicMock()
+
+    # The title model is built where it is used: as the run's turn is prepared.
+    turn = cast(AgentTurnSettings, captured["turn"])
+    with patch("openswe.server.make_model", side_effect=make_title_model):
+        PrepareAgentRunMiddleware(_base_config(), turn, repo_instructions=None)._title_model  # noqa: B018
+    [(title_model, title_kwargs)] = titled
+    assert title_model == "anthropic:claude-haiku-5-5"
+    assert "thinking" not in title_kwargs
+    assert title_kwargs["effort"] == "high"
+    assert title_kwargs["max_tokens"] == 1024
+    main = _main_model(captured)
+    assert main.model_id == "anthropic:claude-opus-5-5"
+    assert main.kwargs["thinking"] == {"type": "adaptive", "display": "summarized"}
+
+
+class TestRecoveryToolCatalog:
+    @pytest.mark.parametrize("recovery_thread", [False, True])
+    async def test_recovery_tools_are_only_offered_in_recovery_threads(self, recovery_thread):
+        from openswe.server import MERGE_QUEUE_RECOVERY_TOOLS
+
+        await index.create(
+            "thread-ctx",
+            runtime="mda",
+            metadata={"merge_queue_recovery": recovery_thread},
+        )
+        config = _base_config()
+        config["metadata"] = {"merge_queue_recovery": True}
+        captured = await _agent_catalog(config)
+        names = _tool_names(captured["tools"])
+        recovery_names = {_registered_tool_name(tool) for tool in MERGE_QUEUE_RECOVERY_TOOLS}
+        assert names & recovery_names == (recovery_names if recovery_thread else set())

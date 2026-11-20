@@ -1,0 +1,1964 @@
+/** @vitest-environment jsdom */
+
+import {
+  QueryClient,
+  QueryClientProvider,
+  onlineManager,
+} from "@tanstack/react-query"
+import { act, render, renderHook, waitFor } from "@testing-library/react"
+import { afterEach, describe, expect, it, vi } from "vitest"
+
+import { invalidationTopic, queryTopics } from "@/lib/invalidations/topics"
+import { clearPerfSpans, getPerfSpans } from "@/lib/perf/trace"
+
+import { agentsApi } from "./api"
+import {
+  cloudSidebarThread,
+  groupSidebarThreadsByRecency,
+} from "./sidebarThreads"
+import {
+  SIDEBAR_PAGE_SIZE,
+  agentScheduleKeys,
+  agentThreadKeys,
+  markAgentThreadViewed,
+  useSetAgentThreadViewed,
+  useShareThread,
+  optimisticThread,
+  setAgentThreadStatus,
+  setAgentThreadResolved,
+  useActiveAgentThread,
+  useAgentThread,
+  useAgentThreadBrowser,
+  useAgentThreadWorkingTreeDiff,
+  usePinAgentThread,
+  useReorderPinnedThreads,
+  useReorderSidebarThreads,
+  useRenameAgentThread,
+  useResolveAgentThread,
+  useSeedAgentThreadDetails,
+  useSidebarActiveThread,
+  useSidebarPinnedThreads,
+  useSidebarRepoThreads,
+  useSidebarRecents,
+  useThreadsPage,
+  useUpdateAgentSchedule,
+  useWorkflowApprovalDecision,
+  useWorkflowApprovals,
+} from "./queries"
+import type { InfiniteData } from "@tanstack/react-query"
+import type {
+  ThreadBrowser,
+  ThreadTurnDiff,
+  ThreadsPage,
+  ThreadsPageParams,
+} from "./api"
+import type {
+  AgentSchedule,
+  AgentThread,
+  WorkflowPushApproval,
+  WorkflowPushApprovalsResponse,
+} from "./types"
+
+vi.mock("@/lib/session", () => ({
+  useSession: () => ({
+    data: { user_id: "alice-id", auth_provider: "github" },
+  }),
+}))
+
+const params: ThreadsPageParams = {
+  limit: 100,
+  offset: 0,
+  scope: "interactive",
+}
+
+const page: ThreadsPage = {
+  items: [],
+  limit: 100,
+  offset: 0,
+  hasMore: false,
+}
+
+const clients: Array<QueryClient> = []
+afterEach(() => {
+  vi.useRealTimers()
+  for (const client of clients) client.clear()
+  clients.length = 0
+  vi.restoreAllMocks()
+  Reflect.deleteProperty(window, "openSweDesktop")
+  localStorage.clear()
+})
+
+function testClient() {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  clients.push(client)
+  return client
+}
+
+describe("useAgentThreadBrowser", () => {
+  const hour = 60 * 60_000
+  function browser(
+    window: string,
+    token: string,
+    expiresIn: number,
+    title = "current"
+  ): ThreadBrowser {
+    return {
+      tabs: [{ id: "t1", title, url: "https://example.com" }],
+      act_url: `https://${window}.browsers.test/auth?token=${token}`,
+      expires_at: new Date(Date.now() + expiresIn).toISOString(),
+    }
+  }
+
+  async function refetchedLink(current: ThreadBrowser, fetched: ThreadBrowser) {
+    const client = testClient()
+    const getThreadBrowser = vi
+      .spyOn(agentsApi, "getThreadBrowser")
+      .mockResolvedValueOnce(current)
+      .mockResolvedValue(fetched)
+    const { result } = renderHook(
+      () => useAgentThreadBrowser("thread-1", true),
+      {
+        wrapper: ({ children }) => (
+          <QueryClientProvider client={client}>{children}</QueryClientProvider>
+        ),
+      }
+    )
+    await waitFor(() => expect(result.current.data).toBeDefined())
+    await act(() =>
+      client.invalidateQueries({
+        queryKey: agentThreadKeys.browser("thread-1"),
+      })
+    )
+    await waitFor(() =>
+      expect(result.current.data?.tabs[0]?.title).toBe("next")
+    )
+    getThreadBrowser.mockRestore()
+    return result.current.data
+  }
+
+  it("keeps the framed link when an invalidation mints a new one", async () => {
+    const current = browser("b-window", "first", 24 * hour)
+    const data = await refetchedLink(
+      current,
+      browser("b-window", "second", 24 * hour, "next")
+    )
+    expect(data?.act_url).toBe(current.act_url)
+    expect(data?.expires_at).toBe(current.expires_at)
+  })
+
+  it("takes the new link for another window or near expiry", async () => {
+    const otherWindow = browser("b-other", "second", 24 * hour, "next")
+    expect(
+      await refetchedLink(browser("b-window", "first", 24 * hour), otherWindow)
+    ).toEqual(otherWindow)
+    const fresh = browser("b-window", "second", 24 * hour, "next")
+    expect(
+      await refetchedLink(browser("b-window", "first", 60_000), fresh)
+    ).toEqual(fresh)
+  })
+})
+
+describe("useAgentThreadWorkingTreeDiff", () => {
+  const diff: ThreadTurnDiff = {
+    status: "ready",
+    truncated: false,
+    summary: { files: 0, additions: 0, deletions: 0 },
+    files: [],
+  }
+
+  function Probe({
+    running,
+    enabled = true,
+  }: {
+    running: boolean
+    enabled?: boolean
+  }) {
+    useAgentThreadWorkingTreeDiff("thread-1", enabled, running)
+    return null
+  }
+
+  function renderProbe(running: boolean, enabled = true) {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    })
+    clients.push(client)
+    return render(
+      <QueryClientProvider client={client}>
+        <Probe running={running} enabled={enabled} />
+      </QueryClientProvider>
+    )
+  }
+
+  it("keeps polling ready cloud diffs while the run is active", async () => {
+    vi.useFakeTimers()
+    const getDiff = vi
+      .spyOn(agentsApi, "getThreadWorkingTreeDiff")
+      .mockResolvedValue(diff)
+
+    renderProbe(true)
+    await vi.waitFor(() => expect(getDiff).toHaveBeenCalledTimes(1))
+    await vi.advanceTimersByTimeAsync(3000)
+    await vi.waitFor(() => expect(getDiff).toHaveBeenCalledTimes(2))
+  })
+
+  it("refreshes immediately and twice after a running cloud diff finishes", async () => {
+    vi.useFakeTimers()
+    const getDiff = vi
+      .spyOn(agentsApi, "getThreadWorkingTreeDiff")
+      .mockResolvedValue(diff)
+    const view = renderProbe(true)
+    await vi.waitFor(() => expect(getDiff).toHaveBeenCalledTimes(1))
+
+    view.rerender(
+      <QueryClientProvider client={clients.at(-1)!}>
+        <Probe running={false} />
+      </QueryClientProvider>
+    )
+    await vi.advanceTimersByTimeAsync(0)
+    await vi.waitFor(() => expect(getDiff).toHaveBeenCalledTimes(2))
+    await vi.advanceTimersByTimeAsync(1000)
+    await vi.waitFor(() => expect(getDiff).toHaveBeenCalledTimes(3))
+    await vi.advanceTimersByTimeAsync(2000)
+    await vi.waitFor(() => expect(getDiff).toHaveBeenCalledTimes(4))
+  })
+
+  it("refetches a fresh cached diff when enabled after the run finished", async () => {
+    vi.useFakeTimers()
+    const getDiff = vi
+      .spyOn(agentsApi, "getThreadWorkingTreeDiff")
+      .mockResolvedValue(diff)
+    const view = renderProbe(true)
+    await vi.waitFor(() => expect(getDiff).toHaveBeenCalledTimes(1))
+
+    view.rerender(
+      <QueryClientProvider client={clients.at(-1)!}>
+        <Probe running enabled={false} />
+      </QueryClientProvider>
+    )
+    view.rerender(
+      <QueryClientProvider client={clients.at(-1)!}>
+        <Probe running={false} enabled={false} />
+      </QueryClientProvider>
+    )
+    await vi.advanceTimersByTimeAsync(3000)
+    expect(getDiff).toHaveBeenCalledTimes(1)
+
+    view.rerender(
+      <QueryClientProvider client={clients.at(-1)!}>
+        <Probe running={false} enabled />
+      </QueryClientProvider>
+    )
+    await vi.waitFor(() => expect(getDiff).toHaveBeenCalledTimes(2))
+    await vi.advanceTimersByTimeAsync(3000)
+    expect(getDiff).toHaveBeenCalledTimes(2)
+  })
+
+  it("refetches a fresh cached diff when remounted after the run finished", async () => {
+    const getDiff = vi
+      .spyOn(agentsApi, "getThreadWorkingTreeDiff")
+      .mockResolvedValue(diff)
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    })
+    client.setQueryData(agentThreadKeys.workingTreeDiff("thread-1"), diff)
+    clients.push(client)
+
+    render(
+      <QueryClientProvider client={client}>
+        <Probe running={false} />
+      </QueryClientProvider>
+    )
+
+    await waitFor(() => expect(getDiff).toHaveBeenCalledTimes(1))
+  })
+
+  it("cleans delayed final refreshes on unmount", async () => {
+    vi.useFakeTimers()
+    const getDiff = vi
+      .spyOn(agentsApi, "getThreadWorkingTreeDiff")
+      .mockResolvedValue(diff)
+    const view = renderProbe(true)
+    await vi.waitFor(() => expect(getDiff).toHaveBeenCalledTimes(1))
+
+    view.rerender(
+      <QueryClientProvider client={clients.at(-1)!}>
+        <Probe running={false} />
+      </QueryClientProvider>
+    )
+    await vi.advanceTimersByTimeAsync(0)
+    await vi.waitFor(() => expect(getDiff).toHaveBeenCalledTimes(2))
+    view.unmount()
+    await vi.advanceTimersByTimeAsync(3000)
+    expect(getDiff).toHaveBeenCalledTimes(2)
+  })
+})
+
+describe("useThreadsPage", () => {
+  it("keeps cached threads visible while stale data revalidates", async () => {
+    const never = new Promise<ThreadsPage>(() => {})
+    const listThreads = vi
+      .spyOn(agentsApi, "listThreadsPage")
+      .mockResolvedValueOnce(page)
+      .mockReturnValueOnce(never)
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    })
+    clients.push(client)
+    const seen: Array<ReturnType<typeof useThreadsPage>> = []
+
+    function Probe() {
+      seen.push(useThreadsPage(params, { staleWhileRevalidate: true }))
+      return null
+    }
+
+    const first = render(
+      <QueryClientProvider client={client}>
+        <Probe />
+      </QueryClientProvider>
+    )
+    await waitFor(() => expect(seen.at(-1)?.data).toBe(page))
+    vi.useFakeTimers()
+    first.unmount()
+    vi.advanceTimersByTime(24 * 60 * 60_000)
+    expect(client.getQueryData(agentThreadKeys.page(params))).toBe(page)
+    vi.useRealTimers()
+
+    await client.invalidateQueries({ queryKey: agentThreadKeys.page(params) })
+    render(
+      <QueryClientProvider client={client}>
+        <Probe />
+      </QueryClientProvider>
+    )
+
+    await waitFor(() => expect(listThreads).toHaveBeenCalledTimes(2))
+    expect(seen.at(-1)?.data).toBe(page)
+    expect(seen.at(-1)?.isLoading).toBe(false)
+    expect(seen.at(-1)?.isFetching).toBe(true)
+  })
+})
+
+describe("setAgentThreadStatus", () => {
+  it("updates paginated sidebar caches", () => {
+    const client = testClient()
+    const thread = {
+      id: "thread-1",
+      status: "finished",
+      resolved: false,
+    } as AgentThread
+    const key = agentThreadKeys.infinitePages({
+      limit: SIDEBAR_PAGE_SIZE,
+      resolved: false,
+      scope: "interactive",
+      sortBy: "updated_at",
+    })
+    client.setQueryData(key, {
+      pages: [
+        {
+          items: [thread],
+          limit: SIDEBAR_PAGE_SIZE,
+          hierarchy: true,
+          offset: 0,
+          hasMore: false,
+        },
+      ],
+      pageParams: [0],
+    })
+    client.setQueryData(agentThreadKeys.sidebarActive(thread.id), thread)
+    const pageKey = agentThreadKeys.page(params)
+    client.setQueryData(pageKey, { ...page, items: [thread] })
+
+    setAgentThreadStatus(client, thread.id, "running")
+
+    expect(client.getQueryData<ThreadsPage>(pageKey)?.items[0]).toMatchObject({
+      status: "running",
+    })
+
+    expect(
+      client.getQueryData<InfiniteData<ThreadsPage>>(key)?.pages[0]?.items[0]
+    ).toMatchObject({ status: "running" })
+    expect(
+      client.getQueryData(agentThreadKeys.sidebarActive(thread.id))
+    ).toMatchObject({ status: "running" })
+  })
+})
+
+describe("sidebar queries", () => {
+  it("polls independent pins, detects external starts, and stops when all finish", async () => {
+    vi.useFakeTimers()
+    const idle = {
+      ...optimisticThread("outside-page", { prompt: "Old resolved pin" }),
+      status: "finished" as const,
+      resolved: true,
+    }
+    const running = optimisticThread("running-pin", { prompt: "Running pin" })
+    const listPins = vi
+      .spyOn(agentsApi, "listPinnedThreads")
+      .mockResolvedValueOnce([idle, running])
+      .mockResolvedValueOnce([
+        { ...idle, status: "running" },
+        { ...running, status: "finished" },
+      ])
+      .mockResolvedValue([idle, { ...running, status: "finished" }])
+    const client = testClient()
+    client.setQueryData(agentThreadKeys.page(params), page)
+    clearPerfSpans()
+    const { result } = renderHook(
+      () => {
+        useSidebarPinnedThreads()
+        return useSidebarPinnedThreads({ measure: true })
+      },
+      {
+        wrapper: ({ children }) => (
+          <QueryClientProvider client={client}>{children}</QueryClientProvider>
+        ),
+      }
+    )
+    await vi.waitFor(() => expect(result.current.data?.[0]).toEqual(idle))
+    await act(() => vi.advanceTimersByTimeAsync(2000))
+    await vi.waitFor(() =>
+      expect(result.current.data?.map((thread) => thread.status)).toEqual([
+        "running",
+        "finished",
+      ])
+    )
+    await act(() => vi.advanceTimersByTimeAsync(2000))
+    await vi.waitFor(() =>
+      expect(
+        result.current.data?.every((thread) => thread.status === "finished")
+      ).toBe(true)
+    )
+    expect(listPins.mock.calls.map(([measure]) => measure)).toEqual([
+      true,
+      false,
+      false,
+    ])
+    const calls = listPins.mock.calls.length
+    await act(() => vi.advanceTimersByTimeAsync(6000))
+    expect(listPins).toHaveBeenCalledTimes(calls)
+    expect(
+      getPerfSpans().filter((span) => span.name === "thread_list_load")
+    ).toHaveLength(1)
+    clearPerfSpans()
+    expect(result.current.data?.map((thread) => thread.id)).toEqual([
+      "outside-page",
+      "running-pin",
+    ])
+  })
+
+  it("refreshes idle pins after pin and unpin mutations", async () => {
+    const pin = {
+      ...optimisticThread("outside-page", { prompt: "Pinned thread" }),
+      status: "finished" as const,
+    }
+    vi.spyOn(agentsApi, "listPinnedThreads")
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([pin])
+      .mockResolvedValue([])
+    vi.spyOn(agentsApi, "pinThread").mockResolvedValue(undefined)
+    const client = testClient()
+    const { result } = renderHook(
+      () => ({
+        pins: useSidebarPinnedThreads(),
+        mutation: usePinAgentThread(),
+      }),
+      {
+        wrapper: ({ children }) => (
+          <QueryClientProvider client={client}>{children}</QueryClientProvider>
+        ),
+      }
+    )
+    await waitFor(() => expect(result.current.pins.data).toEqual([]))
+    await act(() =>
+      result.current.mutation.mutateAsync({ threadId: pin.id, pinned: true })
+    )
+    await waitFor(() => expect(result.current.pins.data).toEqual([pin]))
+    await act(() =>
+      result.current.mutation.mutateAsync({ threadId: pin.id, pinned: false })
+    )
+    await waitFor(() => expect(result.current.pins.data).toEqual([]))
+  })
+
+  it("does not measure background page polling", async () => {
+    vi.useFakeTimers()
+    const running = optimisticThread("running", { prompt: "Running" })
+    const listThreads = vi
+      .spyOn(agentsApi, "listThreadsPage")
+      .mockResolvedValue({
+        ...page,
+        items: [running],
+      })
+    const client = testClient()
+    const { result } = renderHook(
+      () => useSidebarRecents({ repoMode: false }),
+      {
+        wrapper: wrapperFor(client),
+      }
+    )
+    await vi.waitFor(() => expect(result.current.items).toHaveLength(1))
+    await act(() => vi.advanceTimersByTimeAsync(2000))
+    await vi.waitFor(() =>
+      expect(listThreads.mock.calls.length).toBeGreaterThan(1)
+    )
+    expect(listThreads.mock.calls[0]?.[1]).toBe(true)
+    expect(
+      listThreads.mock.calls.slice(1).every(([, measure]) => !measure)
+    ).toBe(true)
+  })
+
+  it("scopes Recents to ownerless threads only in repository mode", async () => {
+    const listThreads = vi
+      .spyOn(agentsApi, "listThreadsPage")
+      .mockResolvedValue(page)
+    const client = testClient()
+    const wrapper = ({ children }: { children: React.ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    )
+    const { rerender } = renderHook(
+      ({ repoMode }) => useSidebarRecents({ repoMode }),
+      { wrapper, initialProps: { repoMode: true } }
+    )
+
+    await waitFor(() =>
+      expect(listThreads).toHaveBeenCalledWith(
+        {
+          limit: SIDEBAR_PAGE_SIZE,
+          hierarchy: true,
+          offset: 0,
+          resolved: false,
+          scope: "interactive",
+          ownerless: true,
+          sortBy: "created_at",
+        },
+        true
+      )
+    )
+
+    rerender({ repoMode: false })
+
+    await waitFor(() =>
+      expect(listThreads).toHaveBeenCalledWith(
+        {
+          limit: SIDEBAR_PAGE_SIZE,
+          hierarchy: true,
+          offset: 0,
+          resolved: false,
+          scope: "interactive",
+          sortBy: "created_at",
+        },
+        true
+      )
+    )
+  })
+
+  it("paginates each repository through an independent query", async () => {
+    const listThreads = vi
+      .spyOn(agentsApi, "listThreadsPage")
+      .mockImplementation(async (request) => {
+        const requestParams = request ?? {}
+        const offset = requestParams.offset ?? 0
+        return {
+          items: [
+            {
+              id: `${requestParams.repo}-${offset}`,
+              repoFullName: requestParams.repo,
+            } as AgentThread,
+          ],
+          limit: requestParams.limit ?? SIDEBAR_PAGE_SIZE,
+          offset,
+          hasMore: offset === 0,
+        }
+      })
+    const client = testClient()
+    const { result } = renderHook(
+      () => ({
+        first: useSidebarRepoThreads({
+          repoFullName: "langchain-ai/first",
+        }),
+        second: useSidebarRepoThreads({
+          repoFullName: "langchain-ai/second",
+        }),
+      }),
+      {
+        wrapper: ({ children }) => (
+          <QueryClientProvider client={client}>{children}</QueryClientProvider>
+        ),
+      }
+    )
+
+    await waitFor(() => {
+      expect(result.current.first.items[0]?.id).toBe("langchain-ai/first-0")
+      expect(result.current.second.items[0]?.id).toBe("langchain-ai/second-0")
+    })
+
+    act(() => result.current.first.fetchNextPage())
+
+    await waitFor(() =>
+      expect(listThreads).toHaveBeenCalledWith(
+        expect.objectContaining({
+          repo: "langchain-ai/first",
+          offset: 1,
+        }),
+        false
+      )
+    )
+    expect(listThreads).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        repo: "langchain-ai/second",
+        offset: 1,
+      }),
+      false
+    )
+  })
+
+  it.each([true, false])(
+    "reactively uses onscreen detail while the sidebar request stalls (preloaded: %s)",
+    async (preloaded) => {
+      const opened = {
+        id: "opened-thread",
+        title: "Onscreen thread",
+        resolved: false,
+      } as AgentThread
+      const getThread = vi
+        .spyOn(agentsApi, "getThread")
+        .mockReturnValue(new Promise<AgentThread>(() => {}))
+      const client = testClient()
+      const key = agentThreadKeys.detail(opened.id)
+      if (preloaded) client.setQueryData(key, opened)
+      const { result } = renderHook(
+        () =>
+          useSidebarActiveThread({
+            activeThreadId: opened.id,
+            loadedThreads: [],
+          }),
+        {
+          wrapper: ({ children }) => (
+            <QueryClientProvider client={client}>
+              {children}
+            </QueryClientProvider>
+          ),
+        }
+      )
+
+      expect(getThread).toHaveBeenCalledTimes(preloaded ? 0 : 1)
+      if (!preloaded) act(() => client.setQueryData(key, opened))
+      await waitFor(() => expect(result.current).toEqual(opened))
+
+      const updated = { ...opened, title: "Updated onscreen title" }
+      act(() => client.setQueryData(key, updated))
+      await waitFor(() => expect(result.current).toEqual(updated))
+    }
+  )
+
+  function openThreadSidebarFirst(opened: AgentThread, listed: boolean) {
+    const client = testClient()
+    const wrapper = ({ children }: { children: React.ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    )
+    const sidebar = renderHook(
+      () =>
+        useSidebarActiveThread({
+          activeThreadId: opened.id,
+          loadedThreads: listed ? [opened] : [],
+        }),
+      { wrapper }
+    )
+    const detail = renderHook(() => useAgentThread(opened.id), { wrapper })
+    const shell = renderHook(() => useActiveAgentThread(opened.id), {
+      wrapper,
+    })
+    return { client, sidebar, detail, shell }
+  }
+
+  it.each([{ listed: false }, { listed: true }])(
+    "requests an opened thread's summary once (listed in the sidebar: $listed)",
+    async ({ listed }) => {
+      const opened = { id: "opened-thread", title: "Opened" } as AgentThread
+      const getThread = vi
+        .spyOn(agentsApi, "getThread")
+        .mockResolvedValue(opened)
+
+      const { sidebar, detail, shell } = openThreadSidebarFirst(opened, listed)
+
+      await waitFor(() => expect(detail.result.current.data).toEqual(opened))
+      expect(sidebar.result.current).toEqual(opened)
+      expect(shell.result.current).toEqual(opened)
+      expect(getThread).toHaveBeenCalledTimes(1)
+    }
+  )
+
+  it("loads the open thread for its commands when no page shows it", async () => {
+    const opened = { id: "opened-thread", title: "Opened" } as AgentThread
+    const getThread = vi.spyOn(agentsApi, "getThread").mockResolvedValue(opened)
+    const client = testClient()
+
+    const { result } = renderHook(() => useActiveAgentThread(opened.id), {
+      wrapper: ({ children }) => (
+        <QueryClientProvider client={client}>{children}</QueryClientProvider>
+      ),
+    })
+
+    await waitFor(() => expect(result.current).toEqual(opened))
+    expect(getThread).toHaveBeenCalledTimes(1)
+  })
+
+  it("shows an unlisted thread's run finishing in the sidebar when no page shows it", async () => {
+    vi.useFakeTimers()
+    const running = {
+      id: "review-chat",
+      title: "Review chat",
+      status: "running",
+      updatedAt: 1,
+    } as AgentThread
+    const getThread = vi
+      .spyOn(agentsApi, "getThread")
+      .mockResolvedValueOnce(running)
+      .mockResolvedValue({ ...running, status: "finished", updatedAt: 2 })
+    const client = testClient()
+    const wrapper = ({ children }: { children: React.ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    )
+    const sidebar = renderHook(
+      () =>
+        useSidebarActiveThread({
+          activeThreadId: running.id,
+          loadedThreads: [],
+        }),
+      { wrapper }
+    )
+    renderHook(() => useActiveAgentThread(running.id), { wrapper })
+    await vi.waitFor(() =>
+      expect(sidebar.result.current?.status).toBe("running")
+    )
+
+    await act(() => vi.advanceTimersByTimeAsync(3000))
+
+    expect(sidebar.result.current?.status).toBe("finished")
+    await act(() => vi.advanceTimersByTimeAsync(30_000))
+    expect(getThread).toHaveBeenCalledTimes(2)
+  })
+
+  it.each([
+    { watchers: "the page", hooks: [useAgentThread] },
+    { watchers: "the shell", hooks: [useActiveAgentThread] },
+    {
+      watchers: "the page and the shell",
+      hooks: [useAgentThread, useActiveAgentThread],
+    },
+  ])(
+    "polls a running thread's summary every 3 s, watched by $watchers",
+    async ({ hooks }) => {
+      vi.useFakeTimers()
+      const running = {
+        id: "running-thread",
+        title: "Running",
+        status: "running",
+      } as AgentThread
+      const getThread = vi
+        .spyOn(agentsApi, "getThread")
+        .mockResolvedValue(running)
+      const client = testClient()
+      const wrapper = ({ children }: { children: React.ReactNode }) => (
+        <QueryClientProvider client={client}>{children}</QueryClientProvider>
+      )
+      for (const hook of hooks) renderHook(() => hook(running.id), { wrapper })
+      await vi.waitFor(() => expect(getThread).toHaveBeenCalledTimes(1))
+
+      await act(() => vi.advanceTimersByTimeAsync(10_000))
+
+      expect(getThread).toHaveBeenCalledTimes(4)
+    }
+  )
+
+  it("loads an opened thread's summary that was asked for offline once back online", async () => {
+    const opened = { id: "opened-thread", title: "Opened" } as AgentThread
+    vi.spyOn(agentsApi, "getThread").mockResolvedValue(opened)
+    onlineManager.setOnline(false)
+    try {
+      const { detail } = openThreadSidebarFirst(opened, false)
+      act(() => onlineManager.setOnline(true))
+
+      await waitFor(() => expect(detail.result.current.data).toEqual(opened))
+    } finally {
+      onlineManager.setOnline(true)
+    }
+  })
+
+  it("loads an opened thread's summary on its own when the request it shares is cancelled", async () => {
+    const opened = { id: "opened-thread", title: "Opened" } as AgentThread
+    const getThread = vi
+      .spyOn(agentsApi, "getThread")
+      .mockReturnValueOnce(new Promise<AgentThread>(() => {}))
+      .mockResolvedValue(opened)
+    const client = testClient()
+    const wrapper = ({ children }: { children: React.ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    )
+    renderHook(
+      () =>
+        useSidebarActiveThread({
+          activeThreadId: opened.id,
+          loadedThreads: [],
+        }),
+      { wrapper }
+    )
+    const detail = renderHook(() => useAgentThread(opened.id), { wrapper })
+
+    await act(() =>
+      client.cancelQueries({
+        queryKey: agentThreadKeys.sidebarActive(opened.id),
+      })
+    )
+
+    await waitFor(() => expect(detail.result.current.data).toEqual(opened))
+    expect(getThread).toHaveBeenCalledTimes(2)
+  })
+
+  it("does not reinsert an open concierge conversation into the sidebar", () => {
+    const opened = {
+      id: "concierge-thread",
+      concierge: true,
+    } as AgentThread
+    const client = testClient()
+    client.setQueryData(agentThreadKeys.detail(opened.id), opened)
+    const { result } = renderHook(
+      () =>
+        useSidebarActiveThread({
+          activeThreadId: opened.id,
+          loadedThreads: [],
+        }),
+      {
+        wrapper: ({ children }) => (
+          <QueryClientProvider client={client}>{children}</QueryClientProvider>
+        ),
+      }
+    )
+
+    expect(result.current).toBeUndefined()
+    expect(client.getQueryData(agentThreadKeys.detail(opened.id))).toEqual(
+      opened
+    )
+  })
+
+  it("refetches detail after sidebar rerenders", async () => {
+    const opened = { id: "opened-thread", status: "idle" } as AgentThread
+    const updated = { ...opened, title: "Refreshed title" }
+    vi.spyOn(agentsApi, "getThread")
+      .mockResolvedValueOnce(opened)
+      .mockResolvedValue(updated)
+    const client = testClient()
+    const wrapper = ({ children }: { children: React.ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    )
+    renderHook(() => useAgentThread(opened.id), { wrapper })
+    const { result, rerender } = renderHook(
+      () =>
+        useSidebarActiveThread({
+          activeThreadId: opened.id,
+          loadedThreads: [],
+        }),
+      { wrapper }
+    )
+    await waitFor(() => expect(result.current?.id).toBe(opened.id))
+    rerender()
+    await act(() =>
+      client.invalidateQueries({ queryKey: agentThreadKeys.detail(opened.id) })
+    )
+    await waitFor(() => expect(result.current?.title).toBe(updated.title))
+    expect(
+      client.getQueryState(agentThreadKeys.detail(opened.id))?.status
+    ).toBe("success")
+  })
+
+  it("refreshes an active coordinator's workers from sidebar pages without opening them", () => {
+    const worker = {
+      id: "worker-thread",
+      status: "running",
+      updatedAt: 1,
+    } as AgentThread
+    const coordinator = {
+      id: "coordinator-thread",
+      title: "Onscreen coordinator",
+      status: "finished",
+      updatedAt: 2,
+      taskMembership: { role: "coordinator" },
+      taskWorkers: [worker],
+    } as AgentThread
+    const client = testClient()
+    client.setQueryData(agentThreadKeys.detail(coordinator.id), coordinator)
+    const { result, rerender } = renderHook(
+      ({ loaded }: { loaded: AgentThread }) =>
+        useSidebarActiveThread({
+          activeThreadId: coordinator.id,
+          loadedThreads: [loaded],
+        }),
+      {
+        initialProps: { loaded: coordinator },
+        wrapper: ({ children }) => (
+          <QueryClientProvider client={client}>{children}</QueryClientProvider>
+        ),
+      }
+    )
+
+    expect(result.current?.taskWorkers?.[0]?.status).toBe("running")
+    rerender({
+      loaded: {
+        ...coordinator,
+        title: "Older sidebar title",
+        updatedAt: 1,
+        taskWorkers: [{ ...worker, status: "finished", updatedAt: 2 }],
+      },
+    })
+
+    expect(result.current?.taskWorkers?.[0]?.status).toBe("finished")
+    expect(result.current?.title).toBe(coordinator.title)
+    expect(
+      client.getQueryData(agentThreadKeys.detail(worker.id))
+    ).toBeUndefined()
+  })
+
+  it("returns the loaded coordinator when the active thread is one of its workers", () => {
+    const worker = { id: "worker-thread", title: "Worker" } as AgentThread
+    const coordinator = {
+      id: "coordinator-thread",
+      title: "Coordinator",
+      taskMembership: { role: "coordinator" },
+      taskWorkers: [worker],
+    } as AgentThread
+    const client = testClient()
+    client.setQueryData(agentThreadKeys.detail(worker.id), worker)
+    const { result } = renderHook(
+      () =>
+        useSidebarActiveThread({
+          activeThreadId: worker.id,
+          loadedThreads: [coordinator],
+        }),
+      {
+        wrapper: ({ children }) => (
+          <QueryClientProvider client={client}>{children}</QueryClientProvider>
+        ),
+      }
+    )
+
+    expect(result.current).toEqual(coordinator)
+  })
+
+  it("nests an open worker the sidebar page has not listed yet under its coordinator", () => {
+    const listedWorker = {
+      id: "listed-worker",
+      status: "finished",
+      updatedAt: 1,
+    } as AgentThread
+    const coordinator = {
+      id: "coordinator-thread",
+      status: "finished",
+      updatedAt: 1,
+      taskMembership: { role: "coordinator", taskId: "task" },
+      taskWorkers: [listedWorker],
+    } as AgentThread
+    const started = {
+      id: "started-worker",
+      status: "running",
+      updatedAt: 2,
+      taskMembership: {
+        role: "worker",
+        taskId: "task",
+        coordinatorThreadId: coordinator.id,
+      },
+    } as AgentThread
+    const client = testClient()
+    client.setQueryData(agentThreadKeys.detail(started.id), started)
+    const { result } = renderHook(
+      () =>
+        useSidebarActiveThread({
+          activeThreadId: started.id,
+          loadedThreads: [coordinator],
+        }),
+      {
+        wrapper: ({ children }) => (
+          <QueryClientProvider client={client}>{children}</QueryClientProvider>
+        ),
+      }
+    )
+
+    expect(result.current?.id).toBe(coordinator.id)
+    expect(result.current?.taskWorkers?.map((worker) => worker.id)).toEqual([
+      listedWorker.id,
+      started.id,
+    ])
+  })
+
+  it("keeps the deep-linked active thread available as cached pages catch up", async () => {
+    const opened = {
+      id: "opened-thread",
+      source: "slack",
+      repoFullName: "langchain-ai/deepagents",
+      status: "finished",
+      resolved: false,
+    } as AgentThread
+    const getThread = vi.spyOn(agentsApi, "getThread").mockResolvedValue(opened)
+    const client = testClient()
+    const { result, rerender } = renderHook(
+      ({ loadedThreads }: { loadedThreads: Array<AgentThread> }) =>
+        useSidebarActiveThread({
+          activeThreadId: opened.id,
+          loadedThreads,
+        }),
+      {
+        initialProps: { loadedThreads: [] as Array<AgentThread> },
+        wrapper: ({ children }) => (
+          <QueryClientProvider client={client}>{children}</QueryClientProvider>
+        ),
+      }
+    )
+
+    await waitFor(() => expect(result.current).toEqual(opened))
+    expect(getThread).toHaveBeenCalledWith(opened.id)
+
+    const cached = { ...opened, title: "Updated title" }
+    rerender({ loadedThreads: [cached] })
+    expect(result.current).toEqual(cached)
+
+    const archived = { ...cached, resolved: true }
+    getThread.mockResolvedValue(archived)
+    rerender({ loadedThreads: [] })
+    await waitFor(() => expect(result.current).toEqual(archived))
+  })
+})
+
+describe("useResolveAgentThread", () => {
+  it("rolls back an optimistic resolution when the request fails", async () => {
+    const opened = {
+      id: "opened-thread",
+      status: "idle",
+      resolved: false,
+    } as AgentThread
+    let failResolve: ((error: Error) => void) | undefined
+    vi.spyOn(agentsApi, "resolveThread").mockReturnValue(
+      new Promise<AgentThread>((_resolve, reject) => {
+        failResolve = reject
+      })
+    )
+    const client = testClient()
+    const key = agentThreadKeys.page({ resolved: false })
+    const unrelated = { ...opened, id: "unrelated-thread", title: "Before" }
+    client.setQueryData(agentThreadKeys.detail(opened.id), opened)
+    client.setQueryData(agentThreadKeys.detail(unrelated.id), unrelated)
+    client.setQueryData(key, {
+      items: [opened],
+      limit: 25,
+      offset: 0,
+      hasMore: false,
+    })
+    const { result } = renderHook(() => useResolveAgentThread(), {
+      wrapper: ({ children }) => (
+        <QueryClientProvider client={client}>{children}</QueryClientProvider>
+      ),
+    })
+
+    act(() => {
+      result.current.mutate({ threadId: opened.id, resolved: true })
+    })
+    await waitFor(() =>
+      expect(client.getQueryData<ThreadsPage>(key)?.items).toEqual([])
+    )
+    expect(
+      client.getQueryData<AgentThread>(agentThreadKeys.detail(opened.id))
+    ).toMatchObject({ resolved: true })
+    client.setQueryData(agentThreadKeys.detail(unrelated.id), {
+      ...unrelated,
+      title: "After",
+    })
+
+    act(() => failResolve?.(new Error("request failed")))
+    await waitFor(() =>
+      expect(client.getQueryData<ThreadsPage>(key)?.items).toEqual([opened])
+    )
+    expect(
+      client.getQueryData<AgentThread>(agentThreadKeys.detail(opened.id))
+    ).toEqual(opened)
+    expect(
+      client.getQueryData(agentThreadKeys.sidebarActive(opened.id))
+    ).toBeUndefined()
+    expect(
+      client.getQueryData<AgentThread>(agentThreadKeys.detail(unrelated.id))
+    ).toMatchObject({ title: "After" })
+  })
+})
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (error: Error) => void
+  const promise = new Promise<T>((done, fail) => {
+    resolve = done
+    reject = fail
+  })
+  return { promise, resolve, reject }
+}
+
+function wrapperFor(client: QueryClient) {
+  return ({ children }: { children: React.ReactNode }) => (
+    <QueryClientProvider client={client}>{children}</QueryClientProvider>
+  )
+}
+
+describe("useShareThread", () => {
+  it("keeps confirmed sharing when an older detail read finishes later", async () => {
+    const client = testClient()
+    const thread = {
+      ...optimisticThread("thread-1", { prompt: "Private prompt" }),
+      visibility: "private",
+      status: "finished",
+    } satisfies AgentThread
+    const shared: AgentThread = { ...thread, visibility: "public" }
+    const staleRead = deferred<AgentThread>()
+    const share = deferred<AgentThread>()
+    vi.spyOn(agentsApi, "getThread").mockReturnValue(staleRead.promise)
+    vi.spyOn(agentsApi, "shareThread").mockReturnValue(share.promise)
+    client.setQueryData(agentThreadKeys.detail(thread.id), thread)
+    const { result } = renderHook(
+      () => ({
+        detail: useAgentThread(thread.id),
+        share: useShareThread(),
+      }),
+      { wrapper: wrapperFor(client) }
+    )
+    act(() => result.current.share.mutate(thread.id))
+    await waitFor(() => expect(result.current.share.isPending).toBe(true))
+    const refetch = result.current.detail.refetch()
+    expect(
+      client.isFetching({ queryKey: agentThreadKeys.detail(thread.id) })
+    ).toBe(1)
+    await act(async () => share.resolve(shared))
+    await waitFor(() =>
+      expect(result.current.detail.data?.visibility).toBe("public")
+    )
+    await act(async () => {
+      staleRead.resolve(thread)
+      await refetch
+    })
+    expect(
+      client.getQueryData<AgentThread>(agentThreadKeys.detail(thread.id))
+        ?.visibility
+    ).toBe("public")
+  })
+})
+
+describe("active thread menu metadata", () => {
+  it("refetches an unknown automation capability and keeps verified detail on sidebar refresh", async () => {
+    const client = testClient()
+    const summary = {
+      ...optimisticThread("automation-1", { prompt: "" }),
+      threadCategory: "automation",
+      automationCanPost: null,
+    } as AgentThread
+    const detail = { ...summary, automationCanPost: true }
+    const getThread = vi.spyOn(agentsApi, "getThread").mockResolvedValue(detail)
+    const { rerender } = renderHook(
+      ({ threads }) => useSeedAgentThreadDetails(threads),
+      { initialProps: { threads: [summary] }, wrapper: wrapperFor(client) }
+    )
+    expect(
+      client.getQueryData<AgentThread>(agentThreadKeys.detail(summary.id))
+        ?.automationCanPost
+    ).toBeNull()
+    const { result } = renderHook(() => useAgentThread(summary.id), {
+      wrapper: wrapperFor(client),
+    })
+    await waitFor(() =>
+      expect(result.current.data?.automationCanPost).toBe(true)
+    )
+    expect(getThread).toHaveBeenCalledTimes(1)
+    rerender({ threads: [{ ...summary, updatedAt: summary.updatedAt + 1 }] })
+    expect(
+      client.getQueryData<AgentThread>(agentThreadKeys.detail(summary.id))
+        ?.automationCanPost
+    ).toBe(true)
+  })
+
+  it("refreshes menu actions from the sidebar without replacing live detail", () => {
+    const client = testClient()
+    const detail = optimisticThread("thread-1", { prompt: "Pending prompt" })
+    client.setQueryData(agentThreadKeys.detail(detail.id), detail)
+    const summary: AgentThread = {
+      ...detail,
+      updatedAt: detail.updatedAt + 1,
+      traceUrl: "https://smith.langchain.com/trace/thread-1",
+      sandboxId: "sandbox-1",
+      messages: [],
+      pendingMessages: [],
+    }
+    const { rerender } = renderHook(
+      ({ threads }) => useSeedAgentThreadDetails(threads, detail.id),
+      { initialProps: { threads: [summary] }, wrapper: wrapperFor(client) }
+    )
+    expect(client.getQueryData(agentThreadKeys.detail(detail.id))).toEqual({
+      ...detail,
+      updatedAt: summary.updatedAt,
+      traceUrl: summary.traceUrl,
+      sandboxId: summary.sandboxId,
+      sourceUrl: summary.sourceUrl,
+      sourceAppUrl: summary.sourceAppUrl,
+      automationId: summary.automationId,
+    })
+    const refreshed = client.getQueryData<AgentThread>(
+      agentThreadKeys.detail(detail.id)
+    )
+    const refreshedAt = client.getQueryState(
+      agentThreadKeys.detail(detail.id)
+    )?.dataUpdatedAt
+    vi.spyOn(Date, "now").mockReturnValue(Date.now() + 1000)
+    for (const updatedAt of [detail.updatedAt, summary.updatedAt]) {
+      rerender({ threads: [{ ...summary, updatedAt, sandboxId: null }] })
+      expect(
+        client.getQueryState(agentThreadKeys.detail(detail.id))?.dataUpdatedAt
+      ).toBe(refreshedAt)
+      expect(client.getQueryData(agentThreadKeys.detail(detail.id))).toEqual(
+        refreshed
+      )
+    }
+    rerender({
+      threads: [
+        { ...summary, updatedAt: summary.updatedAt + 1, sandboxId: null },
+      ],
+    })
+    expect(
+      client.getQueryData<AgentThread>(agentThreadKeys.detail(detail.id))
+        ?.sandboxId
+    ).toBeNull()
+  })
+})
+
+describe("optimistic thread mutations", () => {
+  const thread = {
+    id: "thread-1",
+    title: "Before",
+    status: "idle",
+    resolved: false,
+  } as AgentThread
+  const pageKey = agentThreadKeys.page({ resolved: false })
+  const pageOf = (items: Array<AgentThread>): ThreadsPage => ({
+    items,
+    limit: 25,
+    offset: 0,
+    hasMore: false,
+  })
+
+  it("reorders a project's loaded pages without changing another folder and rolls back failures", async () => {
+    const second = { ...thread, id: "second" }
+    const request = deferred<{ ok: boolean }>()
+    vi.spyOn(agentsApi, "reorderSidebarThreads").mockReturnValue(
+      request.promise
+    )
+    const client = testClient()
+    const key = agentThreadKeys.infinitePages({ project: "project-a" })
+    const other = agentThreadKeys.infinitePages({ project: "project-b" })
+    const original = {
+      pages: [pageOf([thread]), pageOf([second])],
+      pageParams: [0, 1],
+    }
+    client.setQueryData(key, original)
+    client.setQueryData(other, original)
+    const { result } = renderHook(
+      () => useReorderSidebarThreads({ project: "project-a" }),
+      { wrapper: wrapperFor(client) }
+    )
+    act(() => result.current.mutate([second.id, thread.id]))
+    await waitFor(() =>
+      expect(
+        client
+          .getQueryData<InfiniteData<ThreadsPage>>(key)
+          ?.pages.map((entry) => entry.items[0]?.id)
+      ).toEqual(["second", "thread-1"])
+    )
+    expect(client.getQueryData(other)).toEqual(original)
+    await act(async () => request.reject(new Error("save failed")))
+    await waitFor(() => expect(client.getQueryData(key)).toEqual(original))
+  })
+
+  it("reorders pins optimistically and restores their order on failure", async () => {
+    const second = { ...thread, id: "second" }
+    const request = deferred<{ ok: boolean }>()
+    vi.spyOn(agentsApi, "reorderPinnedThreads").mockReturnValue(request.promise)
+    const client = testClient()
+    client.setQueryData(agentThreadKeys.pinned, [thread, second])
+    const { result } = renderHook(() => useReorderPinnedThreads(), {
+      wrapper: wrapperFor(client),
+    })
+    act(() => result.current.mutate([second.id, thread.id]))
+    await waitFor(() =>
+      expect(client.getQueryData(agentThreadKeys.pinned)).toEqual([
+        second,
+        thread,
+      ])
+    )
+    await act(async () => request.reject(new Error("save failed")))
+    await waitFor(() =>
+      expect(client.getQueryData(agentThreadKeys.pinned)).toEqual([
+        thread,
+        second,
+      ])
+    )
+  })
+
+  it("appends a new pin without reordering after the server refresh", async () => {
+    const existing = { ...thread, id: "existing-pin" }
+    const request = deferred<void>()
+    vi.spyOn(agentsApi, "pinThread").mockReturnValue(request.promise)
+    const listPins = vi
+      .spyOn(agentsApi, "listPinnedThreads")
+      .mockResolvedValueOnce([existing])
+      .mockResolvedValue([existing, thread])
+    const client = testClient()
+    client.setQueryData(agentThreadKeys.detail(thread.id), thread)
+    const { result } = renderHook(
+      () => ({
+        pins: useSidebarPinnedThreads(),
+        mutation: usePinAgentThread(),
+      }),
+      { wrapper: wrapperFor(client) }
+    )
+    await waitFor(() => expect(result.current.pins.data).toEqual([existing]))
+
+    act(() =>
+      result.current.mutation.mutate({ threadId: thread.id, pinned: true })
+    )
+    await waitFor(() =>
+      expect(result.current.pins.data).toEqual([existing, thread])
+    )
+    await act(async () => request.resolve(undefined))
+    await waitFor(() => expect(listPins).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(result.current.pins.isFetching).toBe(false))
+    expect(result.current.pins.data).toEqual([existing, thread])
+  })
+
+  it("renames across detail, pinned, and page caches and rolls back on failure", async () => {
+    const request = deferred<AgentThread>()
+    vi.spyOn(agentsApi, "renameThread").mockReturnValue(request.promise)
+    const client = testClient()
+    client.setQueryData(agentThreadKeys.detail(thread.id), thread)
+    client.setQueryData(agentThreadKeys.pinned, [thread])
+    client.setQueryData(pageKey, pageOf([thread]))
+    const { result } = renderHook(() => useRenameAgentThread(), {
+      wrapper: wrapperFor(client),
+    })
+    const titles = () => [
+      client.getQueryData<AgentThread>(agentThreadKeys.detail(thread.id))
+        ?.title,
+      client.getQueryData<Array<AgentThread>>(agentThreadKeys.pinned)?.[0]
+        ?.title,
+      client.getQueryData<ThreadsPage>(pageKey)?.items[0]?.title,
+    ]
+
+    act(() => result.current.mutate({ threadId: thread.id, title: "After" }))
+    await waitFor(() => expect(titles()).toEqual(["After", "After", "After"]))
+
+    act(() => request.reject(new Error("request failed")))
+    await waitFor(() =>
+      expect(titles()).toEqual(["Before", "Before", "Before"])
+    )
+  })
+
+  it("keeps an optimistic resolution when a pinned fetch was already in flight", async () => {
+    const stalePins = deferred<Array<AgentThread>>()
+    vi.spyOn(agentsApi, "resolveThread").mockReturnValue(
+      new Promise<AgentThread>(() => {})
+    )
+    const client = testClient()
+    client.setQueryData(agentThreadKeys.pinned, [thread])
+    void client.prefetchQuery({
+      queryKey: agentThreadKeys.pinned,
+      queryFn: () => stalePins.promise,
+    })
+    const { result } = renderHook(() => useResolveAgentThread(), {
+      wrapper: wrapperFor(client),
+    })
+
+    act(() => result.current.mutate({ threadId: thread.id, resolved: true }))
+    await waitFor(() =>
+      expect(
+        client.getQueryData<Array<AgentThread>>(agentThreadKeys.pinned)?.[0]
+      ).toMatchObject({ resolved: true })
+    )
+    await act(async () => stalePins.resolve([thread]))
+
+    expect(
+      client.getQueryData<Array<AgentThread>>(agentThreadKeys.pinned)?.[0]
+    ).toMatchObject({ resolved: true })
+  })
+})
+
+describe("useUpdateAgentSchedule", () => {
+  it("flips enabled before the request resolves and rolls back on failure", async () => {
+    const schedule = { id: "schedule-1", enabled: true } as AgentSchedule
+    const other = { id: "schedule-2", enabled: true } as AgentSchedule
+    const request = deferred<AgentSchedule>()
+    vi.spyOn(agentsApi, "updateSchedule").mockReturnValue(request.promise)
+    vi.spyOn(agentsApi, "listSchedules").mockResolvedValue([schedule, other])
+    const client = testClient()
+    client.setQueryData(agentScheduleKeys.all, [schedule, other])
+    const { result } = renderHook(() => useUpdateAgentSchedule(), {
+      wrapper: wrapperFor(client),
+    })
+    const enabled = () =>
+      client
+        .getQueryData<Array<AgentSchedule>>(agentScheduleKeys.all)
+        ?.map((entry) => entry.enabled)
+
+    act(() =>
+      result.current.mutate({
+        scheduleId: schedule.id,
+        body: { enabled: false },
+      })
+    )
+    await waitFor(() => expect(enabled()).toEqual([false, true]))
+
+    act(() => request.reject(new Error("request failed")))
+    await waitFor(() => expect(enabled()).toEqual([true, true]))
+  })
+})
+
+describe("useWorkflowApprovals", () => {
+  it("fetches approvals created after the last poll when the run stops", async () => {
+    const client = testClient()
+    const approval = {
+      fingerprint: "late-approval",
+      status: "pending",
+    } as WorkflowPushApproval
+    vi.spyOn(agentsApi, "listWorkflowApprovals")
+      .mockResolvedValueOnce({ threadId: "thread-1", approvals: [] })
+      .mockResolvedValue({ threadId: "thread-1", approvals: [approval] })
+    const { result, rerender } = renderHook(
+      ({ active }) =>
+        useWorkflowApprovals("thread-1", { pollWhileActive: active }),
+      {
+        initialProps: { active: true },
+        wrapper: ({ children }) => (
+          <QueryClientProvider client={client}>{children}</QueryClientProvider>
+        ),
+      }
+    )
+    await waitFor(() => expect(result.current.data?.approvals).toEqual([]))
+
+    rerender({ active: false })
+
+    await waitFor(() =>
+      expect(result.current.data?.approvals).toEqual([approval])
+    )
+  })
+})
+
+describe("useWorkflowApprovalDecision", () => {
+  it("marks the approval decided at once and restores it on failure", async () => {
+    const approval = {
+      fingerprint: "fingerprint-1",
+      status: "pending",
+    } as WorkflowPushApproval
+    const request = deferred<{ status: string; fingerprint: string }>()
+    vi.spyOn(agentsApi, "approveWorkflowPush").mockReturnValue(request.promise)
+    const client = testClient()
+    const key = agentThreadKeys.workflowApprovals("thread-1")
+    client.setQueryData<WorkflowPushApprovalsResponse>(key, {
+      threadId: "thread-1",
+      approvals: [approval],
+    })
+    const { result } = renderHook(
+      () => useWorkflowApprovalDecision("thread-1"),
+      { wrapper: wrapperFor(client) }
+    )
+    const status = () =>
+      client.getQueryData<WorkflowPushApprovalsResponse>(key)?.approvals[0]
+        ?.status
+
+    act(() =>
+      result.current.mutate({
+        fingerprint: approval.fingerprint,
+        decision: "approve",
+      })
+    )
+    await waitFor(() => expect(status()).toBe("approved"))
+
+    act(() => request.reject(new Error("request failed")))
+    await waitFor(() => expect(status()).toBe("pending"))
+  })
+})
+
+describe("markAgentThreadViewed", () => {
+  const unread = { id: "thread-1", viewed: false } as AgentThread
+
+  it("clears the unread flag across the caches", () => {
+    const client = testClient()
+    const pagesKey = agentThreadKeys.infinitePages({ limit: 10 })
+    client.setQueryData<Array<AgentThread>>(agentThreadKeys.pinned, [unread])
+    client.setQueryData<InfiniteData<ThreadsPage>>(pagesKey, {
+      pages: [{ items: [unread], limit: 10, offset: 0, hasMore: false }],
+      pageParams: [0],
+    })
+    client.setQueryData(agentThreadKeys.sidebarActive("thread-1"), unread)
+    client.setQueryData(agentThreadKeys.detail("thread-1"), unread)
+
+    markAgentThreadViewed(client, "thread-1")
+
+    expect(
+      client.getQueryData<Array<AgentThread>>(agentThreadKeys.pinned)?.[0]
+        ?.viewed
+    ).toBe(true)
+    expect(
+      client.getQueryData<InfiniteData<ThreadsPage>>(pagesKey)?.pages[0]
+        ?.items[0]?.viewed
+    ).toBe(true)
+    expect(
+      client.getQueryData<AgentThread>(
+        agentThreadKeys.sidebarActive("thread-1")
+      )?.viewed
+    ).toBe(true)
+    expect(
+      client.getQueryData<AgentThread>(agentThreadKeys.detail("thread-1"))
+        ?.viewed
+    ).toBe(true)
+  })
+})
+
+describe("thread read state", () => {
+  it("does not clear manual unread on a detail refetch", async () => {
+    const thread = {
+      ...optimisticThread("thread-1", { prompt: "Read me" }),
+      status: "finished" as const,
+      latestRunId: "run-1",
+      viewed: false,
+    }
+    vi.spyOn(agentsApi, "getThread").mockResolvedValue(thread)
+    const save = vi
+      .spyOn(agentsApi, "setThreadViewed")
+      .mockResolvedValue({ viewed: true })
+    const client = testClient()
+    const { result } = renderHook(() => useAgentThread(thread.id), {
+      wrapper: wrapperFor(client),
+    })
+    await waitFor(() => expect(save).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(client.isMutating()).toBe(0))
+    act(() => client.setQueryData(agentThreadKeys.detail(thread.id), thread))
+    await act(() => result.current.refetch())
+    expect(save).toHaveBeenCalledTimes(1)
+    await waitFor(() => expect(result.current.data?.viewed).toBe(false))
+  })
+
+  it("keeps inactive plugin chats unread until they become active", async () => {
+    const thread = {
+      ...optimisticThread("thread-1", { prompt: "Plugin chat" }),
+      status: "finished" as const,
+      latestRunId: "run-1",
+      viewed: false,
+    }
+    vi.spyOn(agentsApi, "getThread").mockResolvedValue(thread)
+    const save = vi
+      .spyOn(agentsApi, "setThreadViewed")
+      .mockResolvedValue({ viewed: true })
+    const client = testClient()
+    const { result, rerender } = renderHook(
+      ({ active }) => useAgentThread(thread.id, active),
+      {
+        wrapper: wrapperFor(client),
+        initialProps: { active: false },
+      }
+    )
+    await waitFor(() => expect(result.current.data?.latestRunId).toBe("run-1"))
+    expect(save).not.toHaveBeenCalled()
+    rerender({ active: true })
+    await waitFor(() => expect(save).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(client.isMutating()).toBe(0))
+    rerender({ active: false })
+    act(() =>
+      client.setQueryData(agentThreadKeys.detail(thread.id), {
+        ...thread,
+        latestRunId: "run-2",
+      })
+    )
+    expect(save).toHaveBeenCalledTimes(1)
+    rerender({ active: true })
+    await waitFor(() => expect(save).toHaveBeenCalledTimes(2))
+  })
+
+  it("marks an externally completed run read without observing it running", async () => {
+    const thread = {
+      ...optimisticThread("thread-1", { prompt: "Read me" }),
+      status: "finished" as const,
+      latestRunId: "run-1",
+      viewed: true,
+    }
+    const get = vi.spyOn(agentsApi, "getThread").mockResolvedValue(thread)
+    const save = vi
+      .spyOn(agentsApi, "setThreadViewed")
+      .mockResolvedValue({ viewed: true })
+    const client = testClient()
+    const { result } = renderHook(() => useAgentThread(thread.id), {
+      wrapper: wrapperFor(client),
+    })
+    await waitFor(() => expect(result.current.data?.latestRunId).toBe("run-1"))
+    expect(save).not.toHaveBeenCalled()
+    get.mockResolvedValue({
+      ...thread,
+      unreadResponseId: "response-2",
+      viewed: false,
+    })
+    await act(() => result.current.refetch())
+    await waitFor(() =>
+      expect(save).toHaveBeenCalledWith(thread.id, true, "response-2")
+    )
+    await waitFor(() => expect(client.isMutating()).toBe(0))
+    await waitFor(() => expect(result.current.data?.viewed).toBe(true))
+  })
+
+  it("leaves an answer unread when the reader leaves before completion", async () => {
+    const thread = {
+      ...optimisticThread("thread-1", { prompt: "Read me" }),
+      status: "running" as const,
+      unreadResponseId: null,
+      viewed: true,
+    }
+    vi.spyOn(agentsApi, "getThread").mockResolvedValue(thread)
+    const save = vi
+      .spyOn(agentsApi, "setThreadViewed")
+      .mockResolvedValue({ viewed: true })
+    const client = testClient()
+    const { result, rerender } = renderHook(
+      ({ active }) => useAgentThread(thread.id, active),
+      { wrapper: wrapperFor(client), initialProps: { active: true } }
+    )
+    await waitFor(() => expect(result.current.data?.status).toBe("running"))
+    expect(save).not.toHaveBeenCalled()
+    rerender({ active: false })
+    act(() =>
+      client.setQueryData(agentThreadKeys.detail(thread.id), {
+        ...thread,
+        status: "finished",
+        unreadResponseId: "response-1",
+        viewed: false,
+      })
+    )
+    await waitFor(() => expect(result.current.data?.viewed).toBe(false))
+    expect(save).not.toHaveBeenCalled()
+    rerender({ active: true })
+    await waitFor(() =>
+      expect(save).toHaveBeenCalledWith(thread.id, true, "response-1")
+    )
+    await waitFor(() => expect(result.current.data?.viewed).toBe(true))
+  })
+
+  it("does not clear a newer response when an older acknowledgement completes", async () => {
+    const thread = {
+      ...optimisticThread("thread-1", { prompt: "Read me" }),
+      unreadResponseId: "response-1",
+      viewed: false,
+    }
+    const request = Promise.withResolvers<{ viewed: boolean }>()
+    vi.spyOn(agentsApi, "setThreadViewed").mockReturnValue(request.promise)
+    const client = testClient()
+    client.setQueryData(agentThreadKeys.detail(thread.id), thread)
+    const { result } = renderHook(() => useSetAgentThreadViewed(), {
+      wrapper: wrapperFor(client),
+    })
+    act(() =>
+      result.current.mutate({
+        threadId: thread.id,
+        viewed: true,
+        responseId: "response-1",
+      })
+    )
+    await waitFor(() =>
+      expect(
+        client.getQueryData<AgentThread>(agentThreadKeys.detail(thread.id))
+          ?.viewed
+      ).toBe(true)
+    )
+    act(() =>
+      client.setQueryData(agentThreadKeys.detail(thread.id), {
+        ...thread,
+        unreadResponseId: "response-2",
+      })
+    )
+    await act(() => request.resolve({ viewed: true }))
+    await waitFor(() => expect(client.isMutating()).toBe(0))
+    expect(
+      client.getQueryData<AgentThread>(agentThreadKeys.detail(thread.id))
+        ?.viewed
+    ).toBe(false)
+  })
+
+  it("refreshes the displayed response when the server rejects a stale acknowledgement", async () => {
+    const thread = {
+      ...optimisticThread("thread-1", { prompt: "Read me" }),
+      unreadResponseId: "response-1",
+      viewed: false,
+    }
+    vi.spyOn(agentsApi, "setThreadViewed").mockResolvedValue({ viewed: false })
+    const client = testClient()
+    client.setQueryData(agentThreadKeys.detail(thread.id), thread)
+    const invalidate = vi.spyOn(client, "invalidateQueries")
+    const { result } = renderHook(() => useSetAgentThreadViewed(), {
+      wrapper: wrapperFor(client),
+    })
+    act(() =>
+      result.current.mutate({
+        threadId: thread.id,
+        viewed: true,
+        responseId: "response-1",
+      })
+    )
+    await waitFor(() => expect(result.current.isSuccess).toBe(true))
+    expect(invalidate).toHaveBeenCalledWith({
+      queryKey: agentThreadKeys.detail(thread.id),
+      exact: true,
+    })
+    expect(
+      client.getQueryData<AgentThread>(agentThreadKeys.detail(thread.id))
+        ?.viewed
+    ).toBe(false)
+  })
+
+  it("rolls back an optimistic unread action when saving fails", async () => {
+    const thread = {
+      ...optimisticThread("thread-1", { prompt: "Read me" }),
+      viewed: true,
+    }
+    const request = Promise.withResolvers<{ viewed: boolean }>()
+    vi.spyOn(agentsApi, "setThreadViewed").mockReturnValue(request.promise)
+    const client = testClient()
+    client.setQueryData(agentThreadKeys.detail(thread.id), thread)
+    const { result } = renderHook(() => useSetAgentThreadViewed(), {
+      wrapper: wrapperFor(client),
+    })
+    act(() => result.current.mutate({ threadId: thread.id, viewed: false }))
+    await waitFor(() =>
+      expect(
+        client.getQueryData<AgentThread>(agentThreadKeys.detail(thread.id))
+          ?.viewed
+      ).toBe(false)
+    )
+    act(() => request.reject(new Error("Save failed")))
+    await waitFor(() =>
+      expect(
+        client.getQueryData<AgentThread>(agentThreadKeys.detail(thread.id))
+          ?.viewed
+      ).toBe(true)
+    )
+  })
+
+  it("updates unread state across caches without refetching unfiltered sidebar lists", async () => {
+    const unread = {
+      ...optimisticThread("thread-1", { prompt: "Read me" }),
+      status: "finished" as const,
+      viewed: false,
+    }
+    const listPage = vi.spyOn(agentsApi, "listThreadsPage").mockResolvedValue({
+      items: [unread],
+      limit: 25,
+      offset: 0,
+      hasMore: false,
+    })
+    const listPins = vi
+      .spyOn(agentsApi, "listPinnedThreads")
+      .mockResolvedValue([unread])
+    const listFiltered = vi
+      .spyOn(agentsApi, "setThreadViewed")
+      .mockResolvedValue({ viewed: true })
+    const client = testClient()
+    const unreadFilterParams = { limit: 25, offset: 0, viewed: false }
+    const { result, unmount } = renderHook(
+      () => ({
+        shellPins: useSidebarPinnedThreads(),
+        headerPins: useSidebarPinnedThreads({ refetchOnMount: false }),
+        recents: useSidebarRecents({ repoMode: false }),
+        unreadList: useThreadsPage(unreadFilterParams),
+        setViewed: useSetAgentThreadViewed(),
+      }),
+      { wrapper: wrapperFor(client) }
+    )
+    await waitFor(() =>
+      expect(result.current.recents.items[0]?.viewed).toBe(false)
+    )
+    expect(listPins).toHaveBeenCalledTimes(1)
+    expect(listPage).toHaveBeenCalledTimes(2)
+
+    // Remounting a non-refetching header observer across thread clicks does not refetch pins.
+    const secondHeader = renderHook(
+      () => useSidebarPinnedThreads({ refetchOnMount: false }),
+      { wrapper: wrapperFor(client) }
+    )
+    expect(listPins).toHaveBeenCalledTimes(1)
+    secondHeader.unmount()
+
+    listPage.mockResolvedValue({
+      items: [],
+      limit: 25,
+      offset: 0,
+      hasMore: false,
+    })
+    await act(() =>
+      result.current.setViewed.mutateAsync({
+        threadId: unread.id,
+        viewed: true,
+      })
+    )
+    expect(listFiltered).toHaveBeenCalledTimes(1)
+    // Unfiltered recents and pinned lists keep their patched state without network refetches;
+    // the viewed-filtered page query still invalidates and refetches.
+    await waitFor(() => {
+      expect(result.current.recents.items[0]?.viewed).toBe(true)
+      expect(result.current.shellPins.data?.[0]?.viewed).toBe(true)
+      expect(result.current.unreadList.data?.items).toEqual([])
+    })
+    expect(listPins).toHaveBeenCalledTimes(1)
+    expect(listPage).toHaveBeenCalledTimes(3)
+    unmount()
+  })
+})
+
+describe("sidebar activity invalidation", () => {
+  it.each([true, false])(
+    "only subscribes shared lists to public activity (owned: %s)",
+    async (owned) => {
+      vi.spyOn(agentsApi, "listThreadsPage").mockResolvedValue(page)
+      const client = testClient()
+      renderHook(() => useSidebarRecents({ repoMode: false, owned }), {
+        wrapper: wrapperFor(client),
+      })
+      await waitFor(() =>
+        expect(
+          client
+            .getQueryCache()
+            .getAll()
+            .some((query) => query.state.status === "success")
+        ).toBe(true)
+      )
+      const topics = client.getQueryCache().getAll().flatMap(queryTopics)
+      expect(topics).toContain(invalidationTopic("threads", "alice-id"))
+      expect(topics.includes(invalidationTopic("threads", "public"))).toBe(
+        !owned
+      )
+    }
+  )
+
+  it("moves yesterday's idle thread to Today when activity is invalidated, without polling", async () => {
+    const now = new Date(2026, 5, 10, 15)
+    const yesterday = new Date(2026, 5, 9, 12).getTime()
+    let updatedAt = yesterday
+    const listThreads = vi
+      .spyOn(agentsApi, "listThreadsPage")
+      .mockImplementation(async () => ({
+        ...page,
+        items: [
+          {
+            ...optimisticThread("old-thread", { prompt: "Continue" }),
+            createdAt: yesterday,
+            updatedAt,
+            status: "idle",
+          },
+        ],
+      }))
+    const client = testClient()
+    const { result } = renderHook(
+      () =>
+        groupSidebarThreadsByRecency(
+          useSidebarRecents({ repoMode: false, sort: "updated" }).items.map(
+            cloudSidebarThread
+          ),
+          now
+        ),
+      { wrapper: wrapperFor(client) }
+    )
+    await waitFor(() => expect(result.current[0]?.label).toBe("Yesterday"))
+    updatedAt = now.getTime()
+    await act(() =>
+      client.invalidateQueries({
+        predicate: (query) =>
+          queryTopics(query).includes(invalidationTopic("threads", "alice-id")),
+      })
+    )
+    await waitFor(() => expect(result.current[0]?.label).toBe("Today"))
+    expect(listThreads.mock.calls.map(([, measure]) => measure)).toEqual([
+      true,
+      false,
+    ])
+  })
+})
+
+describe("sidebar task families", () => {
+  const worker = {
+    id: "worker",
+    title: "Implementation",
+    status: "running",
+    viewed: false,
+  } as AgentThread
+  const coordinator = {
+    id: "coordinator",
+    status: "idle",
+    taskMembership: { role: "coordinator", taskId: "task" },
+    taskWorkers: [worker],
+  } as AgentThread
+
+  it("updates nested worker caches for navigation and optimistic edits", () => {
+    const client = testClient()
+    const key = agentThreadKeys.page({ hierarchy: true, resolved: false })
+    client.setQueryData(key, { ...page, items: [coordinator] })
+    markAgentThreadViewed(client, worker.id)
+    setAgentThreadStatus(client, worker.id, "finished")
+    expect(
+      client.getQueryData<ThreadsPage>(key)?.items[0]?.taskWorkers?.[0]
+    ).toMatchObject({ viewed: true, status: "finished" })
+    setAgentThreadResolved(client, worker.id, true)
+    expect(
+      client.getQueryData<ThreadsPage>(key)?.items[0]?.taskWorkers
+    ).toEqual([])
+  })
+
+  it("finds an idle thread's first and later workers when its task-workers topic is invalidated, without polling", async () => {
+    vi.useFakeTimers()
+    let workers: Array<AgentThread> = []
+    const listed = vi
+      .spyOn(agentsApi, "listThreadsPage")
+      .mockImplementation(async () => ({
+        ...page,
+        items: [
+          workers.length
+            ? { ...coordinator, taskWorkers: workers }
+            : {
+                ...coordinator,
+                taskMembership: undefined,
+                taskWorkers: undefined,
+              },
+        ],
+      }))
+    const client = testClient()
+    const { result } = renderHook(
+      () => useSidebarRecents({ repoMode: false }),
+      { wrapper: wrapperFor(client) }
+    )
+    await vi.waitFor(() => expect(result.current.items).toHaveLength(1))
+    const topic = invalidationTopic("task-workers", coordinator.id)
+    const delegate = async (added: AgentThread) => {
+      workers = [...workers, added]
+      await act(() =>
+        client.invalidateQueries({
+          predicate: (query) => queryTopics(query).includes(topic),
+        })
+      )
+      await vi.waitFor(() =>
+        expect(result.current.items[0]?.taskWorkers).toHaveLength(
+          workers.length
+        )
+      )
+    }
+    await delegate({ ...worker, status: "finished" })
+    const calls = listed.mock.calls.length
+    await act(() => vi.advanceTimersByTimeAsync(60_000))
+    expect(listed.mock.calls.length).toBe(calls)
+    await delegate({ ...worker, id: "new-worker", status: "running" })
+    workers = workers.map((thread) => ({ ...thread, status: "finished" }))
+    await act(() => vi.advanceTimersByTimeAsync(2100))
+    await vi.waitFor(() =>
+      expect(result.current.items[0]?.taskWorkers?.[1]?.status).toBe("finished")
+    )
+  })
+})

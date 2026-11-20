@@ -1,0 +1,161 @@
+[project]
+name = "open-swe-agent"
+version = "0.1.0"
+description = "Robin Agent - Python agent for automating software engineering tasks"
+readme = "README.md"
+requires-python = ">=3.14"
+license = { text = "MIT" }
+dependencies = [
+    "deepagents==0.7.41",
+    # The types of the event endpoint requests the MDA deployment's channels send (mda/),
+    # from the vendored SDK the deployment runs (vendor/README.md).
+    "managed-deepagents>=0.10.1",
+    # Verifies the signature MDA puts on those requests (MDA_SERVICE_SECRET).
+    "standardwebhooks>=1.1.0",
+    "fastapi>=0.141.1",
+    "uvicorn>=0.52.4",
+    "httpx2>=2.12.0",
+    "orjson>=3.12.0",
+    "PyJWT>=2.13.0",
+    "cryptography>=50.0.0",
+    "langgraph-sdk>=0.4.14",
+    "langchain[mcp]>=1.5.2",
+    "langgraph>=1.2.24",
+    "markdownify>=1.2.3",
+    "markdown-it-py==4.3.0",
+    "langchain-anthropic>=1.7.12",
+    "langsmith>=0.15.1",
+    "langchain-openai>=1.8.5,<2.0.0",
+    "openai>=3.10.0",
+    "langchain-fireworks>=1.7.3",
+    # langchain-fireworks 1.4.2 pins a pre-release fireworks-ai; opt in explicitly so uv resolves it.
+    "fireworks-ai>=1.2.9",
+    "exa-py>=2.18.1",
+    "langchain-google-genai>=4.5.2",
+    "websockets>=16.1.1",
+    "slack-sdk>=3.44.1",
+    "aiohttp>=3.14.3",
+    "alembic==1.20.1",
+    "croniter>=6.0.0",
+    "sqlalchemy[asyncio]==2.1.8",
+    "asyncpg==0.32.0",
+    "pillow>=12.1.0",
+    "Pygments>=2.21.0",
+    "pyyaml>=6.0.3",
+    "githubkit[auth-app]==0.17.1",
+    "githubkit-schemas[2022-11-28]==26.11.5",
+    "jinja2>=3.1.6",
+    "langchain-typesafe==0.1.0",
+    "langchain-quickjs==0.3.12",
+    "open-swe-runtime-api",
+]
+
+[project.optional-dependencies]
+dev = [
+    "langgraph-cli[inmem]>=0.4.43",
+    "ty==0.0.95",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "pytest-xdist>=3.8.0",
+    "ruff>=0.16.4",
+]
+
+# Shared with mda/: the contract between the backend and its MDA runtime.
+[tool.uv.sources]
+open-swe-runtime-api = { path = "packages/runtime-api", editable = true }
+managed-deepagents = { path = "vendor/managed-deepagents-sdk/packages/pypi", editable = true }
+
+[tool.uv]
+constraint-dependencies = [
+    "langgraph-api==0.19.0.dev3",
+    "langgraph-runtime-inmem==0.39.0rc7",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["openswe"]
+
+[tool.ruff]
+line-length = 100
+# Scripts copied into sandboxes run on whatever python3 the image ships.
+per-file-target-version = { "openswe/sandbox_scripts/*.py" = "py38", "mda/rt/sandbox_scripts/*.py" = "py38" }
+# Vendored upstream code keeps its own style.
+extend-exclude = ["vendor"]
+
+[tool.ruff.lint]
+# PLC2701 (private-name imports) is preview-only; explicit-preview-rules keeps every
+# other preview rule off.
+preview = true
+explicit-preview-rules = true
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # Pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "UP",  # pyupgrade
+    "TID251",
+    "SLF",  # flake8-self: no cross-module access to _private names
+    "PLC2701",  # no cross-module imports of _private names
+]
+ignore = [
+    "E501",  # line too long (handled by formatter)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["SLF001", "PLC2701"]
+"mda/tests/**" = ["SLF001", "PLC2701"]
+# Siblings of one package sharing package-internal helpers. PLC2701 cannot tell
+# an intra-package import from a cross-package one; names these modules expose
+# to the rest of the codebase are public.
+"openswe/threads/*" = ["PLC2701"]
+# MDA builds the deployment on Python 3.13, which evaluates annotations as it
+# defines them, so a name imported only for type checking stays quoted there.
+"mda/**" = ["UP037"]
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"__future__.annotations".msg = "Do not use postponed annotation evaluation."
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ty.src]
+include = ["openswe", "packages", "tests"]
+# Runs in the mda/ project's environment, against the graph `mda build` compiles.
+# Sandbox scripts run on an older python3; `make typecheck` checks them at 3.8.
+exclude = ["tests/e2e/mda_entrypoint.py", "openswe/sandbox_scripts/*.py"]
+
+[tool.ty.analysis]
+allowed-unresolved-imports = [
+    "ddtrace",
+    "ddtrace.trace",
+]
+
+[tool.ty.terminal]
+error-on-warning = false
+
+[[tool.ty.overrides]]
+include = ["openswe/tasks/schemas.py"]
+
+[tool.ty.overrides.rules]
+invalid-mutable-override = "ignore"
+
+[[tool.ty.overrides]]
+include = ["tests/**"]
+
+[tool.ty.overrides.rules]
+invalid-argument-type = "ignore"
+invalid-assignment = "ignore"
+invalid-key = "ignore"
+invalid-return-type = "ignore"
+invalid-type-form = "ignore"
+not-subscriptable = "ignore"
+unresolved-attribute = "ignore"

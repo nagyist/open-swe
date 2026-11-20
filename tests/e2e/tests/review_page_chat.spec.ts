@@ -1,0 +1,1051 @@
+import { test, expect, type Locator, type Page } from "@playwright/test";
+import {
+  SAME_ORIGIN_HEADERS,
+  SAME_USER,
+  loginAs,
+  seedOpenPullRequest,
+  typeIntoComposer,
+  type SeededPullRequest,
+} from "./helpers/dashboard";
+
+// A route handler still reading a response when the test ends must not fail it.
+test.afterEach(async ({ page }) => {
+  await page.unrouteAll({ behavior: "ignoreErrors" });
+});
+
+const OWNER = "fakeorg";
+const REPO = "demo";
+const DESCRIPTION = "Adds the ALPHA and ZETA constant modules.";
+
+function constants(prefix: string, count: number): string {
+  return (
+    Array.from(
+      { length: count },
+      (_, index) => `${prefix}_${index + 1} = ${index + 1}`,
+    ).join("\n") + "\n"
+  );
+}
+
+// alpha.py is long enough that zeta.py starts below the fold, so a chat
+// pointing into zeta.py has to scroll the diff to be seen.
+const FILES = {
+  "alpha.py": constants("ALPHA", 150),
+  "zeta.py": constants("ZETA", 60),
+};
+
+interface ReviewPayload {
+  walkthrough: object | null;
+  walkthrough_scout_thread_id: string | null;
+}
+
+interface FakeReviewComment {
+  body: string;
+  path: string;
+  line: number;
+  side: string;
+  user: { login: string };
+  pull_request_review_id: number;
+}
+
+interface FakeSubmittedReview {
+  id: number;
+  author: string;
+  state: string;
+  body: string;
+}
+
+interface FakePull {
+  number: number;
+  repo: string;
+  review_comments: FakeReviewComment[];
+  reviews: FakeSubmittedReview[];
+  standalone_comment_posts: object[];
+  issue_comments: Array<{ body: string }>;
+}
+
+function reviewApi(pr: SeededPullRequest, suffix = ""): string {
+  return `/dashboard/api/reviews/${OWNER}/${REPO}/${pr.number}${suffix}`;
+}
+
+async function fakePull(page: Page, pr: SeededPullRequest): Promise<FakePull> {
+  const res = await page.request.get("/mock/github/data");
+  expect(res.ok()).toBeTruthy();
+  const pulls = (await res.json()) as FakePull[];
+  const pull = pulls.find(
+    (item) => item.repo === `${OWNER}/${REPO}` && item.number === pr.number,
+  );
+  expect(pull, `no fake PR #${pr.number}`).toBeDefined();
+  return pull as FakePull;
+}
+
+// Pull request numbers restart at 1 after a reset, and the chat and scout
+// threads are keyed by the PR, so an earlier run's history would otherwise
+// load into this one.
+async function forgetReviewThreads(page: Page, pr: SeededPullRequest) {
+  const chat = await page.request.get(reviewApi(pr, "/chat"));
+  expect(chat.ok(), await chat.text()).toBeTruthy();
+  const review = await page.request.get(reviewApi(pr));
+  expect(review.ok(), await review.text()).toBeTruthy();
+  const ids = [
+    ((await chat.json()) as { thread_id: string }).thread_id,
+    ((await review.json()) as ReviewPayload).walkthrough_scout_thread_id,
+  ];
+  for (const id of ids) {
+    if (!id) continue;
+    const res = await page.request.delete(`/threads/${id}`);
+    expect([200, 204, 404], await res.text()).toContain(res.status());
+  }
+}
+
+async function openReview(page: Page, pr: SeededPullRequest) {
+  await page.goto(`/agents/reviews/${OWNER}/${REPO}/${pr.number}`);
+  await expect(
+    page.getByRole("heading", { name: "Changes", exact: true }),
+  ).toBeVisible();
+}
+
+function chatPanel(page: Page): Locator {
+  return page
+    .locator("aside")
+    .filter({ has: page.getByTestId("composer-editor") });
+}
+
+function diffColumn(page: Page): Locator {
+  return page.getByRole("region", { name: "Changes" });
+}
+
+async function openChatTab(page: Page) {
+  const tab = page.getByRole("tab", { name: "Chat", exact: true });
+  if (!(await tab.isVisible()))
+    await page.getByRole("button", { name: "Chat", exact: true }).click();
+  await tab.click();
+  await expect(page.getByTestId("composer-editor")).toBeVisible();
+}
+
+async function sendChat(page: Page, text: string) {
+  await typeIntoComposer(page, text);
+}
+
+let pr: SeededPullRequest;
+
+test.describe("review page", () => {
+  test.use({ viewport: { width: 1600, height: 1000 } });
+  test.beforeEach(async ({ page }) => {
+    await page.request.post("/control/reset");
+    await loginAs(page, SAME_USER);
+    pr = await seedOpenPullRequest(page, {
+      repo: `${OWNER}/${REPO}`,
+      title: "Add constant modules",
+      body: DESCRIPTION,
+      author: "bob",
+      head: "add-constants",
+      files: FILES,
+    });
+    await forgetReviewThreads(page, pr);
+  });
+
+  test("refreshes an unavailable pull request without reloading the page", async ({
+    page,
+  }) => {
+    let recovered = false;
+    let message = "GitHub API rate limit exceeded";
+    await page.route(`**${reviewApi(pr)}`, async (route) => {
+      if (recovered) {
+        await route.continue();
+      } else {
+        await route.fulfill({ status: 403, json: { detail: message } });
+      }
+    });
+    await page.goto(`/agents/reviews/${OWNER}/${REPO}/${pr.number}`);
+    const alert = page.getByRole("alert");
+    await expect(alert).toContainText(message);
+    const timeOrigin = await page.evaluate(() => performance.timeOrigin);
+    const refresh = alert.getByRole("button", { name: "Refresh", exact: true });
+
+    await page.setViewportSize({ width: 375, height: 812 });
+    await expect(refresh).toBeInViewport();
+    message = "GitHub is still rate limited";
+    await refresh.focus();
+    await refresh.press("Enter");
+    await expect(alert).toContainText(message);
+    await expect(refresh).toBeEnabled();
+    await page.setViewportSize({ width: 1280, height: 720 });
+
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await page.route(`**${reviewApi(pr)}`, async (route) => {
+      await gate;
+      await route.fallback();
+    });
+    recovered = true;
+    await refresh.click();
+    await expect(refresh).toBeDisabled();
+    await expect(refresh).toHaveAttribute("aria-busy", "true");
+    release();
+    await expect(alert).toBeHidden();
+    await expect(
+      page.getByRole("heading", { name: "Changes", exact: true }),
+    ).toBeVisible();
+    expect(await page.evaluate(() => performance.timeOrigin)).toBe(timeOrigin);
+  });
+
+  test("opens a review from a pasted or typed pull request link", async ({
+    page,
+  }) => {
+    const target = (url: URL) =>
+      url.pathname === "/agents/reviews" &&
+      url.searchParams.get("pr") === `${OWNER}/${REPO}#${pr.number}`;
+    const link = `https://github.com/${OWNER}/${REPO}/pull/${pr.number}/files?w=1`;
+
+    const input = page.getByLabel("Open a pull request review");
+    // The server-rendered input shows before the client handles it; retry until it does.
+    await page.goto("/agents/reviews");
+    await expect(async () => {
+      await input.clear();
+      await input.fill(`see ${link} thx`);
+      await input.press("Enter");
+      await expect(page).toHaveURL(target, { timeout: 5_000 });
+    }).toPass();
+
+    await page.goto("/agents/reviews");
+    await expect(async () => {
+      await input.focus();
+      await input.evaluate((element, text) => {
+        const data = new DataTransfer();
+        data.setData("text/plain", text);
+        element.dispatchEvent(
+          new ClipboardEvent("paste", {
+            clipboardData: data,
+            bubbles: true,
+            cancelable: true,
+          }),
+        );
+      }, `see ${link} thx`);
+      await expect(page).toHaveURL(target, { timeout: 5_000 });
+    }).toPass();
+  });
+
+  test("keeps the state pill beside the title menu and a separate GitHub link", async ({
+    page,
+  }) => {
+    await openReview(page, pr);
+    const title = page
+      .locator("h2")
+      .filter({ hasText: "Add constant modules" });
+    const menu = title.getByRole("link", { name: /Add constant modules/ });
+    await expect(menu).toContainText("Add constant modules");
+    await expect(menu).not.toContainText(`#${pr.number}`);
+    await page
+      .context()
+      .grantPermissions(["clipboard-read", "clipboard-write"]);
+    const number = page.getByRole("button", {
+      name: `Copy PR number #${pr.number}`,
+      exact: true,
+    });
+    await expect(number).toHaveText(`#${pr.number}`);
+    await number.click();
+    await expect
+      .poll(() => page.evaluate(() => navigator.clipboard.readText()))
+      .toBe(`#${pr.number}`);
+    await expect(page.getByRole("menu")).toBeHidden();
+    const link = page.getByRole("link", {
+      name: "Open on GitHub",
+      exact: true,
+    });
+    await expect(link).toBeVisible();
+    await expect(link).toHaveAttribute(
+      "href",
+      `https://github.com/${OWNER}/${REPO}/pull/${pr.number}`,
+    );
+
+    const pill = title.locator("xpath=../preceding-sibling::span[1]");
+    await expect(pill).toHaveText("Reviewable");
+    const pillBox = await pill.boundingBox();
+    const titleBox = await title.boundingBox();
+    expect(pillBox).not.toBeNull();
+    expect(titleBox).not.toBeNull();
+    const pillMiddle = pillBox!.y + pillBox!.height / 2;
+    expect(pillMiddle).toBeGreaterThan(titleBox!.y);
+    expect(pillMiddle).toBeLessThan(titleBox!.y + titleBox!.height);
+    expect(pillBox!.x + pillBox!.width).toBeLessThanOrEqual(titleBox!.x);
+  });
+
+  test("edits titles with keyboard controls and restores failed drafts", async ({
+    page,
+  }) => {
+    await openReview(page, pr);
+    const edit = page.getByRole("button", { name: "Edit title", exact: true });
+    const input = page.getByRole("textbox", { name: "PR title", exact: true });
+    const save = page.getByRole("button", { name: "Save title", exact: true });
+    await edit.click();
+    await expect(input).toBeFocused();
+    await expect(save).toBeDisabled();
+    await input.fill("Discard this title");
+    await input.press("Escape");
+    await expect(edit).toBeFocused();
+    await edit.click();
+    await expect(input).toHaveValue("Add constant modules");
+    await input.fill("   ");
+    await expect(save).toBeDisabled();
+    await input.fill("Rename constant modules");
+    const compositionHandled = await input.evaluate((element) => {
+      const event = new KeyboardEvent("keydown", {
+        key: "Enter",
+        isComposing: true,
+        bubbles: true,
+        cancelable: true,
+      });
+      element.dispatchEvent(event);
+      return event.defaultPrevented;
+    });
+    expect(compositionHandled).toBe(true);
+    await expect(input).toBeVisible();
+    await input.press("Enter");
+    await expect(input).toBeHidden();
+    await expect(
+      page.getByRole("heading", { level: 2, name: /Rename constant modules/ }),
+    ).toBeVisible();
+    await page.reload();
+    await edit.click();
+    await expect(input).toHaveValue("Rename constant modules");
+    const endpoint = `**${reviewApi(pr, "/title")}`;
+    await page.route(endpoint, (route) =>
+      route.fulfill({
+        status: 403,
+        contentType: "application/json",
+        body: JSON.stringify({
+          detail: "You do not have permission to edit this PR",
+        }),
+      }),
+    );
+    await input.fill("Retry this title");
+    await save.click();
+    await expect(input).toHaveValue("Retry this title");
+    await expect(
+      page.getByText("Couldn't update title", { exact: true }),
+    ).toBeVisible();
+    await page.unroute(endpoint);
+    await save.click();
+    await expect(input).toBeHidden();
+    await page.reload();
+    await expect(
+      page.getByRole("heading", { level: 2, name: /Retry this title/ }),
+    ).toBeVisible();
+  });
+
+  test("edits descriptions, cancels drafts, and keeps failed saves retryable", async ({
+    page,
+  }) => {
+    await page.route("**/monaco-editor/**", (route) => route.abort());
+    await openReview(page, pr);
+    const description = page.getByRole("article", {
+      name: "Description",
+      exact: true,
+    });
+    const edit = description.getByRole("button", { name: "Edit description" });
+    const input = description.getByRole("textbox", { name: "PR description" });
+    const save = description.getByRole("button", { name: "Save description" });
+    await edit.click();
+    await expect(input).toBeFocused();
+    await expect(input).toHaveValue(DESCRIPTION);
+    await expect(save).toBeDisabled();
+    await input.focus();
+    await input.press("ControlOrMeta+A");
+    await page.keyboard.insertText("Discard this draft");
+    await description
+      .getByRole("button", { name: "Cancel", exact: true })
+      .click();
+    await expect(description).toContainText(DESCRIPTION);
+    await edit.click();
+    await expect(input).toHaveValue(DESCRIPTION);
+    const updated = "## Updated description\n\nSaved **from the review page**.";
+    await input.focus();
+    await input.press("ControlOrMeta+A");
+    await page.keyboard.insertText(updated);
+    await input.press("Control+Enter");
+    await expect(input).toBeHidden();
+    await expect(
+      description.getByRole("heading", { name: "Updated description" }),
+    ).toBeVisible();
+    await page.reload();
+    await edit.click();
+    await expect(input).toHaveValue(updated);
+    const endpoint = `**${reviewApi(pr, "/description")}`;
+    await page.route(endpoint, (route) =>
+      route.fulfill({
+        status: 403,
+        contentType: "application/json",
+        body: JSON.stringify({
+          detail: "You do not have permission to edit this PR",
+        }),
+      }),
+    );
+    await input.focus();
+    await input.press("ControlOrMeta+A");
+    await page.keyboard.insertText("Retry this draft");
+    await save.click();
+    await expect(input).toHaveValue("Retry this draft");
+    await expect(
+      page.getByText("Couldn't update description", { exact: true }),
+    ).toBeVisible();
+    await page.unroute(endpoint);
+    await description
+      .getByRole("button", { name: "Cancel", exact: true })
+      .click();
+    await expect(
+      description.getByRole("heading", { name: "Updated description" }),
+    ).toBeVisible();
+    await edit.click();
+    await input.focus();
+    await input.press("ControlOrMeta+A");
+    await input.press("Backspace");
+    await save.click();
+    await expect(
+      description.getByText("No description.", { exact: true }),
+    ).toBeVisible();
+    await page.reload();
+    await expect(
+      description.getByText("No description.", { exact: true }),
+    ).toBeVisible();
+  });
+
+  test("links description references to GitHub without assuming they are pull requests", async ({
+    page,
+  }) => {
+    const linkedPr = await seedOpenPullRequest(page, {
+      repo: `${OWNER}/${REPO}`,
+      title: "Fix issue backlinks",
+      body: `Fixes #4879. See #${pr.number} and ${OWNER}/${REPO}#${pr.number}, plus langchain-ai/langgraph#9252. Leave \`#42\` alone.`,
+      author: "bob",
+      head: "issue-backlinks",
+      files: { "backlinks.py": "FIXED = True\n" },
+    });
+    await page.route(`**${reviewApi(linkedPr)}`, async (route) => {
+      const response = await route.fetch();
+      const detail = await response.json();
+      detail.pr.description_pull_requests = [pr.number];
+      await route.fulfill({ response, json: detail });
+    });
+    await openReview(page, linkedPr);
+    const description = page.getByRole("article", {
+      name: "Description",
+      exact: true,
+    });
+    await expect(
+      description.getByRole("link", { name: "#4879", exact: true }),
+    ).toHaveAttribute(
+      "href",
+      `https://github.com/${OWNER}/${REPO}/issues/4879`,
+    );
+    await expect(
+      description.getByRole("link", {
+        name: "langchain-ai/langgraph#9252",
+        exact: true,
+      }),
+    ).toHaveAttribute(
+      "href",
+      "https://github.com/langchain-ai/langgraph/issues/9252",
+    );
+    for (const name of [`#${pr.number}`, `${OWNER}/${REPO}#${pr.number}`]) {
+      await expect(
+        description.getByRole("link", { name, exact: true }),
+      ).toHaveAttribute(
+        "href",
+        `/agents/reviews/${OWNER}/${REPO}/${pr.number}`,
+      );
+    }
+    await expect(
+      description.getByRole("link", { name: "#42", exact: true }),
+    ).toHaveCount(0);
+    await expect(description.locator("code")).toHaveText("#42");
+  });
+
+  test("keeps description spacing stable when expanding and collapsing", async ({
+    page,
+  }) => {
+    const longPr = await seedOpenPullRequest(page, {
+      repo: `${OWNER}/${REPO}`,
+      title: "Keep description spacing stable",
+      body: Array.from(
+        { length: 24 },
+        (_, index) => `Paragraph ${index + 1}: Description content.`,
+      ).join("\n\n"),
+      author: "bob",
+      head: "description-spacing",
+      files: { "spacing.py": "SPACING = 1\n" },
+    });
+    await openReview(page, longPr);
+    const description = page.getByRole("article", {
+      name: "Description",
+      exact: true,
+    });
+    const offset = () =>
+      description.evaluate((element) => {
+        const header = element.querySelector("header")!;
+        const paragraph = element.querySelector(".chat-markdown p")!;
+        return (
+          paragraph.getBoundingClientRect().top -
+          header.getBoundingClientRect().bottom
+        );
+      });
+    const expand = description.getByRole("button", {
+      name: "Show the whole description",
+    });
+    await expect(expand).toBeVisible();
+    const collapsed = await offset();
+    await expand.click();
+    expect(await offset()).toBeCloseTo(collapsed, 1);
+    await description
+      .getByRole("button", { name: "Show less", exact: true })
+      .click();
+    expect(await offset()).toBeCloseTo(collapsed, 1);
+  });
+
+  test("collapses human input above the description and the changes", async ({
+    page,
+  }) => {
+    const seeded = await page.request.post("/control/walkthrough", {
+      data: {
+        repo: `${OWNER}/${REPO}`,
+        number: pr.number,
+        human_input: "Asked to keep the constants in flat modules",
+      },
+    });
+    expect(seeded.ok(), await seeded.text()).toBeTruthy();
+
+    await openReview(page, pr);
+    const guidance = page.getByRole("group", {
+      name: "Requested changes",
+    });
+    const request = guidance.getByText(
+      "Asked to keep the constants in flat modules",
+    );
+    await expect(guidance).toBeVisible();
+    await expect(request).toBeHidden();
+    const toggle = guidance.locator("summary");
+    await toggle.click();
+    await expect(request).toBeVisible();
+
+    const description = await page.getByText(DESCRIPTION).boundingBox();
+    const card = await guidance.boundingBox();
+    const changes = await page
+      .getByRole("heading", { name: "Changes", exact: true })
+      .boundingBox();
+    expect(description && card && changes).toBeTruthy();
+    expect(card!.y + card!.height).toBeLessThanOrEqual(description!.y);
+    expect(description!.y + description!.height).toBeLessThanOrEqual(
+      changes!.y,
+    );
+    await toggle.press("Enter");
+    await expect(request).toBeHidden();
+  });
+
+  test("dismissing a walkthrough reports whether there was one", async ({
+    page,
+  }) => {
+    const seeded = await page.request.post("/control/walkthrough", {
+      data: { repo: `${OWNER}/${REPO}`, number: pr.number },
+    });
+    expect(seeded.ok(), await seeded.text()).toBeTruthy();
+    const before = (await (
+      await page.request.get(reviewApi(pr))
+    ).json()) as ReviewPayload;
+    expect(before.walkthrough).not.toBeNull();
+
+    const first = await page.request.delete(reviewApi(pr, "/walkthrough"), {
+      headers: SAME_ORIGIN_HEADERS,
+    });
+    expect(first.ok(), await first.text()).toBeTruthy();
+    expect(await first.json()).toEqual({ dismissed: true });
+    const after = (await (
+      await page.request.get(reviewApi(pr))
+    ).json()) as ReviewPayload;
+    expect(after.walkthrough).toBeNull();
+
+    const second = await page.request.delete(reviewApi(pr, "/walkthrough"), {
+      headers: SAME_ORIGIN_HEADERS,
+    });
+    expect(second.ok(), await second.text()).toBeTruthy();
+    expect(await second.json()).toEqual({ dismissed: false });
+  });
+
+  test("shows the scout's error when the walkthrough fails to build", async ({
+    page,
+  }) => {
+    await openReview(page, pr);
+    await expect(page.getByText("Read this PR step by step")).toBeVisible();
+    const build = page.getByRole("button", { name: "Build walkthrough" });
+    await expect(build).toBeEnabled();
+
+    // Every label the button shows from the click to the run's end, so a
+    // one-frame fall back to idle between the request and the poll is caught.
+    await build.evaluate((button) => {
+      const labels: string[] = [button.textContent ?? ""];
+      const callout = button.parentElement!;
+      new MutationObserver(() => {
+        const label =
+          callout.querySelector(":scope > button")?.textContent ?? "";
+        if (labels[labels.length - 1] !== label) labels.push(label);
+      }).observe(callout, {
+        subtree: true,
+        childList: true,
+        characterData: true,
+      });
+      (window as unknown as { buildLabels: string[] }).buildLabels = labels;
+    });
+
+    await build.click();
+    await expect(
+      page.getByRole("button", { name: "Building…" }),
+    ).toBeDisabled();
+    await expect(page.getByText("Building the walkthrough…")).toBeVisible();
+
+    // The scout runs on Managed Deep Agents, whose run error carries what its
+    // backend hook raised.
+    const failure =
+      /RuntimeError: E2E has no sandbox provider for the review scout/;
+    await expect(
+      page.getByText(new RegExp(`^Last attempt failed: .*${failure.source}`)),
+    ).toBeVisible({
+      timeout: 30_000,
+    });
+    await expect(
+      page.getByText("The walkthrough failed to build"),
+    ).toBeVisible();
+    await expect(
+      page.getByText(
+        new RegExp(`^The review scout crashed: .*${failure.source}`),
+      ),
+    ).toBeVisible();
+    await expect(build).toBeEnabled();
+
+    const labels = await page.evaluate(
+      () => (window as unknown as { buildLabels: string[] }).buildLabels,
+    );
+    expect(labels).toEqual([
+      "Build walkthrough",
+      "Building…",
+      "Build walkthrough",
+    ]);
+  });
+
+  test("greets an unreviewed PR without claiming to have reviewed it", async ({
+    page,
+  }) => {
+    await openReview(page, pr);
+    await openChatTab(page);
+    await expect(chatPanel(page).getByTestId("composer-editor")).toBeEditable();
+    await expect(page.getByText("I've reviewed this PR")).toHaveCount(0);
+    await expect(
+      chatPanel(page).getByRole("button", {
+        name: "Walk me through the review findings",
+      }),
+    ).toHaveCount(0);
+  });
+
+  test("clears the line selection when cancelling an inline comment", async ({
+    page,
+  }) => {
+    await openReview(page, pr);
+    const diff = diffColumn(page);
+    await expect(async () => {
+      await diff.locator('[data-column-number="5"]').first().hover();
+      await diff
+        .locator("[data-gutter-utility-slot] button")
+        .click({ timeout: 1000 });
+    }).toPass({ timeout: 10_000 });
+    await expect(diff.getByLabel("Comment body")).toBeVisible();
+    await expect(diff.locator("[data-selected-line]").first()).toBeVisible();
+
+    await diff.getByRole("button", { name: "Cancel", exact: true }).click();
+    await page.getByRole("heading", { name: "Changes", exact: true }).click();
+    await expect(diff.getByLabel("Comment body")).toHaveCount(0);
+    await expect(diff.locator("[data-selected-line]")).toHaveCount(0);
+  });
+
+  test("chat-drafted comments join one pending review that submits together", async ({
+    page,
+  }) => {
+    await openReview(page, pr);
+    await openChatTab(page);
+    await sendChat(page, "E2E_REVIEW_CHAT_COMMENTS leave comments on zeta.py");
+
+    const chatCard = (location: string) =>
+      chatPanel(page)
+        .getByTestId("proposed-comment")
+        .filter({ hasText: location });
+    const inlineCard = (location: string) =>
+      diffColumn(page)
+        .getByTestId("proposed-comment")
+        .filter({ hasText: location });
+    const toPost = "zeta.py:R5";
+    const toDiscard = "zeta.py:R12";
+
+    await expect(chatCard(toPost)).toContainText("Draft review comment", {
+      timeout: 30_000,
+    });
+    await expect(chatCard(toDiscard)).toContainText("Draft review comment");
+    await chatCard(toPost).getByRole("button", { name: toPost }).click();
+    await expect(inlineCard(toPost)).toContainText("Draft review comment");
+    await expect(inlineCard(toPost).getByLabel("Comment body")).toHaveValue(
+      "Rename ZETA_5 to something descriptive.",
+    );
+
+    const edited = "Rename ZETA_5 to GREETING_PREFIX.";
+    await chatCard(toPost).getByLabel("Comment body").fill(edited);
+    await expect(inlineCard(toPost).getByLabel("Comment body")).toHaveValue(
+      edited,
+    );
+    // The diff renders only the lines near the viewport; the card's location
+    // link scrolls the diff to its line.
+    await chatCard(toDiscard).getByRole("button", { name: toDiscard }).click();
+    await expect(inlineCard(toDiscard)).toBeInViewport();
+    await inlineCard(toDiscard)
+      .getByLabel("Comment body")
+      .fill("Edited inline before discarding.");
+    await expect(chatCard(toDiscard).getByLabel("Comment body")).toHaveValue(
+      "Edited inline before discarding.",
+    );
+
+    const added = page.waitForResponse(
+      (response) =>
+        response.url().endsWith(reviewApi(pr, "/pending-review/comments")) &&
+        response.request().method() === "POST",
+    );
+    await chatCard(toPost).getByRole("button", { name: toPost }).click();
+    await expect(inlineCard(toPost)).toBeInViewport();
+    await inlineCard(toPost)
+      .getByRole("button", { name: "Add to review" })
+      .click();
+    const response = await added;
+    expect(response.ok(), await response.text()).toBeTruthy();
+    await expect(chatCard(toPost)).toContainText("Added to your review");
+    await expect(inlineCard(toPost)).toHaveCount(0);
+
+    const pendingCard = diffColumn(page)
+      .getByTestId("pending-review-comment")
+      .filter({ hasText: edited });
+    await expect(pendingCard).toContainText("Pending");
+    // Approving is one click; the rest of the review form is behind its caret.
+    await expect(
+      page.getByRole("button", { name: "Approve, 1 pending comment" }),
+    ).toContainText("1");
+    const reviewButton = page.getByRole("button", {
+      name: "Comment or request changes",
+    });
+
+    await chatCard(toDiscard).getByRole("button", { name: "Discard" }).click();
+    await expect(chatCard(toDiscard)).toContainText("Comment discarded");
+    await expect(inlineCard(toDiscard)).toHaveCount(0);
+
+    // Nothing is visible to anyone else until the review is submitted.
+    let fake = await fakePull(page, pr);
+    const [pending] = fake.reviews;
+    expect(fake.reviews).toHaveLength(1);
+    expect(pending).toMatchObject({
+      state: "PENDING",
+      author: SAME_USER.login,
+    });
+
+    const final = "Rename ZETA_5 to GREETING_PREFIX, please.";
+    await pendingCard.getByRole("button", { name: "Edit" }).click();
+    await diffColumn(page).getByLabel("Pending comment body").fill(final);
+    await diffColumn(page).getByRole("button", { name: "Save" }).click();
+    await expect(
+      diffColumn(page)
+        .getByTestId("pending-review-comment")
+        .filter({ hasText: final }),
+    ).toBeVisible();
+
+    await reviewButton.click();
+    await expect(
+      page.getByText("1 pending comment will be submitted with this review."),
+    ).toBeVisible();
+    await page.getByRole("radio", { name: /Request changes/ }).check();
+    const summary = "A couple of naming nits.";
+    await page.getByLabel("Review summary").fill(summary);
+    const submitted = page.waitForResponse(
+      (res) =>
+        res.url().endsWith(reviewApi(pr, "/submit-review")) &&
+        res.request().method() === "POST",
+    );
+    await page.getByRole("button", { name: "Submit review" }).click();
+    const submitResponse = await submitted;
+    expect(submitResponse.ok(), await submitResponse.text()).toBeTruthy();
+    await expect(
+      diffColumn(page).getByTestId("pending-review-comment"),
+    ).toHaveCount(0);
+
+    fake = await fakePull(page, pr);
+    expect(fake.reviews).toHaveLength(1);
+    expect(fake.reviews[0]).toMatchObject({
+      id: pending.id,
+      state: "CHANGES_REQUESTED",
+      body: summary,
+      author: SAME_USER.login,
+    });
+    const comments = fake.review_comments.filter(
+      (comment) => comment.pull_request_review_id === pending.id,
+    );
+    expect(comments).toHaveLength(1);
+    expect(comments[0]).toMatchObject({
+      body: final,
+      path: "zeta.py",
+      line: 5,
+      side: "RIGHT",
+      user: { login: SAME_USER.login },
+    });
+    expect(fake.standalone_comment_posts).toEqual([]);
+  });
+
+  test("discarding the pending review drops its comments", async ({ page }) => {
+    await openReview(page, pr);
+    await openChatTab(page);
+    await sendChat(page, "E2E_REVIEW_CHAT_COMMENTS leave comments on zeta.py");
+    const card = chatPanel(page)
+      .getByTestId("proposed-comment")
+      .filter({ hasText: "zeta.py:R5" });
+    await expect(card).toContainText("Draft review comment", {
+      timeout: 30_000,
+    });
+    await card.getByRole("button", { name: "Add to review" }).click();
+    await expect(card).toContainText("Added to your review");
+    await expect(
+      page.getByRole("button", { name: "Approve, 1 pending comment" }),
+    ).toContainText("1");
+
+    await page
+      .getByRole("button", { name: "Comment or request changes" })
+      .click();
+    await page.getByRole("button", { name: "Discard review" }).click();
+    await expect(
+      page.getByRole("button", { name: "Approve", exact: true }),
+    ).toBeVisible();
+    await expect(
+      diffColumn(page).getByTestId("pending-review-comment"),
+    ).toHaveCount(0);
+
+    const fake = await fakePull(page, pr);
+    expect(fake.reviews).toEqual([]);
+    expect(fake.review_comments).toEqual([]);
+    expect(fake.standalone_comment_posts).toEqual([]);
+  });
+
+  test("shows the conversation timeline and posts a top-level comment", async ({
+    page,
+  }) => {
+    await openReview(page, pr);
+    await page.getByRole("button", { name: "Chat", exact: true }).click();
+    await page.getByRole("tab", { name: /Discussion/ }).click();
+    const conversation = page.getByRole("region", { name: "Conversation" });
+    await expect(conversation).toBeVisible();
+
+    const comment = "Thanks, taking a look now.";
+    await conversation
+      .getByRole("textbox", { name: "Comment on this pull request" })
+      .fill(comment);
+    await page
+      .getByRole("complementary", { name: "Chat and discussion" })
+      .getByRole("button", { name: "Close", exact: true })
+      .click();
+    await expect(conversation).toBeHidden();
+    await page.getByRole("button", { name: "Chat", exact: true }).click();
+    await page.getByRole("tab", { name: /Discussion/ }).click();
+    await expect(
+      conversation.getByRole("textbox", {
+        name: "Comment on this pull request",
+      }),
+    ).toHaveValue(comment);
+    await conversation
+      .getByRole("button", { name: "Comment", exact: true })
+      .click();
+    await expect(conversation.getByText(comment)).toBeVisible();
+
+    await page
+      .getByRole("button", { name: "Comment or request changes" })
+      .click();
+    const verdict = "Approving the constant modules.";
+    await page.getByLabel("Review summary").fill(verdict);
+    await page.getByRole("radio", { name: /Approve/ }).check();
+    await page
+      .getByRole("button", { name: "Cancel", exact: true })
+      .press("Meta+Enter");
+    await expect(page.getByLabel("Review summary")).toBeVisible();
+    expect((await fakePull(page, pr)).reviews).toHaveLength(0);
+    await page.getByRole("button", { name: "Cancel", exact: true }).click();
+    await page
+      .getByRole("button", { name: "Comment or request changes" })
+      .click();
+    await page.getByRole("radio", { name: /Approve/ }).check();
+    await page.getByRole("radio", { name: /Approve/ }).press("Meta+Enter");
+    await expect(conversation.getByText(verdict)).toBeVisible();
+    await expect(
+      conversation.getByText("approved", { exact: true }),
+    ).toBeVisible();
+
+    const fake = await fakePull(page, pr);
+    expect(fake.issue_comments.map((item) => item.body)).toContain(comment);
+    expect(fake.reviews).toHaveLength(1);
+    expect(fake.reviews[0]).toMatchObject({ state: "APPROVED", body: verdict });
+  });
+
+  test("drafts a whole-PR review the user submits with a chosen verdict", async ({
+    page,
+  }) => {
+    await openReview(page, pr);
+    await openChatTab(page);
+    await sendChat(page, "E2E_REVIEW_CHAT_REVIEW draft a review for me");
+
+    const card = chatPanel(page).getByTestId("proposed-review");
+    await expect(card).toContainText("Draft review", { timeout: 30_000 });
+    const verdict = card.getByRole("radiogroup", { name: "Review verdict" });
+    await expect(
+      verdict.getByRole("radio", { name: "Comment" }),
+    ).toHaveAttribute("aria-checked", "true");
+    await expect(verdict.getByRole("radio", { name: "Approve" })).toBeVisible();
+    await expect(card.getByLabel("Review body")).toHaveValue(
+      "Looks reasonable overall.",
+    );
+
+    await verdict.getByRole("radio", { name: "Request changes" }).click();
+    await expect(
+      verdict.getByRole("radio", { name: "Request changes" }),
+    ).toHaveAttribute("aria-checked", "true");
+    const body = "Please add tests before merging.";
+    await card.getByLabel("Review body").fill(body);
+
+    const submitted = page.waitForResponse(
+      (response) =>
+        response.url().endsWith(reviewApi(pr, "/submit-review")) &&
+        response.request().method() === "POST",
+    );
+    await card.getByRole("button", { name: "Submit as you" }).click();
+    const response = await submitted;
+    expect(response.ok(), await response.text()).toBeTruthy();
+    await expect(card).toContainText("Review submitted: Request changes");
+
+    const reviews = (await fakePull(page, pr)).reviews;
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0]).toMatchObject({
+      author: SAME_USER.login,
+      state: "CHANGES_REQUESTED",
+      body,
+    });
+    expect((await fakePull(page, pr)).standalone_comment_posts).toEqual([]);
+  });
+
+  test("Robin queues commands for the page it chats beside, which the page carries out in order", async ({
+    page,
+  }) => {
+    await openReview(page, pr);
+    await openChatTab(page);
+    await sendChat(page, "E2E_REVIEW_PAGE_TOOLS point me at ZETA_44");
+
+    // Each tool answers at once with its command's place in the page's queue;
+    // Robin then waits for the page to carry them out and reads what it listed.
+    await expect(
+      chatPanel(page).getByText(
+        "Queued page commands at positions 1, 2, 3, 4, 5. The page ran 5 of 5; it lists alpha.py, zeta.py.",
+      ),
+    ).toBeVisible({ timeout: 60_000 });
+
+    // The page hears its queue change and carries the commands out.
+    await expect(
+      diffColumn(page).getByText("Showing 1 of 2 matching “zeta”"),
+    ).toBeVisible();
+    await expect(page.getByLabel("Find in files and changes")).toHaveValue(
+      "ZETA_44",
+    );
+    // zeta.py starts below alpha.py's 150 lines, so the draft is only in view
+    // because the page scrolled the diff to it.
+    const draft = diffColumn(page).getByLabel("Comment body");
+    await expect(draft).toHaveValue("Could ZETA_44 get a descriptive name?");
+    await expect(draft).toBeInViewport();
+
+    // A draft is the person's to post: nothing reached GitHub.
+    const fake = await fakePull(page, pr);
+    expect(fake.review_comments).toEqual([]);
+    expect(fake.reviews).toEqual([]);
+
+    // The tools are Robin's alone; a browser's own agent never sees them.
+    const browserTools = await page.evaluate(async () => {
+      const context = (
+        document as Document & {
+          modelContext?: { getTools(): Promise<Array<{ name: string }>> };
+        }
+      ).modelContext;
+      return context ? (await context.getTools()).map((tool) => tool.name) : [];
+    });
+    expect(browserTools).not.toContain("review_show_code");
+  });
+
+  test("Robin moves to a walkthrough step and marks steps and files viewed", async ({
+    page,
+  }) => {
+    const seeded = await page.request.post("/control/walkthrough", {
+      data: {
+        repo: `${OWNER}/${REPO}`,
+        number: pr.number,
+        title: "Both constant modules",
+      },
+    });
+    expect(seeded.ok(), await seeded.text()).toBeTruthy();
+    await openReview(page, pr);
+    // Robin's step tool switches the diff to the walkthrough's order itself.
+    await page.evaluate(() =>
+      localStorage.setItem("open-swe.review.view", "files"),
+    );
+    await page.reload();
+    await openChatTab(page);
+    await expect(
+      page.getByRole("button", { name: "0 / 2 viewed", exact: true }),
+    ).toBeVisible();
+
+    await sendChat(page, "E2E_REVIEW_PAGE_STEPS walk me through it");
+    await expect(
+      chatPanel(page).getByText("The page ran 3 of 3 walkthrough commands."),
+    ).toBeVisible({ timeout: 60_000 });
+
+    // The whole step was marked viewed, then alpha.py handed back unviewed.
+    await expect(
+      page.getByRole("button", { name: "1 / 2 viewed", exact: true }),
+    ).toBeVisible();
+    await expect(
+      diffColumn(page).getByText("Both constant modules").first(),
+    ).toBeVisible();
+  });
+
+  test("opens the chat in place on a narrow window", async ({ page }) => {
+    await page.setViewportSize({ width: 1000, height: 800 });
+    await openReview(page, pr);
+    const open = page.getByRole("button", { name: "Chat", exact: true });
+    await expect(open).toBeVisible();
+    await expect(page.getByTestId("composer-editor")).toBeHidden();
+
+    await open.click();
+    const chat = chatPanel(page);
+    await expect(diffColumn(page)).toBeHidden();
+    await expect(page.getByRole("dialog")).toHaveCount(0);
+    await openChatTab(page);
+    await sendChat(page, "E2E_REVIEW_CHAT_PLAIN what does this add?");
+    await expect(
+      chat.getByText("The pull request adds two constant modules."),
+    ).toBeVisible({ timeout: 30_000 });
+
+    await page.reload();
+    await expect(open).toBeVisible();
+    await open.click();
+    await expect(chat).toBeVisible();
+    await openChatTab(page);
+    await expect(
+      chat.getByText("The pull request adds two constant modules."),
+    ).toBeVisible();
+    await expect(chat).toBeVisible();
+    const input = chat.getByTestId("composer-editor");
+    await input.pressSequentially("follow-up question");
+    await expect(input).toHaveText("follow-up question");
+    await expect(chat).toBeVisible();
+  });
+});

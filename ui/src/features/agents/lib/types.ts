@@ -1,0 +1,730 @@
+import type { TaskEventMetadata } from "./structuredInputMessages"
+import type { PassageReply } from "@/features/agents/utils/passageReply"
+
+export type Author = "user" | "agent" | "system" | "tool"
+
+export type ChunkKind =
+  | "text"
+  | "reasoning"
+  | "code"
+  | "error"
+  | "list"
+  | "tool-execution"
+  | "todo"
+  | "image"
+
+export type TodoStatus = "pending" | "in_progress" | "completed"
+
+export type AgentStatus =
+  | "idle"
+  | "running"
+  | "finished"
+  | "interrupted"
+  | "error"
+
+export type AgentSource =
+  | "dashboard"
+  | "github"
+  | "slack"
+  | "linear"
+  | "schedule"
+  | "claude_code"
+
+export type AgentThreadCategory =
+  | "interactive"
+  | "issue"
+  | "pull_request"
+  | "automation"
+  | "review"
+  | "system"
+
+export type AgentTriggerKind =
+  | "user"
+  | "schedule"
+  | "schedule_test"
+  | "wakeup"
+  | "reviewer"
+  | "ci_autofix"
+  | "slack_bot"
+
+export interface TodoItem {
+  content: string
+  status: TodoStatus
+}
+
+export type AcpToolKind =
+  | "read"
+  | "edit"
+  | "delete"
+  | "move"
+  | "search"
+  | "execute"
+  /** `background_execute` — a shell command started in the background. */
+  | "background"
+  | "think"
+  | "fetch"
+  | "slack"
+  | "linear"
+  | "sql"
+  | "managed-tools"
+  /** deepagents `task` tool — spawns a subagent; rendered as a subagent card. */
+  | "task"
+  /** Code mode's `eval` tool — runs code that may call other tools. */
+  | "code"
+  | "other"
+
+export type AcpToolStatus = "pending" | "in_progress" | "completed" | "error"
+
+export interface AcpToolLocation {
+  path: string
+  line?: number
+}
+
+export interface DiffData {
+  originalContent: string | null
+  newContent: string
+  filePath: string
+  isNewFile: boolean
+  isBinary: boolean
+  isTruncated: boolean
+  totalLines: number
+}
+
+export type OutputIframeDisplay =
+  | {
+      type: "output_iframe"
+      previewUrl: string
+      downloadUrl: string
+      title: string
+      filename: string
+    }
+  | {
+      type: "output_iframe"
+      html: string
+      title: string
+      filename: string
+    }
+
+export interface ToolExecutionChunk {
+  kind: "tool-execution"
+  toolCallId: string
+  toolName?: string
+  /** Stable arrival time for the tool call, shown on hover. */
+  timestamp?: string
+  title: string
+  toolKind: AcpToolKind
+  input?: Record<string, unknown>
+  status: AcpToolStatus
+  output?: string
+  /**
+   * Fetches the call's full output, for sources that only hold a preview (the
+   * transcript log keeps large outputs out of its snapshot). Present only when
+   * there is more output than {@link output} already shows.
+   */
+  loadOutput?: () => Promise<string>
+  display?: OutputIframeDisplay
+  /** Images the tool returned alongside its text, such as a browser screenshot. */
+  images?: Array<AnyImageChunk>
+  elapsedMs?: number
+  approvalRequestId?: string
+  diffData?: DiffData
+  diffs?: Array<DiffData>
+  locations?: Array<AcpToolLocation>
+  /**
+   * Namespace of the subagent this `task` call spawned, from the SDK's
+   * `stream.subagents` discovery map (correlated by tool-call id). Present only
+   * for `toolKind: "task"` chunks whose subagent the SDK has discovered; lets
+   * the UI open a scoped `useToolCalls(stream, { namespace })` subscription to
+   * show the subagent's nested activity.
+   */
+  subagentNamespace?: Array<string>
+  /**
+   * The tool calls a `code` chunk's code made, in order. When present the row
+   * shows them instead of the code's raw output.
+   */
+  calls?: Array<ToolExecutionChunk>
+}
+
+export interface TextChunk {
+  kind: "text"
+  text: string
+  /** When the agent message that wrote it started; bounds the work around it. */
+  timestamp?: string
+}
+
+export interface ReasoningChunk {
+  kind: "reasoning"
+  text: string
+}
+
+export interface CodeChunk {
+  kind: "code"
+  text: string
+  language?: string
+}
+
+export interface ErrorChunk {
+  kind: "error"
+  text: string
+}
+
+export interface ListChunk {
+  kind: "list"
+  lines: Array<string>
+}
+
+export interface TodoChunk {
+  kind: "todo"
+  todos: Array<TodoItem>
+}
+
+/** An image carried inline, which is what a composer upload produces. */
+export interface ImageChunk {
+  kind: "image"
+  base64: string
+  mimeType: string
+  fileName?: string
+}
+
+/** What a page around a thread puts in its composer; a new `key` puts it there again. */
+export interface ComposerDraft {
+  key: number
+  text: string
+  images?: ReadonlyArray<ImageChunk>
+}
+
+/**
+ * An image the transcript references rather than inlines: the log stores
+ * metadata plus either an attachment id addressing bytes on our own API, or a
+ * third-party URL recorded with the message.
+ *
+ * `credentials` says how the bytes are reachable — `"session"` needs the
+ * session cookie, so the URL is fetched and shown through a blob URL rather
+ * than handed to `<img src>` (a cross-origin dashboard deployment would
+ * otherwise depend on the browser sending a third-party cookie for an image);
+ * `"none"` is a plain URL the browser loads itself.
+ */
+export interface RemoteImageChunk {
+  kind: "image"
+  url: string
+  credentials: "session" | "none"
+  mimeType?: string
+  fileName?: string
+}
+
+/** Either image form, as a renderer receives it from `Chunk`. */
+export type AnyImageChunk = ImageChunk | RemoteImageChunk
+
+export interface TaskEventChunk {
+  kind: "task-event"
+  messageId: string
+  event: TaskEventMetadata
+  timestamp?: string
+}
+
+export type Chunk =
+  | TaskEventChunk
+  | TextChunk
+  | ReasoningChunk
+  | CodeChunk
+  | ErrorChunk
+  | ListChunk
+  | ToolExecutionChunk
+  | TodoChunk
+  | ImageChunk
+  | RemoteImageChunk
+
+export interface Message {
+  id: string
+  author: Author
+  timestamp: string
+  deliveryStatus?: "sending" | "failed"
+  deliveryError?: string
+  deliveryTurnId?: string
+  optimistic?: boolean
+  structuredSenderId?: string
+  structuredSenderKind?: "person" | "system"
+  structuredSenderName?: string
+  /** GitHub login of a dashboard sender, so a pending message can borrow their label. */
+  structuredSenderLogin?: string
+  structuredSenderNote?: string
+  structuredSenderIsBot?: boolean
+  structuredSurface?: string
+  slackMessageUrl?: string
+  slackOccurredAt?: number
+  /** Passages the sender selected and replied to, carried in the message's envelope. */
+  replies?: Array<PassageReply>
+  taskEvent?: TaskEventMetadata
+  /**
+   * What the context a plugin sent with this message is called, such as the
+   * open page; the agent read the context itself, which the thread never shows.
+   */
+  contextLabel?: string
+  turnId?: string
+  /** Id of the user message that opened this agent run and keys its diff artifact. */
+  turnKey?: string
+  /** Invocations an agent turn's model calls ran under; key their costs in `AgentThread.runCosts`. */
+  invocationIds?: Array<string>
+  /** Timestamp of the first message in an agent turn; used to derive work duration. */
+  startedAt?: string
+  runStartedAt?: string
+  completedAt?: string
+  timestampIsFallback?: boolean
+  chunks: Array<Chunk>
+  hidden?: boolean
+}
+
+export interface LocalRepo {
+  id: string
+  path: string
+  name: string
+  createdAt: number
+  lastOpenedAt: number
+  gitBranch?: string
+}
+
+export type GitHubTriggerEvent =
+  | "issues.opened"
+  | "pull_request.opened"
+  | "pull_request.closed"
+  | "pull_request.merged"
+
+export type SlackTriggerEvent = "message.posted"
+export type SlackTriggerSenders = "anyone" | "people" | "bots"
+export type LinearTriggerEvent =
+  | "issue.created"
+  | "issue.labeled"
+  | "issue.accepted"
+
+/** One way an automation fires; `kind` names the provider, the rest are its filters. */
+export type AutomationTriggerConfig =
+  | { kind: "schedule"; cron: string; timezone?: string }
+  | {
+      kind: "github"
+      repo: string
+      events: Array<GitHubTriggerEvent>
+      /** Globs on a pull request's head branch that skip it, e.g. `actions/*`. */
+      head_branches_exclude?: Array<string>
+      /** Globs the pull request's base branch must match, when any are listed. */
+      base_branches?: Array<string>
+      /** Its creator confirmed it may fire on a public repository. */
+      allow_public_repo?: boolean
+    }
+  | {
+      kind: "slack"
+      channel: string
+      events: Array<SlackTriggerEvent>
+      senders?: SlackTriggerSenders
+      /** Case-insensitive regular expression the message text must match. */
+      match?: string | null
+      max_runs_per_hour?: number | null
+    }
+  | {
+      kind: "linear"
+      /** Team key, e.g. ENG. */
+      team: string
+      events: Array<LinearTriggerEvent>
+      labels?: Array<string>
+      project?: string | null
+      max_runs_per_hour?: number | null
+    }
+
+export type AutomationTriggerProvider = AutomationTriggerConfig["kind"]
+
+/** The event providers an automation can run on, each with its events' labels. */
+export const AUTOMATION_EVENT_PROVIDERS = {
+  github: {
+    label: "GitHub",
+    events: {
+      "issues.opened": "Issue opened",
+      "pull_request.opened": "PR opened",
+      "pull_request.closed": "PR closed",
+      "pull_request.merged": "PR merged",
+    } satisfies Record<GitHubTriggerEvent, string>,
+  },
+  slack: {
+    label: "Slack",
+    events: {
+      "message.posted": "Message posted",
+    } satisfies Record<SlackTriggerEvent, string>,
+  },
+  linear: {
+    label: "Linear",
+    events: {
+      "issue.created": "Issue created",
+      "issue.labeled": "Label added",
+      "issue.accepted": "Accepted from Triage",
+    } satisfies Record<LinearTriggerEvent, string>,
+  },
+} as const
+
+export interface AgentSchedule {
+  id: string
+  name: string
+  prompt: string
+  schedule: string | null
+  triggers: Array<AutomationTriggerConfig & { id: string }>
+  scope: "system"
+  adminThread: boolean
+  model: string
+  effort?: string | null
+  enabled: boolean
+  cronId?: string | null
+  lastThreadId?: string | null
+  lastRunId?: string | null
+  lastTriggeredAt?: string | null
+  lastError?: string | null
+  lastErrorAt?: string | null
+  ownerId?: string | null
+  /** Robin's, not its creator's: only admins manage it. */
+  system?: boolean
+  createdBy?: string | null
+  updatedBy?: string | null
+  createdAt?: string | null
+  updatedAt?: string | null
+}
+
+export interface QueuedThreadMessage {
+  id: string
+  content: string
+  images?: Array<AnyImageChunk>
+  replies?: Array<PassageReply>
+  createdAt: number
+  /** The server has not acknowledged it yet, so it cannot be sent now or cancelled. */
+  pending?: boolean
+  /** False when someone else sent it: only its sender may send it now or cancel it. */
+  mine?: boolean
+  /** Held in the thread's queue for the agent's next model call, with no run of its own. */
+  waitsForAgent?: boolean
+  sender?: string | null
+}
+
+/** A message in the thread's queue, as `/threads/{id}/queued-messages` returns it. */
+export interface AgentBackgroundCommand {
+  task_id: string
+  command: string | null
+  status: string
+  started_at: number | null
+}
+
+export interface AgentThreadMonitor {
+  monitor_id: string
+  description: string
+  command: string
+  filter: string
+  status: string
+  started_at: number | null
+  timeout: number | null
+  events: number
+  raw_lines: number
+}
+
+/** An event subscription that wakes the thread when a matching event arrives. */
+export interface AgentEventListener {
+  subscription_id: string
+  /** The pull request URL, repository, or "Robin events" it listens on. */
+  target: string
+  sources: Array<string>
+  event_types: Array<string>
+  instructions: string
+  one_shot: boolean
+  trigger_count: number
+  last_triggered_at: number | null
+  expires_at: number
+  created_at: number | null
+}
+
+/** The sandbox commands, monitors and event listeners keeping a thread busy. */
+export interface AgentBackgroundWork {
+  commands: Array<AgentBackgroundCommand>
+  monitors: Array<AgentThreadMonitor>
+  /** Absent from servers older than the listing of event subscriptions. */
+  listeners?: Array<AgentEventListener>
+}
+
+/** The last lines a background command or monitor wrote. */
+export interface AgentBackgroundOutput {
+  output: string
+}
+
+export interface AgentQueuedMessage {
+  id: string
+  text: string
+  sender: string | null
+  platform: string | null
+  queued_at: string | null
+}
+
+export interface PendingThreadMessage extends Omit<
+  QueuedThreadMessage,
+  "images" | "pending" | "mine"
+> {
+  images?: Array<ImageChunk>
+  replies?: Array<PassageReply>
+  /** `sent`: the server took it; the transcript just doesn't have it yet. */
+  status: "sending" | "sent" | "failed"
+  /** Sent to queue behind the live run, so it renders as a queued row. */
+  queued?: boolean
+  /** Why delivery failed, e.g. `503 Service Unavailable`. */
+  error?: string
+}
+
+export type WorkflowApprovalStatus = "pending" | "approved" | "rejected"
+
+export interface WorkflowDiffStats {
+  files: number
+  additions: number
+  deletions: number
+}
+
+export interface WorkflowPushApproval {
+  coordinatorStatus?: "approved" | "rejected" | null
+  fingerprint: string
+  status: WorkflowApprovalStatus
+  repo: string
+  branch: string
+  baseSha: string
+  headSha: string
+  files: Array<string>
+  diffStats: WorkflowDiffStats
+  diffPreview: string
+  diffPreviewTruncated: boolean
+  inheritedFrom: string | null
+  approvalUrl: string | null
+  requestedAt: string | null
+  decidedAt: string | null
+  decidedBy: string | null
+}
+
+export interface WorkflowPushApprovalsResponse {
+  threadId: string
+  approvals: Array<WorkflowPushApproval>
+}
+
+export interface AgentPullRequestSummary {
+  number: number
+  title: string
+  state: "draft" | "open" | "merged" | "closed"
+  headRef: string
+  baseRef: string
+  url: string
+}
+
+export interface AgentPullRequest extends AgentPullRequestSummary {
+  repoFullName: string
+  author: string | null
+  authorAvatarUrl: string | null
+  createdAt: string | null
+  diffStats: {
+    files: number
+    additions: number
+    deletions: number
+  }
+}
+
+export interface AgentPullRequestHealth {
+  repoFullName: string | null
+  number: number | null
+  url: string | null
+  statusAvailable: boolean
+  state: "open" | "merged" | "closed" | null
+  isDraft: boolean | null
+  mergeConflictState: "mergeable" | "conflicting" | "unknown" | null
+  checksAvailable: boolean
+  failingChecks: Array<{
+    name: string
+    conclusion: string | null
+    url: string | null
+  }>
+  pendingCheckCount: number | null
+  inconclusiveCheckCount: number | null
+  commentsAvailable: boolean
+  unresolvedReviewThreadCount: number | null
+  unresolvedReviewThreads: Array<{
+    author: string | null
+    body: string
+    path: string
+    line: number | null
+    url: string | null
+  }>
+}
+
+export interface AgentPullRequestStatusResponse {
+  pullRequests: Array<AgentPullRequestHealth>
+}
+
+/** What a thread-view fix prompt covers: conflicts and checks together, or comments. */
+export type ThreadFixScope = "repair" | "comments"
+
+export interface AgentPullRequestContextResponse {
+  context: {
+    repoFullName: string
+    number: number
+    url: string
+    headSha: string | null
+    mergeState: string | null
+    reviewDecision: string | null
+    checksAvailable: boolean
+    checks: Array<{
+      name: string
+      status: string
+      conclusion: string | null
+      required: boolean | null
+      url: string | null
+    }>
+    reviewsAvailable: boolean
+    changesRequestedReviews: Array<{
+      author: string
+      body: string
+      url: string | null
+    }>
+    unresolvedReviewThreads: Array<{
+      path: string
+      line: number | null
+      isOutdated: boolean
+      commentsTruncated: boolean
+      comments: Array<{
+        author: string
+        body: string
+        url: string | null
+      }>
+    }>
+    truncated: boolean
+  }
+  prompt: string
+}
+
+export interface ReviewPageRef {
+  owner: string
+  repo: string
+  number: number
+}
+
+export type AgentSubagentStatus = "in_progress" | "completed" | "error"
+
+/**
+ * A subagent the thread spawned with the `task` tool, as the sidebar lists it
+ * under the thread. `toolCallId` is the `task` call's id, which is also the
+ * last segment of the namespace every event the subagent emitted carries.
+ */
+export interface AgentSubagentSummary {
+  toolCallId: string
+  /** The first line of the task description. */
+  title: string
+  subagentType: string
+  status: AgentSubagentStatus
+  startedAt: number
+  endedAt: number | null
+}
+
+export type TaskMembership =
+  | { role: "coordinator"; taskId: string }
+  | { role: "worker"; taskId: string; coordinatorThreadId: string | null }
+
+export interface AgentThread {
+  pendingWorkflowApproval?: boolean
+  waitingForDelegatedWork?: boolean
+  taskMembership?: TaskMembership
+  taskWorkers?: Array<AgentThread>
+  ownerLogin?: string | null
+  ownerId?: string | null
+  visibility?: "public" | "private"
+  id: string
+  /** Set on a PR review listed in the sidebar: its row opens this review page. */
+  reviewPage?: ReviewPageRef
+  /** Root-level subagents, oldest first; only transcript-log threads report them. */
+  subagents?: Array<AgentSubagentSummary>
+  /**
+   * Transcript source for the thread, from its LangGraph metadata. `"v2"` means
+   * the append-only event log serves it; absent means the SDK stream does.
+   */
+  transcript?: "v2"
+
+  title: string
+  repo: string
+  repoFullName: string
+  /** The Open SWE project the thread was started in or moved to. */
+  projectId?: string | null
+  branch: string
+  model: string
+  effort?: string | null
+  modelSelection?: "auto" | "explicit" | null
+  planStatus?: string | null
+  adminThread?: boolean
+  concierge?: boolean
+  source?: AgentSource
+  origin?: AgentSource | string
+  threadCategory?: AgentThreadCategory | string
+  triggerKind?: AgentTriggerKind | string
+  /** The allowed Slack bot that started the thread; the dashboard cannot steer it. */
+  triggeringBot?: { key: string; name: string } | null
+  automationId?: string | null
+  automationName?: string | null
+  automationActionPosted?: boolean
+  automationCanPost?: boolean | null
+  status: AgentStatus
+  viewed: boolean
+  latestRunId?: string | null
+  unreadResponseId?: string | null
+  viewedAt?: number | null
+  resolved?: boolean
+  resolvedAt?: number | null
+  createdAt: number
+  updatedAt: number
+  traceUrl?: string | null
+  /** LangSmith cost of the thread's finished runs so far, in USD. */
+  costUsd?: number | null
+  /** LangSmith cost of each finished run, in USD, by invocation id. */
+  runCosts?: Record<string, number>
+  sourceUrl?: string | null
+  sourceAppUrl?: string | null
+  sandboxId?: string | null
+  /**
+   * The thread's LangSmith browser: "opened" once the agent or a person has
+   * opened it, "available" while it can be opened, null before the agent's
+   * first run names it.
+   */
+  browser?: "opened" | "available" | null
+  messages: Array<Message>
+  pendingMessages?: Array<PendingThreadMessage>
+  pr?: AgentPullRequestSummary
+  pullRequests?: Array<AgentPullRequest>
+  diffStats?: {
+    files: number
+    additions: number
+    deletions: number
+  }
+  changedFiles?: Array<{
+    path: string
+    additions: number
+    deletions: number
+    patch?: string
+  }>
+}
+
+export type GitFileStatus =
+  | "index-modified"
+  | "index-added"
+  | "index-deleted"
+  | "index-renamed"
+  | "index-copied"
+  | "modified"
+  | "deleted"
+  | "untracked"
+  | "ignored"
+  | "type-changed"
+  | "intent-to-add"
+  | "both-modified"
+  | "both-added"
+  | "both-deleted"
+  | "added-by-us"
+  | "added-by-them"
+  | "deleted-by-us"
+  | "deleted-by-them"
+
+export interface GitStatusEntry {
+  path: string
+  status: GitFileStatus
+  staged: boolean
+  originalPath?: string
+}

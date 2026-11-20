@@ -1,0 +1,326 @@
+/*
+ * Chat markdown rendering. The element renderers in
+ * `features/agents/components/chat/Markdown.tsx` emit plain semantic HTML and
+ * this sheet does the styling, so nested lists, task lists, tables and alerts
+ * behave the way markdown authors expect without a class on every node.
+ */
+
+.chat-markdown > :first-child {
+  margin-top: 0;
+}
+
+.chat-markdown > :last-child {
+  margin-bottom: 0;
+}
+
+.chat-markdown p,
+.chat-markdown ul,
+.chat-markdown ol,
+.chat-markdown blockquote,
+.chat-markdown pre {
+  margin: 0.65rem 0;
+}
+
+.chat-markdown h1,
+.chat-markdown h2,
+.chat-markdown h3,
+.chat-markdown h4,
+.chat-markdown h5,
+.chat-markdown h6 {
+  margin: 1.25rem 0 0.5rem;
+  font-weight: 600;
+  line-height: 1.3;
+  color: var(--text-primary);
+}
+
+.chat-markdown h1 {
+  font-size: 1.125rem;
+}
+
+.chat-markdown h2 {
+  font-size: 1rem;
+}
+
+.chat-markdown h3,
+.chat-markdown h4,
+.chat-markdown h5,
+.chat-markdown h6 {
+  font-size: 0.875rem;
+}
+
+.chat-markdown h6 {
+  color: var(--text-secondary);
+}
+
+/* `--list-gutter` is inherited, so both list types reset it: a nested list
+   under an ol widened for 3+ character markers keeps its own default. */
+.chat-markdown ul {
+  --list-gutter: 1.25rem;
+  padding-left: 1.25rem;
+  list-style-type: disc;
+}
+
+.chat-markdown ol {
+  --list-gutter: 1.25rem;
+  padding-left: var(--list-gutter, 1.25rem);
+  list-style-type: decimal;
+}
+
+.chat-markdown ol > li::marker {
+  font-variant-numeric: tabular-nums;
+}
+
+.chat-markdown ul ul {
+  list-style-type: circle;
+}
+
+.chat-markdown ul ul ul {
+  list-style-type: square;
+}
+
+.chat-markdown ol ol {
+  list-style-type: lower-alpha;
+}
+
+.chat-markdown ol ol ol {
+  list-style-type: lower-roman;
+}
+
+.chat-markdown li {
+  margin: 0;
+}
+
+.chat-markdown li + li,
+.chat-markdown li > ul,
+.chat-markdown li > ol {
+  margin-top: 0.25rem;
+}
+
+.chat-markdown li > p {
+  margin: 0;
+}
+
+/* GitHub-style task lists: the checkbox replaces the list marker. */
+.chat-markdown li.task-list-item {
+  list-style-type: none;
+}
+
+.chat-markdown li.task-list-item input[type="checkbox"] {
+  margin: 0 0.35em 0.15em calc(-1 * var(--list-gutter, 1.25rem));
+  vertical-align: middle;
+  accent-color: var(--bg-brand);
+}
+
+/* Markdown assumes inline images; the Tailwind preflight's block-level img
+   would stack a row of badges one per line. */
+.chat-markdown img {
+  display: inline-block;
+  max-width: 100%;
+  border-radius: 0.375rem;
+}
+
+.chat-markdown a {
+  color: var(--text-brand-primary);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.chat-markdown a:hover,
+.chat-markdown a:focus-visible {
+  text-decoration-style: dotted;
+}
+
+.chat-markdown blockquote {
+  border-left: 2px solid var(--border-default);
+  padding-left: 0.8rem;
+  color: var(--text-secondary);
+}
+
+/* GitHub alerts: an alert's body is ordinary text under a coloured title, so it
+   is not muted like a quote. Colours come from the semantic palette. */
+.chat-markdown [data-alert] {
+  --alert: var(--text-brand-primary);
+  --alert-foreground: var(--text-brand-primary);
+  margin: 0.65rem 0;
+  border-left: 2px solid var(--alert);
+  padding-left: 0.8rem;
+}
+
+.chat-markdown [data-alert="tip"] {
+  --alert: var(--icon-success);
+  --alert-foreground: var(--text-success-secondary);
+}
+
+.chat-markdown [data-alert="important"] {
+  --alert: var(--merged, var(--bg-brand));
+  --alert-foreground: var(--merged-foreground, var(--bg-brand));
+}
+
+.chat-markdown [data-alert="warning"] {
+  --alert: var(--icon-warning);
+  --alert-foreground: var(--text-warning-secondary);
+}
+
+.chat-markdown [data-alert="caution"] {
+  --alert: var(--text-error-secondary);
+  --alert-foreground: var(--text-error-secondary);
+}
+
+.chat-markdown [data-alert] > p:first-child {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+  margin-top: 0;
+  font-weight: 500;
+  color: var(--alert-foreground);
+}
+
+.chat-markdown [data-alert] > :last-child {
+  margin-bottom: 0;
+}
+
+.chat-markdown :not(pre) > code {
+  border-radius: 0.375rem;
+  background: var(--bg-surface-level-1-hover);
+  padding: 0.1rem 0.35rem;
+  color: var(--text-primary);
+  font-size: 0.8125rem;
+  overflow-wrap: anywhere;
+}
+
+.chat-markdown hr {
+  margin: 0.9rem 0;
+  border-color: color-mix(in srgb, var(--border-default) 60%, transparent);
+}
+
+.chat-markdown section[data-footnotes] {
+  margin-top: 1.25rem;
+  border-top: 1px solid var(--border-default);
+  padding-top: 0.75rem;
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+}
+
+.chat-markdown section[data-footnotes] h2 {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-secondary);
+}
+
+/* Tables scroll horizontally rather than squeezing columns to single
+   characters, which the root's `overflow-wrap: anywhere` would otherwise do. */
+.chat-markdown .chat-markdown-table {
+  margin: 0.65rem 0;
+  min-width: 0;
+}
+
+[data-transcript-scroll] .chat-markdown-table {
+  width: max(100%, calc(50cqw + 50% - 1.25rem));
+}
+
+.chat-markdown-table [data-table-scroll-edge] {
+  display: none;
+}
+
+.chat-markdown-table:has([data-table-scroll-edge="left"]) {
+  --table-fade-left: transparent;
+}
+
+.chat-markdown-table:has([data-table-scroll-edge="right"]) {
+  --table-fade-right: transparent;
+}
+
+.chat-markdown-table [role="region"] {
+  mask-image: linear-gradient(
+    to right,
+    var(--table-fade-left, var(--text-primary)),
+    var(--text-primary) 2rem,
+    var(--text-primary) calc(100% - 2rem),
+    var(--table-fade-right, var(--text-primary))
+  );
+}
+
+.chat-markdown table {
+  width: 100%;
+  min-width: max-content;
+  border-collapse: collapse;
+  overflow-wrap: normal;
+  word-break: normal;
+  font-size: 0.8125rem;
+}
+
+.chat-markdown th,
+.chat-markdown td {
+  padding: 0.45rem 0.75rem;
+  text-align: left;
+  max-width: 24rem;
+  overflow-wrap: anywhere;
+}
+
+.chat-markdown thead th {
+  border-bottom: 1px solid var(--border-default);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.chat-markdown tbody tr + tr td {
+  border-top: 1px solid color-mix(in srgb, var(--border-default) 60%, transparent);
+}
+
+.chat-markdown details {
+  margin: 0.65rem 0;
+  border-radius: 0.5rem;
+  border: 1px solid var(--border-default);
+  padding: 0.4rem 0.7rem;
+}
+
+.chat-markdown summary {
+  cursor: pointer;
+  font-weight: 500;
+}
+
+/* A GitHub PR link: the Open SWE review page, then a GitHub mark. */
+.pr-link-chip {
+  display: inline-flex;
+  align-items: stretch;
+  overflow: hidden;
+  border: 1px solid var(--border-default);
+  border-radius: 0.375rem;
+  vertical-align: baseline;
+  line-height: 1.4;
+}
+
+.pr-link-chip > a {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 0.35rem;
+  text-decoration: none;
+}
+
+.pr-link-chip > a:first-child {
+  background: var(--bg-surface-level-1);
+  color: var(--text-brand-primary);
+  font-weight: 500;
+}
+
+.pr-link-chip > a + a {
+  border-left: 1px solid var(--border-default);
+  color: var(--text-secondary);
+}
+
+.pr-link-chip > a:hover,
+.pr-link-chip > a:focus-visible {
+  background: var(--bg-surface-level-1-hover);
+}
+
+.pr-link-chip > a:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: -2px;
+}
+
+/* A pull request card styles its own links. */
+.chat-markdown .pr-card a {
+  color: inherit;
+  text-decoration: none;
+}

@@ -1,0 +1,618 @@
+import { test, expect, type Locator, type Page } from "@playwright/test";
+import {
+  SAME_USER,
+  loginAs,
+  readPullRequest,
+  seedOpenPullRequest,
+  setRepoMergeMethods,
+  type SeededPullRequest,
+  type SeedPullRequestOptions,
+} from "./helpers/dashboard";
+
+const DEMO = "fakeorg/demo";
+const COMPANION = "anotherorg/companion";
+
+// The three card statuses the per-card actions key off, as overallStatus()
+// derives them: a conflict wins over a failing check, and Approved needs a
+// clean merge state, no failing checks and an APPROVED review.
+const approved: SeedPullRequestOptions = {
+  mergeable: true,
+  mergeable_state: "clean",
+  reviews: [{ author: "reviewer", state: "APPROVED" }],
+};
+const conflicted: SeedPullRequestOptions = {
+  mergeable: false,
+  mergeable_state: "dirty",
+};
+const failing: SeedPullRequestOptions = {
+  mergeable: true,
+  mergeable_state: "clean",
+  check_runs: [
+    { name: "unit-tests", status: "completed", conclusion: "failure" },
+  ],
+};
+
+function card(page: Page, pr: SeededPullRequest) {
+  return page
+    .getByRole("listitem")
+    .filter({ hasText: new RegExp(`${pr.repo} #${pr.number}(?!\\d)`) });
+}
+
+async function openMine(page: Page) {
+  await page.goto("/agents/reviews");
+  await expect(
+    page.getByRole("heading", { name: "Pull Requests" }),
+  ).toBeVisible();
+}
+
+async function expectStatus(target: Locator, status: string) {
+  await expect(target).toContainText(status, { timeout: 15_000 });
+}
+
+test.describe("my pull requests", () => {
+  test.beforeEach(async ({ page }) => {
+    await page.request.post("/control/reset");
+    await loginAs(page, SAME_USER);
+  });
+
+  test("finds description-only matches in My PRs and the command palette", async ({
+    page,
+  }) => {
+    const own = await seedOpenPullRequest(page, {
+      repo: DEMO,
+      title: "Improve deployment reliability",
+      body: "Prevent aardvark deployment rollback outages.",
+      ...approved,
+    });
+    const theirs = await seedOpenPullRequest(page, {
+      repo: DEMO,
+      title: "Someone else's deployment change",
+      body: "Prevent aardvark outages too.",
+      author: "bob",
+      ...approved,
+    });
+    for (const pr of [own, theirs]) {
+      const response = await page.request.get(
+        `/fake-gh/repos/${pr.repo}/pulls/${pr.number}`,
+      );
+      const delivered = await page.request.post("/control/github-event", {
+        data: {
+          event: "pull_request",
+          payload: {
+            action: "edited",
+            repository: { full_name: pr.repo, private: false },
+            pull_request: await response.json(),
+            installation: { id: 42 },
+            sender: { login: "alice" },
+          },
+        },
+      });
+      expect(delivered.ok()).toBeTruthy();
+    }
+    await openMine(page);
+    await page.getByRole("button", { name: "To Review", exact: true }).click();
+    await page.getByRole("button", { name: "Mine", exact: true }).click();
+    const search = page.getByRole("textbox", { name: "Search pull requests" });
+    await search.fill("aardvark");
+    await expect(card(page, own)).toContainText(
+      "Improve deployment reliability",
+    );
+    await expect(card(page, theirs)).toHaveCount(0);
+    await page.goBack();
+    await expect(
+      page.getByRole("button", { name: "To Review", exact: true }),
+    ).toHaveAttribute("aria-pressed", "true");
+    await page.goForward();
+    await expect(search).toHaveValue("aardvark");
+    await search.blur();
+    await page.keyboard.press("Control+k");
+    await page
+      .getByPlaceholder("Search commands, threads, and pull requests…")
+      .fill("aardvark");
+    const result = page.getByRole("option", {
+      name: /Improve deployment reliability/,
+    });
+    await expect(result).toBeVisible();
+    await result.click();
+    await expect(page).toHaveURL(
+      (url) =>
+        url.pathname === "/agents/reviews" &&
+        url.searchParams.get("pr") === `fakeorg/demo#${own.number}`,
+    );
+  });
+
+  test("lists the signed-in user's open PRs with live status", async ({
+    page,
+  }) => {
+    const ok = await seedOpenPullRequest(page, {
+      repo: DEMO,
+      title: "Approved change",
+      ...approved,
+    });
+    const conflict = await seedOpenPullRequest(page, {
+      repo: COMPANION,
+      title: "Conflicting change",
+      ...conflicted,
+    });
+    const broken = await seedOpenPullRequest(page, {
+      repo: DEMO,
+      title: "Failing change",
+      ...failing,
+    });
+    const theirs = await seedOpenPullRequest(page, {
+      repo: DEMO,
+      title: "Someone else's change",
+      author: "bob",
+      ...approved,
+    });
+
+    await openMine(page);
+
+    await expectStatus(card(page, ok), "Approved");
+    await expect(card(page, ok)).toContainText("Approved change");
+    await expectStatus(card(page, conflict), "Conflicted");
+    await expect(card(page, conflict)).toContainText(COMPANION);
+    await expectStatus(card(page, broken), "Failing");
+    await expect(card(page, broken)).toContainText("unit-tests");
+
+    await expect(card(page, theirs)).toHaveCount(0);
+    await expect(page.getByText("Someone else's change")).toHaveCount(0);
+  });
+
+  test("switches PR list and files in one pane and preserves the review route", async ({
+    page,
+  }) => {
+    const mine = await seedOpenPullRequest(page, {
+      repo: DEMO,
+      title: "My authored change",
+      head: "my-authored-change",
+      body: "The complete review workspace stays beside the list.",
+      files: { "change.py": "VALUE = 1\n" },
+      ...approved,
+    });
+    const other = await seedOpenPullRequest(page, {
+      repo: DEMO,
+      title: "Another authored change",
+      head: "another-authored-change",
+      files: { "another.py": "VALUE = 3\n" },
+      ...approved,
+    });
+    const theirs = await seedOpenPullRequest(page, {
+      repo: DEMO,
+      title: "Someone else's change",
+      head: "someone-elses-change",
+      author: "bob",
+      files: { "other.py": "VALUE = 2\n" },
+      ...approved,
+    });
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("/agents");
+    const sidebar = page.locator("[data-sidebar-frame]");
+    const pullRequests = sidebar.getByRole("link", { name: "Pull Requests" });
+    await pullRequests.click();
+    await expect(sidebar).toHaveCount(0);
+    await page
+      .getByRole("textbox", { name: "Search pull requests" })
+      .fill("authored");
+    await card(page, mine)
+      .getByText("My authored change", { exact: true })
+      .click();
+    const workspace = page.getByRole("region", {
+      name: "Selected pull request",
+    });
+    await expect(
+      workspace.getByRole("heading", { name: "Changes", exact: true }),
+    ).toBeVisible();
+    await expect(sidebar).toHaveCount(0);
+    await expect(workspace).toContainText(
+      "The complete review workspace stays beside the list.",
+    );
+    await expect(
+      page.getByRole("link", { name: "Reviewer", exact: true }),
+    ).toHaveCount(0);
+    await expect(page.getByRole("group", { name: "Review queue" })).toHaveCount(
+      0,
+    );
+    const navigator = page.getByRole("navigation", {
+      name: "Files & Walkthrough",
+    });
+    const prList = page.getByRole("button", { name: "PR list", exact: true });
+    const rail = page.getByRole("complementary", {
+      name: "Chat and discussion",
+    });
+    await expect(navigator).toContainText("change.py");
+    await expect(rail.getByRole("tab", { name: /^Discussion/ })).toBeVisible();
+    await rail.getByRole("button", { name: "Close", exact: true }).click();
+    await expect(rail).toBeHidden();
+    await expect(
+      page.getByRole("textbox", { name: "Search pull requests" }),
+    ).toBeHidden();
+    await prList.click();
+    await expect(navigator).toBeHidden();
+    await expect(
+      workspace.getByRole("heading", { name: "Changes", exact: true }),
+    ).toBeVisible();
+    await expect(
+      page.getByRole("textbox", { name: "Search pull requests" }),
+    ).toHaveValue("authored");
+    await page
+      .getByRole("button", {
+        name: `fakeorg/demo #${other.number} Another authored change Approved`,
+        exact: true,
+      })
+      .click();
+    await expect(
+      workspace.getByRole("heading", { name: /Another authored change/ }),
+    ).toBeVisible();
+    await expect(rail).toBeHidden();
+    await expect(navigator).toContainText("another.py");
+    await prList.click();
+    await expect
+      .poll(async () => {
+        const rows = await page
+          .getByRole("region", { name: "My open pull requests", exact: true })
+          .getByRole("listitem")
+          .all();
+        if (rows.length < 2) return false;
+        const first = await rows[0]!.boundingBox();
+        const second = await rows[1]!.boundingBox();
+        return (
+          first !== null &&
+          second !== null &&
+          first.y + first.height <= second.y + 1
+        );
+      })
+      .toBe(true);
+    await page.goto(
+      `/agents/reviews/fakeorg/demo/${theirs.number}?q=no-matches#discussion`,
+    );
+    await expect(
+      workspace.getByRole("heading", { name: /Someone else's change/ }),
+    ).toBeVisible();
+    await expect(page).toHaveURL(
+      (url) =>
+        url.pathname === "/agents/reviews" &&
+        url.searchParams.get("pr") === `fakeorg/demo#${theirs.number}` &&
+        url.searchParams.get("q") === "no-matches" &&
+        url.hash === "#discussion",
+    );
+    await page.setViewportSize({ width: 640, height: 900 });
+    await expect(workspace).toBeVisible();
+    await expect(navigator).toBeHidden();
+    await prList.click();
+    await expect(workspace).toBeHidden();
+    await page
+      .getByRole("button", { name: "Files & Walkthrough", exact: true })
+      .click();
+    await expect(navigator).toContainText("other.py");
+    await expect(
+      page.getByRole("dialog", { name: "Files & Walkthrough" }),
+    ).toHaveCount(0);
+    await page.getByRole("button", { name: "Review", exact: true }).click();
+    await expect(workspace).toBeVisible();
+    await page
+      .getByRole("button", { name: "Close PR details", exact: true })
+      .click();
+    await expect(
+      page.getByRole("textbox", { name: "Search pull requests" }),
+    ).toHaveValue("no-matches");
+    await expect(page).toHaveURL((url) => !url.searchParams.has("pr"));
+    await page.getByRole("button", { name: "Back to threads" }).click();
+    await expect(page).toHaveURL(/\/agents$/);
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await expect(pullRequests).toBeVisible();
+  });
+
+  test("queues requested reviews before own drafts and keeps marked-ready PRs open", async ({
+    page,
+  }) => {
+    const files = {
+      "constants.py": Array.from(
+        { length: 150 },
+        (_, index) => `VALUE_${index} = ${index}`,
+      ).join("\n"),
+    };
+    const mine = await seedOpenPullRequest(page, {
+      repo: DEMO,
+      title: "My authored change",
+      draft: true,
+      files,
+      ...approved,
+    });
+    const assigned = await seedOpenPullRequest(page, {
+      repo: DEMO,
+      title: "Assigned to Alice",
+      author: "bob",
+      files,
+      ...approved,
+    });
+    const unassigned = await seedOpenPullRequest(page, {
+      repo: COMPANION,
+      title: "Not assigned to Alice",
+      author: "bob",
+      ...approved,
+    });
+    const requested = await page.request.post(
+      `/fake-gh/repos/fakeorg/demo/pulls/${assigned.number}/requested_reviewers`,
+      { data: { reviewers: [SAME_USER.login] } },
+    );
+    expect(requested.ok()).toBeTruthy();
+
+    await openMine(page);
+    await expect(card(page, mine)).toBeVisible();
+    await page.getByRole("button", { name: "To Review", exact: true }).click();
+    await expect(card(page, assigned)).toBeVisible();
+    await expect(card(page, mine)).toBeVisible();
+    await expect(card(page, unassigned)).toHaveCount(0);
+    const titles = await page.getByRole("listitem").allTextContents();
+    expect(
+      titles.findIndex((text) => text.includes("Assigned to Alice")),
+    ).toBeLessThan(
+      titles.findIndex((text) => text.includes("My authored change")),
+    );
+    await page.getByText("Review one by one (2)").click();
+    await expect(page).toHaveURL(
+      (url) => url.searchParams.get("pr") === `fakeorg/demo#${assigned.number}`,
+    );
+    const changes = page.locator(".review-code-view");
+    await expect
+      .poll(() => changes.evaluate((node) => node.scrollHeight))
+      .toBeGreaterThan(1500);
+    await changes.evaluate((node) => {
+      node.scrollTop = 1500;
+    });
+    await expect
+      .poll(() => changes.evaluate((node) => node.scrollTop))
+      .toBeGreaterThan(1000);
+    await page
+      .getByRole("button", { name: "Approve & next", exact: true })
+      .click();
+    await expect(page).toHaveURL(
+      (url) => url.searchParams.get("pr") === `fakeorg/demo#${mine.number}`,
+    );
+    await expect.poll(() => changes.evaluate((node) => node.scrollTop)).toBe(0);
+    const readyResponse = page.waitForResponse(
+      (response) =>
+        new URL(response.url()).pathname ===
+          `/dashboard/api/repos/fakeorg/demo/pulls/${mine.number}/action` &&
+        response.request().method() === "POST",
+    );
+    await page
+      .locator("header")
+      .getByRole("button", { name: "Mark ready", exact: true })
+      .click();
+    expect((await readyResponse).ok()).toBeTruthy();
+    await expect(
+      page.getByRole("button", { name: "Finish", exact: true }),
+    ).toBeVisible();
+    await expect(page).toHaveURL(
+      (url) => url.searchParams.get("pr") === `fakeorg/demo#${mine.number}`,
+    );
+    await page.getByRole("button", { name: "Finish", exact: true }).click();
+    await expect(page).toHaveURL(/tab=to-review/);
+    await expect(
+      page.getByText("Nothing to review. You’re all caught up."),
+    ).toBeVisible();
+    expect(
+      (await readPullRequest(page, "fakeorg", "demo", mine.number)).draft,
+    ).toBe(false);
+  });
+
+  test("closes a pull request from its own card after confirmation", async ({
+    page,
+  }) => {
+    const mine = await seedOpenPullRequest(page, {
+      repo: DEMO,
+      title: "Close me",
+      ...conflicted,
+    });
+    const other = await seedOpenPullRequest(page, {
+      repo: COMPANION,
+      title: "Keep me",
+      ...approved,
+    });
+
+    await openMine(page);
+    await expectStatus(card(page, mine), "Conflicted");
+
+    await card(page, mine)
+      .getByRole("button", { name: "Close", exact: true })
+      .click();
+    const dialog = page.getByRole("dialog");
+    await expect(
+      dialog.getByRole("heading", { name: `Close ${DEMO}#${mine.number}?` }),
+    ).toBeVisible();
+
+    await dialog.getByRole("button", { name: "Cancel" }).click();
+    await expect(dialog).toHaveCount(0);
+    await expect(card(page, mine)).toBeVisible();
+
+    await card(page, mine)
+      .getByRole("button", { name: "Close", exact: true })
+      .click();
+    await page
+      .getByRole("dialog")
+      .getByRole("button", { name: "Close pull request" })
+      .click();
+
+    await expect(page.getByText(`Closed ${DEMO}#${mine.number}`)).toBeVisible();
+    await expect(card(page, mine)).toContainText("Closed ·");
+    await expect(
+      card(page, mine).getByRole("button", { name: "Close", exact: true }),
+    ).toHaveCount(0);
+
+    expect(
+      (await readPullRequest(page, "fakeorg", "demo", mine.number)).state,
+    ).toBe("closed");
+    expect(
+      (await readPullRequest(page, "anotherorg", "companion", other.number))
+        .state,
+    ).toBe("open");
+  });
+
+  test("takes a draft out of draft from its own card", async ({ page }) => {
+    const draft = await seedOpenPullRequest(page, {
+      repo: DEMO,
+      title: "Still a draft",
+      draft: true,
+      ...approved,
+    });
+    const ready = await seedOpenPullRequest(page, {
+      repo: COMPANION,
+      title: "Already ready",
+      ...approved,
+    });
+
+    await openMine(page);
+    await expectStatus(card(page, draft), "Draft");
+    await expect(
+      card(page, ready).getByRole("button", { name: "Mark ready" }),
+    ).toHaveCount(0);
+
+    await card(page, draft).getByRole("button", { name: "Mark ready" }).click();
+    await expect(
+      page.getByText(`Marked ${DEMO}#${draft.number} ready for review`),
+    ).toBeVisible();
+
+    expect(
+      (await readPullRequest(page, "fakeorg", "demo", draft.number)).draft,
+    ).toBe(false);
+    await expect(card(page, draft)).not.toContainText("Draft");
+  });
+
+  test("offers a fix only on the cards that are broken", async ({ page }) => {
+    const conflict = await seedOpenPullRequest(page, {
+      repo: DEMO,
+      title: "Fix the conflict",
+      ...conflicted,
+    });
+    const broken = await seedOpenPullRequest(page, {
+      repo: COMPANION,
+      title: "Fix the checks",
+      ...failing,
+    });
+    const ok = await seedOpenPullRequest(page, {
+      repo: DEMO,
+      title: "Nothing to fix",
+      ...approved,
+    });
+
+    await openMine(page);
+    await expectStatus(card(page, conflict), "Conflicted");
+    await expectStatus(card(page, broken), "Failing");
+    await expectStatus(card(page, ok), "Approved");
+
+    const fixButtons = (pr: SeededPullRequest) =>
+      card(page, pr).getByRole("button", { name: "Fix up", exact: true });
+    const fix = fixButtons(broken);
+    await expect(fix).toBeEnabled();
+    await expect(fixButtons(broken)).toHaveCount(1);
+    await expect(fixButtons(conflict)).toBeEnabled();
+    await expect(fixButtons(conflict)).toHaveCount(1);
+    await expect(fixButtons(ok)).toHaveCount(0);
+
+    // The fix opens a thread and dispatches a real run, so wait on the
+    // response: a rejected one names the reason instead of timing out on the
+    // toast that never arrives.
+    const dispatched = page.waitForResponse(
+      (response) =>
+        response.url().includes(`/${broken.number}/thread`) &&
+        response.request().method() === "POST",
+      { timeout: 30_000 },
+    );
+    await fix.click();
+    const response = await dispatched;
+    expect(response.status(), await response.text()).toBe(200);
+    await expect(
+      page.getByText(`Fix up queued for ${COMPANION}#${broken.number}`),
+    ).toBeVisible();
+  });
+
+  test("offers only the merge method the repository allows", async ({
+    page,
+  }) => {
+    await setRepoMergeMethods(page, DEMO, ["rebase"]);
+    const mine = await seedOpenPullRequest(page, {
+      repo: DEMO,
+      title: "Rebase me",
+      ...approved,
+    });
+    const other = await seedOpenPullRequest(page, {
+      repo: COMPANION,
+      title: "Leave me open",
+      ...approved,
+    });
+
+    await openMine(page);
+    await expectStatus(card(page, mine), "Approved");
+
+    const method = card(page, mine).getByLabel(
+      `Merge method for PR #${mine.number}`,
+    );
+    await expect(method).toBeHidden();
+    await card(page, mine)
+      .getByRole("button", { name: "Rebase and merge", exact: true })
+      .click();
+
+    await expect(page.getByText(`Merged ${DEMO}#${mine.number}`)).toBeVisible();
+    await expect(card(page, mine)).toContainText("Merged ·");
+    await expect(
+      card(page, mine).getByRole("button", {
+        name: "Rebase and merge",
+        exact: true,
+      }),
+    ).toHaveCount(0);
+
+    const merged = await readPullRequest(page, "fakeorg", "demo", mine.number);
+    expect(merged.merged).toBe(true);
+    expect(merged.merge_method).toBe("rebase");
+    expect(
+      (await readPullRequest(page, "anotherorg", "companion", other.number))
+        .merged,
+    ).toBe(false);
+  });
+
+  test("defaults to squash while allowing a different method on the card", async ({
+    page,
+  }) => {
+    await setRepoMergeMethods(page, DEMO, ["squash", "rebase"]);
+    const mine = await seedOpenPullRequest(page, {
+      repo: DEMO,
+      title: "Pick one",
+      ...approved,
+    });
+
+    await openMine(page);
+    await expectStatus(card(page, mine), "Approved");
+
+    const method = card(page, mine).getByLabel(
+      `Merge method for PR #${mine.number}`,
+    );
+    await expect(
+      card(page, mine).getByRole("button", {
+        name: "Squash and merge",
+        exact: true,
+      }),
+    ).toBeEnabled();
+    await expect(method).toBeEnabled();
+    await method.click();
+    await expect(
+      page.getByRole("menuitemradio", { name: /^Merge commit/ }),
+    ).toHaveCount(0);
+
+    await page.getByRole("menuitemradio", { name: /^Squash merge/ }).click();
+    await page.keyboard.press("Escape");
+    const merge = card(page, mine).getByRole("button", {
+      name: "Squash and merge",
+      exact: true,
+    });
+    await expect(merge).toBeEnabled();
+    await merge.click();
+
+    await expect(page.getByText(`Merged ${DEMO}#${mine.number}`)).toBeVisible();
+    expect(
+      (await readPullRequest(page, "fakeorg", "demo", mine.number))
+        .merge_method,
+    ).toBe("squash");
+  });
+});

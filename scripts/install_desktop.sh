@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$(uname -s)" != "Darwin" ]]; then
+  echo "Robin Desktop can only be installed with this command on macOS." >&2
+  exit 1
+fi
+
+for command in node ditto; do
+  command -v "$command" >/dev/null || {
+    echo "Missing $command. Install Node.js, then try again." >&2
+    exit 1
+  }
+done
+
+command -v bun >/dev/null || {
+  echo "Missing bun. Install it from https://bun.com/docs/installation, then try again." >&2
+  exit 1
+}
+
+# Node 25 dropped the bundled corepack shim, so neither launcher is guaranteed.
+if command -v pnpm >/dev/null; then
+  pnpm=(pnpm)
+elif command -v corepack >/dev/null; then
+  pnpm=(corepack pnpm)
+else
+  echo "Missing pnpm. Install it from https://pnpm.io/installation, then try again." >&2
+  exit 1
+fi
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+"${pnpm[@]}" install --frozen-lockfile
+rm -rf desktop/dist
+"${pnpm[@]}" --dir desktop run pack
+
+apps=(desktop/dist/mac*/"Robin.app")
+if [[ ${#apps[@]} -ne 1 || ! -d "${apps[0]}" ]]; then
+  echo "Could not find the packaged Robin application." >&2
+  exit 1
+fi
+
+system_app="/Applications/Robin.app"
+user_app="$HOME/Applications/Robin.app"
+if [[ -w /Applications ]]; then
+  target="$system_app"
+else
+  mkdir -p "$HOME/Applications"
+  target="$user_app"
+fi
+
+if [[ -e "$target" ]]; then
+  target_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$target/Contents/Info.plist" 2>/dev/null || true)"
+  if [[ "$target_id" != "com.langchain.openswe" ]]; then
+    echo "Refusing to replace $target because its bundle ID could not be verified." >&2
+    exit 1
+  fi
+fi
+
+staged="${target}.installing.$$"
+trap 'rm -rf "$staged"' EXIT
+ditto "${apps[0]}" "$staged"
+osascript -e 'tell application id "com.langchain.openswe" to quit' >/dev/null 2>&1 || true
+rm -rf "$target"
+mv "$staged" "$target"
+trap - EXIT
+legacy_app="${target%/*}/Open SWE.app"
+if [[ -d "$legacy_app" ]]; then
+  legacy_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$legacy_app/Contents/Info.plist" 2>/dev/null || true)"
+  if [[ "$legacy_id" == "com.langchain.openswe" ]]; then
+    rm -rf "$legacy_app"
+  else
+    echo "Left $legacy_app in place because its bundle ID could not be verified." >&2
+  fi
+fi
+open "$target"
+echo "Robin Desktop installed at $target"

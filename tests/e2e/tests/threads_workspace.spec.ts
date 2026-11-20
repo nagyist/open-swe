@@ -1,0 +1,1044 @@
+import {
+  expect,
+  test,
+  type APIRequestContext,
+  type Locator,
+  type Page,
+} from "@playwright/test";
+
+import {
+  dismissOnboardingIfShown,
+  seedRepoSidebar,
+  waitForThreadIdle,
+} from "./helpers/dashboard";
+
+// A route handler still reading a response when the test ends must not fail it.
+test.afterEach(async ({ page }) => {
+  await page.unrouteAll({ behavior: "ignoreErrors" });
+});
+
+const USER = {
+  login: "threads-workspace-e2e",
+  email: "threads-workspace-e2e@example.com",
+};
+const ADMIN_USER = { login: "alice", email: "alice@example.com" };
+const BASE_URL = `http://127.0.0.1:${process.env.E2E_PORT ?? 2024}`;
+const SAME_ORIGIN_HEADERS = { origin: BASE_URL, referer: `${BASE_URL}/` };
+const WORKSPACE_QUERY = "E2E Workspace";
+
+const THREAD_IDS = {
+  attention: "71000000-0000-4000-8000-000000000001",
+  error: "71000000-0000-4000-8000-000000000002",
+  interrupted: "71000000-0000-4000-8000-000000000006",
+  running: "71000000-0000-4000-8000-000000000003",
+  ready: "71000000-0000-4000-8000-000000000004",
+  done: "71000000-0000-4000-8000-000000000005",
+  shared: "71000000-0000-4000-8000-000000000007",
+  dailyScheduled: "73000000-0000-4000-8000-000000000001",
+  dailyTest: "73000000-0000-4000-8000-000000000002",
+  weeklyRunning: "73000000-0000-4000-8000-000000000003",
+  noRepo: "74000000-0000-4000-8000-000000000001",
+  pinnedRepo: "74000000-0000-4000-8000-000000000002",
+} as const;
+
+const TITLES = {
+  attention: "E2E Workspace Review auth failure",
+  error: "E2E Workspace Repair deployment",
+  interrupted: "E2E Workspace Interrupted release",
+  running: "E2E Workspace Running refactor",
+  ready: "E2E Workspace Ready docs",
+  done: "E2E Workspace Resolved cleanup",
+  shared: "E2E Workspace Teammate incident",
+  dailyScheduled: "E2E Workspace Daily health scheduled run",
+  dailyTest: "E2E Workspace Daily health test run",
+  weeklyRunning: "E2E Workspace Weekly cleanup running",
+  noRepo: "E2E Workspace No repository chat",
+  pinnedRepo: "E2E Workspace Pinned repository chat",
+} as const;
+
+// Filled in by seedSchedules: the dashboard API assigns automation ids.
+const SCHEDULE_IDS = { daily: "", weekly: "" };
+
+interface ThreadSeed {
+  id: string;
+  metadata: Record<string, unknown>;
+}
+
+const createdThreadIds = new Set<string>();
+const createdScheduleIds = new Set<string>();
+
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+async function loginAs(page: Page) {
+  const response = await page.request.post("/control/login", { data: USER });
+  expect(response.ok()).toBeTruthy();
+  await seedRepoSidebar(page);
+}
+
+function baseMetadata(
+  now: number,
+  title: string,
+  updatedOffset: number,
+  overrides: Record<string, unknown>,
+): Record<string, unknown> {
+  return {
+    participant_logins: { [USER.login]: true },
+    owner_login: USER.login,
+    title,
+    source: "dashboard",
+    origin: "dashboard",
+    thread_category: "interactive",
+    trigger_kind: "user",
+    repo_owner: "acme",
+    repo_name: "alpha",
+    base_branch: "main",
+    branch_name: "open-swe/e2e-workspace",
+    created_at_ms: now - 120_000,
+    updated_at_ms: now - updatedOffset,
+    ...overrides,
+  };
+}
+
+function workspaceThreads(): Array<ThreadSeed> {
+  const now = Date.now();
+  return [
+    {
+      id: THREAD_IDS.attention,
+      metadata: baseMetadata(now, TITLES.attention, 1_000, {
+        source: "github",
+        origin: "github",
+        thread_category: "pull_request",
+        latest_run_id: "e2e-run-attention",
+        latest_run_status: "success",
+        pr_number: 82,
+        pr_url: "https://github.com/acme/alpha/pull/82",
+        pr_title: TITLES.attention,
+        pr_state: "draft",
+        diff_stats: { files: 3, additions: 18, deletions: 4 },
+      }),
+    },
+    {
+      id: THREAD_IDS.error,
+      metadata: baseMetadata(now, TITLES.error, 2_000, {
+        source: "linear",
+        origin: "linear",
+        repo_name: "delta",
+        latest_run_id: "e2e-run-error",
+        latest_run_status: "error",
+      }),
+    },
+    {
+      id: THREAD_IDS.interrupted,
+      metadata: baseMetadata(now, TITLES.interrupted, 2_500, {
+        source: "github",
+        origin: "github",
+        repo_name: "epsilon",
+        latest_run_id: "e2e-run-interrupted",
+        latest_run_status: "interrupted",
+      }),
+    },
+    {
+      id: THREAD_IDS.running,
+      metadata: baseMetadata(now, TITLES.running, 3_000, {
+        source: "slack",
+        origin: "slack",
+        repo_name: "beta",
+        latest_run_id: "e2e-run-running",
+        latest_run_status: "running",
+      }),
+    },
+    {
+      id: THREAD_IDS.ready,
+      metadata: baseMetadata(now, TITLES.ready, 4_000, {
+        repo_name: "gamma",
+        latest_run_id: "e2e-run-ready",
+        latest_run_status: "success",
+        last_viewed_run_id: "e2e-run-ready",
+        last_viewed_at_ms: now - 3_500,
+        pr_number: 84,
+        pr_url: "https://github.com/acme/gamma/pull/84",
+        pr_title: TITLES.ready,
+        pr_state: "open",
+      }),
+    },
+    {
+      id: THREAD_IDS.done,
+      metadata: baseMetadata(now, TITLES.done, 5_000, {
+        source: "github",
+        origin: "github",
+        latest_run_id: "e2e-run-done",
+        latest_run_status: "success",
+        last_viewed_run_id: "e2e-run-done",
+        last_viewed_at_ms: now - 4_500,
+        resolved: true,
+        resolved_at_ms: now - 4_000,
+        pr_number: 85,
+        pr_url: "https://github.com/acme/alpha/pull/85",
+        pr_title: TITLES.done,
+        pr_state: "merged",
+      }),
+    },
+  ];
+}
+
+function resolvedOverflowThreads(): Array<ThreadSeed> {
+  const now = Date.now();
+  return Array.from({ length: 21 }, (_, index) => {
+    const number = index + 1;
+    return {
+      id: `74000000-0000-4000-8000-${String(number).padStart(12, "0")}`,
+      metadata: baseMetadata(
+        now,
+        `E2E Workspace Resolved overflow ${String(number).padStart(2, "0")}`,
+        100 + index * 100,
+        {
+          latest_run_id: `e2e-run-resolved-overflow-${number}`,
+          latest_run_status: "success",
+          last_viewed_run_id: `e2e-run-resolved-overflow-${number}`,
+          last_viewed_at_ms: now - (50 + index * 100),
+          resolved: true,
+          resolved_at_ms: now - (25 + index * 100),
+        },
+      ),
+    };
+  });
+}
+
+function automationThreads(): Array<ThreadSeed> {
+  const now = Date.now();
+  return [
+    {
+      id: THREAD_IDS.dailyScheduled,
+      metadata: baseMetadata(now, TITLES.dailyScheduled, 500, {
+        source: "schedule",
+        origin: "schedule",
+        thread_category: "automation",
+        trigger_kind: "schedule",
+        schedule_id: SCHEDULE_IDS.daily,
+        schedule_name: "E2E Daily Health",
+        automation_action_posted_at: "2026-08-21T12:00:00+00:00",
+        latest_run_id: "e2e-run-daily-scheduled",
+        latest_run_status: "success",
+      }),
+    },
+    {
+      id: THREAD_IDS.dailyTest,
+      metadata: baseMetadata(now, TITLES.dailyTest, 1_500, {
+        source: "schedule",
+        origin: "schedule",
+        thread_category: "automation",
+        trigger_kind: "schedule_test",
+        schedule_test: true,
+        schedule_id: SCHEDULE_IDS.daily,
+        schedule_name: "E2E Daily Health",
+        latest_run_id: "e2e-run-daily-test",
+        latest_run_status: "error",
+      }),
+    },
+    {
+      id: THREAD_IDS.weeklyRunning,
+      metadata: baseMetadata(now, TITLES.weeklyRunning, 2_500, {
+        source: "schedule",
+        origin: "schedule",
+        thread_category: "automation",
+        trigger_kind: "schedule",
+        schedule_id: SCHEDULE_IDS.weekly,
+        schedule_name: "E2E Weekly Cleanup",
+        repo_name: "beta",
+        latest_run_id: "e2e-run-weekly-running",
+        latest_run_status: "running",
+      }),
+    },
+  ];
+}
+
+// Earlier specs leave their own threads behind for this user, and the sidebar
+// counts every one of them — so start from an empty workspace.
+async function purgeParticipantThreads(request: APIRequestContext) {
+  for (const owner of [{ participant_logins: { [USER.login]: true } }]) {
+    for (let page = 0; page < 20; page += 1) {
+      const searchResponse = await request.post("/threads/search", {
+        data: { metadata: owner, limit: 100, offset: 0 },
+      });
+      expect(searchResponse.ok(), await searchResponse.text()).toBeTruthy();
+      const threads = (await searchResponse.json()) as Array<{
+        thread_id: string;
+      }>;
+      if (threads.length === 0) break;
+      for (const thread of threads) {
+        const response = await request.delete(`/threads/${thread.thread_id}`);
+        expect([200, 204, 404]).toContain(response.status());
+      }
+    }
+  }
+}
+
+async function seedThreads(
+  request: APIRequestContext,
+  threads: Array<ThreadSeed>,
+) {
+  await purgeParticipantThreads(request);
+  for (const thread of threads) {
+    const resetResponse = await request.delete(`/threads/${thread.id}`);
+    expect([200, 204, 404]).toContain(resetResponse.status());
+    const response = await request.post("/threads", {
+      data: {
+        thread_id: thread.id,
+        if_exists: "raise",
+        metadata: thread.metadata,
+      },
+    });
+    expect(response.ok(), await response.text()).toBeTruthy();
+    createdThreadIds.add(thread.id);
+  }
+}
+
+async function seedSchedules(request: APIRequestContext) {
+  const login = await request.post("/control/login", { data: ADMIN_USER });
+  expect(login.ok(), await login.text()).toBeTruthy();
+  const schedules = [
+    {
+      key: "daily" as const,
+      body: {
+        name: "E2E Daily Health",
+        prompt: "Check repository health.",
+        triggers: [{ kind: "schedule", cron: "0 9 * * 1-5" }],
+      },
+      enabled: true,
+    },
+    {
+      key: "weekly" as const,
+      body: {
+        name: "E2E Weekly Cleanup",
+        prompt: "Clean up stale work.",
+        triggers: [{ kind: "schedule", cron: "0 10 * * 1" }],
+      },
+      enabled: false,
+    },
+  ];
+
+  for (const schedule of schedules) {
+    const response = await request.post("/dashboard/api/schedules", {
+      data: schedule.body,
+      headers: SAME_ORIGIN_HEADERS,
+    });
+    expect(response.ok(), await response.text()).toBeTruthy();
+    const { id } = (await response.json()) as { id: string };
+    SCHEDULE_IDS[schedule.key] = id;
+    createdScheduleIds.add(id);
+    if (!schedule.enabled) {
+      const paused = await request.patch(`/dashboard/api/schedules/${id}`, {
+        data: { enabled: false },
+        headers: SAME_ORIGIN_HEADERS,
+      });
+      expect(paused.ok(), await paused.text()).toBeTruthy();
+    }
+  }
+}
+
+async function cleanupFixtures(request: APIRequestContext) {
+  if (createdThreadIds.size > 0) {
+    const login = await request.post("/control/login", { data: USER });
+    expect(login.ok(), await login.text()).toBeTruthy();
+  }
+  for (const threadId of createdThreadIds) {
+    const pinResponse = await request.delete(
+      `/dashboard/api/threads/${threadId}/pin`,
+      { headers: SAME_ORIGIN_HEADERS },
+    );
+    expect([200, 204, 404]).toContain(pinResponse.status());
+    const response = await request.delete(`/threads/${threadId}`);
+    expect([200, 204, 404]).toContain(response.status());
+  }
+  if (createdScheduleIds.size > 0) {
+    const login = await request.post("/control/login", { data: ADMIN_USER });
+    expect(login.ok(), await login.text()).toBeTruthy();
+  }
+  for (const scheduleId of createdScheduleIds) {
+    const response = await request.delete(
+      `/dashboard/api/schedules/${scheduleId}`,
+      { headers: SAME_ORIGIN_HEADERS },
+    );
+    expect([200, 204, 404]).toContain(response.status());
+  }
+  createdThreadIds.clear();
+  createdScheduleIds.clear();
+}
+
+function waitForThreadsPage(page: Page, expected: Record<string, string>) {
+  return page.waitForResponse((response) => {
+    const url = new URL(response.url());
+    return (
+      response.request().method() === "GET" &&
+      url.pathname === "/dashboard/api/threads/page" &&
+      Object.entries(expected).every(
+        ([key, value]) => url.searchParams.get(key) === value,
+      )
+    );
+  });
+}
+
+function sidebarSection(sidebar: Locator, name: string): Locator {
+  return sidebar
+    .getByRole("button", { name, exact: true })
+    .locator("..")
+    .locator("..");
+}
+
+test.afterEach(async ({ request }) => {
+  await cleanupFixtures(request);
+});
+
+test.describe("threads workspace", () => {
+  test("pins and unpins a non-owned thread across sidebar views", async ({
+    page,
+    request,
+  }) => {
+    const thread = {
+      id: THREAD_IDS.shared,
+      metadata: {
+        ...baseMetadata(Date.now(), TITLES.shared, 1_000, {
+          owner_login: "teammate",
+          github_login: "teammate",
+          triggering_user_email: "teammate@example.com",
+          source: "slack",
+          origin: "slack",
+          latest_run_id: "e2e-run-shared",
+          latest_run_status: "success",
+        }),
+      },
+    };
+    await seedThreads(request, [thread]);
+    await loginAs(page);
+    await page.goto(`/agents/${THREAD_IDS.shared}`);
+
+    const row = page.getByRole("link", { name: TITLES.shared }).first();
+    await expect(
+      page.getByRole("button", { name: "Rename thread" }),
+    ).toHaveText(TITLES.shared);
+    await expect(row).toHaveCount(0);
+    await page
+      .locator("aside")
+      .getByRole("button", { name: "Projects options" })
+      .click();
+    const ownedOnly = page.getByRole("menuitemcheckbox", {
+      name: "Only my threads",
+      exact: true,
+    });
+    await expect(ownedOnly).toBeChecked();
+    await ownedOnly.click();
+    await page.keyboard.press("Escape");
+    await expect(row).toBeVisible();
+    await row.click({ button: "right" });
+    const pinResponse = page.waitForResponse(
+      (response) =>
+        new URL(response.url()).pathname ===
+          `/dashboard/api/threads/${THREAD_IDS.shared}/pin` &&
+        response.request().method() === "POST",
+    );
+    await page.getByRole("menuitem", { name: "Pin", exact: true }).click();
+    expect((await pinResponse).ok()).toBeTruthy();
+    await page.reload();
+
+    const pinned = sidebarSection(page.locator("aside"), "Pinned");
+    const pinnedRow = pinned.getByRole("link", { name: TITLES.shared });
+    await expect(pinnedRow).toBeVisible();
+
+    await pinnedRow.press("Shift+F10");
+    const unpinResponse = page.waitForResponse(
+      (response) =>
+        new URL(response.url()).pathname ===
+          `/dashboard/api/threads/${THREAD_IDS.shared}/pin` &&
+        response.request().method() === "DELETE",
+    );
+    await page.getByRole("menuitem", { name: "Unpin", exact: true }).click();
+    expect((await unpinResponse).ok()).toBeTruthy();
+    await expect(pinned).toHaveCount(0);
+  });
+
+  test("does not flash new-thread onboarding while a thread route loads", async ({
+    page,
+    request,
+  }) => {
+    const threadId = "75000000-0000-4000-8000-000000000001";
+    const title = "E2E Workspace Pending thread";
+    await seedThreads(request, [
+      {
+        id: threadId,
+        metadata: baseMetadata(Date.now(), title, 1_000, {
+          latest_run_id: "e2e-run-pending-thread",
+          latest_run_status: "success",
+        }),
+      },
+    ]);
+    await loginAs(page);
+    await page.route("**/dashboard/api/me", async (route) => {
+      const response = await route.fetch();
+      const session = (await response.json()) as Record<string, unknown>;
+      await route.fulfill({
+        json: {
+          ...session,
+          slack_oauth_enabled: true,
+          slack_user_id: null,
+        },
+      });
+    });
+
+    const profileGate = deferred();
+    const profileStarted = deferred();
+    const profileFinished = deferred();
+    await page.route("**/dashboard/api/profile", async (route) => {
+      profileStarted.resolve();
+      await profileGate.promise;
+      await route.fulfill({ json: {} });
+      profileFinished.resolve();
+    });
+
+    const threadChunkGate = deferred();
+    const threadChunkStarted = deferred();
+    await page.route(
+      /\/assets\/_threadId-(?!pendingComponent-)[^/]+\.js$/,
+      async (route) => {
+        threadChunkStarted.resolve();
+        await threadChunkGate.promise;
+        await route.continue();
+      },
+    );
+
+    await page.goto("/agents");
+    await profileStarted.promise;
+    await expect(
+      page.getByRole("heading", { name: "What should we work on?" }),
+    ).toBeVisible();
+
+    await page.evaluate(() => {
+      const seen = { value: false };
+      (window as unknown as Record<string, unknown>).__newThreadDialogSeen =
+        seen;
+      const detect = () => {
+        if (document.body.textContent?.includes("Connect your Slack account")) {
+          seen.value = true;
+        }
+      };
+      new MutationObserver(detect).observe(document.body, {
+        childList: true,
+        subtree: true,
+      });
+    });
+
+    try {
+      await page.getByRole("button", { name: "Search", exact: true }).click();
+      await page
+        .getByPlaceholder("Search commands, threads, and pull requests…")
+        .fill(title);
+      await page.getByRole("option", { name: title }).click();
+      await threadChunkStarted.promise;
+      profileGate.resolve();
+      await profileFinished.promise;
+      await page.evaluate(
+        () =>
+          new Promise<void>((resolve) => {
+            requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+          }),
+      );
+      threadChunkGate.resolve();
+
+      await expect(page).toHaveURL(`/agents/${threadId}`);
+      await expect(
+        page.getByText("This thread has no messages yet."),
+      ).toBeVisible();
+      const flashed = await page.evaluate(
+        () =>
+          (
+            (window as unknown as Record<string, unknown>)
+              .__newThreadDialogSeen as { value: boolean }
+          ).value,
+      );
+      expect(flashed).toBe(false);
+    } finally {
+      profileGate.resolve();
+      threadChunkGate.resolve();
+    }
+  });
+
+  test("shows a recency-sorted repository list in the sidebar", async ({
+    page,
+    request,
+  }, testInfo) => {
+    await seedThreads(request, [
+      ...workspaceThreads(),
+      ...resolvedOverflowThreads(),
+    ]);
+    await loginAs(page);
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await page.goto("/agents");
+    await dismissOnboardingIfShown(page);
+
+    const sidebar = page.locator("[data-sidebar-frame]");
+    await sidebar.getByRole("button", { name: "Projects options" }).click();
+    await expect(
+      page.getByRole("menuitemcheckbox", {
+        name: "Only my threads",
+        exact: true,
+      }),
+    ).toBeChecked();
+    await expect(
+      page.getByRole("menuitemradio", { name: "Last updated", exact: true }),
+    ).toHaveCount(0);
+    await page.keyboard.press("Escape");
+    const workspaceLinks = sidebar.locator(
+      `a[href^="/agents/"]:has-text("${WORKSPACE_QUERY}")`,
+    );
+
+    await expect
+      .poll(() =>
+        workspaceLinks.evaluateAll((links) =>
+          links.map((link) => link.getAttribute("href")),
+        ),
+      )
+      .toEqual([
+        `/agents/${THREAD_IDS.attention}`,
+        `/agents/${THREAD_IDS.error}`,
+        `/agents/${THREAD_IDS.interrupted}`,
+        `/agents/${THREAD_IDS.running}`,
+        `/agents/${THREAD_IDS.ready}`,
+      ]);
+
+    const alphaGroup = sidebar
+      .getByRole("button", { name: "alpha", exact: true })
+      .locator("..")
+      .locator("..");
+    const betaGroup = sidebar.getByRole("button", {
+      name: "beta",
+      exact: true,
+    });
+    await expect(
+      sidebar.getByRole("button", { name: "alpha", exact: true }),
+    ).toBeVisible();
+    await expect(betaGroup).toBeVisible();
+    await expect(sidebar.getByText("acme/alpha", { exact: true })).toHaveCount(
+      0,
+    );
+
+    // Collapsing a repository hides only that repository's threads.
+    await betaGroup.click();
+    await expect(betaGroup).toHaveAttribute("aria-expanded", "false");
+    await expect(workspaceLinks).toHaveCount(4);
+    await expect(
+      workspaceLinks.filter({ hasText: TITLES.running }),
+    ).toHaveCount(0);
+    await betaGroup.click();
+    await expect(workspaceLinks).toHaveCount(5);
+
+    await sidebar.getByRole("button", { name: "Projects options" }).click();
+    await page
+      .getByRole("menuitemcheckbox", { name: "Show archived", exact: true })
+      .click();
+    await page.keyboard.press("Escape");
+
+    for (const group of ["Needs attention", "In progress", "Ready", "Done"]) {
+      await expect(
+        sidebar.getByRole("button", { name: group, exact: true }),
+      ).toHaveCount(0);
+    }
+    await expect(sidebar).toContainText("E2E Workspace Resolved overflow 21");
+    const showMore = alphaGroup.getByRole("button", {
+      name: "Show more",
+      exact: true,
+    });
+    const overflowIds = resolvedOverflowThreads().map((thread) => thread.id);
+    const alphaThreads = alphaGroup.locator("a[data-selectable-thread]");
+    // Activity invalidations can refetch the list while a page is loading.
+    // Keep paging until the fixture rows are present, rather than assuming
+    // each click permanently increases the number of loaded rows.
+    await expect
+      .poll(async () => {
+        if (await showMore.isVisible()) await showMore.click();
+        return alphaThreads.evaluateAll((rows) =>
+          rows.map((row) => row.getAttribute("data-selectable-thread")),
+        );
+      })
+      .toEqual(expect.arrayContaining(overflowIds));
+    await expect(alphaGroup).toContainText(TITLES.done);
+    await expect(showMore).toHaveCount(0);
+
+    const screenshotPath = testInfo.outputPath("unified-thread-sidebar.png");
+    await sidebar.screenshot({ path: screenshotPath });
+    await testInfo.attach("unified-thread-sidebar", {
+      path: screenshotPath,
+      contentType: "image/png",
+    });
+  });
+
+  test("shows unfiled chats by activity in Recents below Projects", async ({
+    page,
+    request,
+  }) => {
+    const now = Date.now();
+    await seedThreads(request, [
+      {
+        id: THREAD_IDS.noRepo,
+        metadata: baseMetadata(now, TITLES.noRepo, 3_000, {
+          repo_owner: "",
+          repo_name: "",
+          created_at_ms: now - 1_000,
+          latest_run_status: "success",
+        }),
+      },
+      {
+        id: THREAD_IDS.shared,
+        metadata: baseMetadata(now, TITLES.shared, 1_000, {
+          repo_owner: "",
+          repo_name: "",
+          created_at_ms: now - 86_400_000,
+          latest_run_id: "e2e-resumed-chat",
+          latest_run_status: "running",
+        }),
+      },
+      {
+        id: THREAD_IDS.pinnedRepo,
+        metadata: baseMetadata(now, TITLES.pinnedRepo, 2_000, {
+          latest_run_status: "success",
+        }),
+      },
+      ...Array.from({ length: 26 }, (_, index) => ({
+        id: `7a000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
+        metadata: baseMetadata(now, `Filed chat ${index + 1}`, index, {
+          repo_name: "beta",
+          latest_run_status: "success",
+        }),
+      })),
+    ]);
+    await loginAs(page);
+    await page.addInitScript(() => {
+      localStorage.setItem(
+        "open-swe.agents.sidebar-prefs",
+        JSON.stringify({
+          organize: "repo",
+          pinnedRepoKeys: ["repo:no-repo"],
+          collapsedRepoKeys: ["repo:no-repo", "repo:acme/beta"],
+        }),
+      );
+    });
+    await page.setViewportSize({ width: 1280, height: 900 });
+    const recentsResponse = page.waitForResponse((response) => {
+      const url = new URL(response.url());
+      return (
+        url.pathname === "/dashboard/api/threads/page" &&
+        url.searchParams.get("ownerless") === "true"
+      );
+    });
+    await page.goto("/agents");
+    await dismissOnboardingIfShown(page);
+    const recentsPage = await (await recentsResponse).json();
+    expect(recentsPage).toMatchObject({
+      hasMore: false,
+      items: expect.arrayContaining([
+        expect.objectContaining({ id: THREAD_IDS.shared }),
+        expect.objectContaining({ id: THREAD_IDS.noRepo }),
+      ]),
+    });
+    expect(recentsPage.items).toHaveLength(2);
+
+    const sidebar = page.getByRole("complementary");
+    const projects = sidebarSection(sidebar, "Projects");
+    const recents = sidebarSection(sidebar, "Recents");
+    await expect(recents.getByRole("link")).toHaveText([
+      TITLES.shared,
+      TITLES.noRepo,
+    ]);
+    await expect(
+      projects.getByRole("link", { name: TITLES.pinnedRepo }),
+    ).toBeVisible();
+    await expect(
+      sidebar.getByRole("link", { name: TITLES.pinnedRepo }),
+    ).toHaveCount(1);
+    await expect(
+      recents.getByRole("img", { name: "Thread running" }),
+    ).toBeVisible();
+    await expect(
+      sidebar.getByRole("button", { name: "No project", exact: true }),
+    ).toHaveCount(0);
+    await expect(
+      sidebar.getByRole("button", { name: "Running", exact: true }),
+    ).toHaveCount(0);
+    expect(
+      await projects.evaluate((node) => node.getBoundingClientRect().top),
+    ).toBeLessThan(
+      await recents.evaluate((node) => node.getBoundingClientRect().top),
+    );
+
+    await sidebar
+      .getByRole("button", { name: "Projects", exact: true })
+      .click();
+    await expect(projects.getByRole("link")).toHaveCount(0);
+    await expect(
+      recents.getByRole("link", { name: TITLES.shared }),
+    ).toBeVisible();
+    await page.reload();
+    await expect(recents.getByRole("link")).toHaveText([
+      TITLES.shared,
+      TITLES.noRepo,
+    ]);
+    await page.addInitScript(() => {
+      const key = "open-swe.agents.sidebar-prefs";
+      localStorage.setItem(
+        key,
+        JSON.stringify({
+          ...JSON.parse(localStorage.getItem(key) ?? "{}"),
+          collapsedSectionKeys: ["repos"],
+          collapsedRepoKeys: ["repo:acme/alpha"],
+        }),
+      );
+    });
+    await page.goto(`/agents/${THREAD_IDS.pinnedRepo}`);
+    await expect(
+      projects.getByRole("link", { name: TITLES.pinnedRepo }),
+    ).toBeVisible();
+
+    for (const id of [THREAD_IDS.shared, THREAD_IDS.noRepo]) {
+      const response = await request.delete(`/threads/${id}`);
+      expect(response.ok()).toBeTruthy();
+    }
+    await page.reload();
+    await expect(
+      projects.getByRole("link", { name: TITLES.pinnedRepo }),
+    ).toBeVisible();
+    await expect(
+      sidebar.getByRole("button", { name: "Recents", exact: true }),
+    ).toHaveCount(0);
+  });
+});
+
+test.describe("automation run history", () => {
+  test("gates the run composer on the viewer's automation capability", async ({
+    page,
+    request,
+  }, testInfo) => {
+    await seedThreads(request, workspaceThreads());
+    await loginAs(page);
+    await page.emulateMedia({ colorScheme: "dark" });
+    await page.setViewportSize({ width: 1280, height: 900 });
+    let capability: boolean | undefined = true;
+    let adminThread = false;
+    await page.route(
+      `**/dashboard/api/threads/${THREAD_IDS.ready}`,
+      async (route) => {
+        const response = await route.fetch();
+        await route.fulfill({
+          response,
+          json: {
+            ...(await response.json()),
+            threadCategory: "automation",
+            automationCanPost: capability,
+            adminThread,
+          },
+        });
+      },
+    );
+
+    await page.goto(`/agents/${THREAD_IDS.ready}`);
+    await dismissOnboardingIfShown(page);
+    const composer = page.getByRole("textbox", {
+      name: "Message",
+      exact: true,
+    });
+    await expect(composer).toBeEditable();
+    await composer.fill("Follow up on this automation run");
+    await expect(
+      page.getByRole("button", { name: "Send message", exact: true }),
+    ).toBeEnabled();
+    const screenshotPath = testInfo.outputPath(
+      "automation-owner-composer-dark.png",
+    );
+    await page.screenshot({ path: screenshotPath });
+    await testInfo.attach("automation-owner-composer-dark-api-fixture", {
+      path: screenshotPath,
+      contentType: "image/png",
+    });
+
+    capability = false;
+    await page.reload();
+    await expect(composer).not.toBeEditable();
+    await expect(
+      page.getByText("You can't send messages in this thread", { exact: true }),
+    ).toBeVisible();
+
+    capability = undefined;
+    await page.reload();
+    await expect(composer).not.toBeEditable();
+
+    capability = true;
+    adminThread = true;
+    await page.reload();
+    await expect(composer).not.toBeEditable();
+    await expect(
+      page.getByText("Only Robin admins can send messages in this thread", {
+        exact: true,
+      }),
+    ).toBeVisible();
+
+    const adminLogin = await page.request.post("/control/login", {
+      data: ADMIN_USER,
+    });
+    expect(adminLogin.ok()).toBeTruthy();
+    capability = false;
+    await page.reload();
+    await expect(composer).not.toBeEditable();
+
+    capability = true;
+    await page.reload();
+    await expect(composer).toBeEditable();
+  });
+
+  test("retries failures and scopes global and per-automation runs", async ({
+    page,
+    request,
+  }) => {
+    await seedSchedules(request);
+    await seedThreads(request, [...workspaceThreads(), ...automationThreads()]);
+    const loginResponse = await page.request.post("/control/login", {
+      data: ADMIN_USER,
+    });
+    expect(loginResponse.ok()).toBeTruthy();
+
+    const triggerResponse = await page.request.post(
+      `/dashboard/api/schedules/${SCHEDULE_IDS.daily}/trigger`,
+      { headers: SAME_ORIGIN_HEADERS },
+    );
+    expect(triggerResponse.ok(), await triggerResponse.text()).toBeTruthy();
+    const triggered = (await triggerResponse.json()) as {
+      status: string;
+      thread_id: string;
+      run_id: string;
+    };
+    expect(triggered.status).toBe("started");
+    createdThreadIds.add(triggered.thread_id);
+    await waitForThreadIdle(page, triggered.thread_id);
+
+    const producedHistoryResponse = await page.request.get(
+      `/dashboard/api/threads/page?scope=automation&automation_id=${SCHEDULE_IDS.daily}&limit=100&offset=0`,
+    );
+    expect(
+      producedHistoryResponse.ok(),
+      await producedHistoryResponse.text(),
+    ).toBeTruthy();
+    const producedHistory = (await producedHistoryResponse.json()) as {
+      items: Array<{
+        id: string;
+        title: string;
+        triggerKind: string;
+        automationId: string;
+      }>;
+    };
+    expect(producedHistory.items).toContainEqual(
+      expect.objectContaining({
+        id: triggered.thread_id,
+        title: "Add greet() helper",
+        triggerKind: "schedule_test",
+        automationId: SCHEDULE_IDS.daily,
+      }),
+    );
+
+    let failAutomationRuns = true;
+    await page.route("**/dashboard/api/threads/page?*", async (route) => {
+      const url = new URL(route.request().url());
+      if (
+        failAutomationRuns &&
+        url.searchParams.get("scope") === "automation"
+      ) {
+        await route.fulfill({
+          status: 500,
+          contentType: "application/json",
+          body: JSON.stringify({ detail: "E2E transient failure" }),
+        });
+        return;
+      }
+      await route.continue();
+    });
+
+    await page.goto("/agents/automations?tab=runs");
+    const automations = page
+      .getByRole("heading", { name: "Automations", level: 1 })
+      .locator("..");
+    await expect(
+      automations.getByText("Automation runs could not be loaded."),
+    ).toBeVisible({ timeout: 20_000 });
+
+    failAutomationRuns = false;
+    const retryResponse = waitForThreadsPage(page, {
+      scope: "automation",
+      limit: "25",
+      offset: "0",
+    });
+    await automations.getByRole("button", { name: "Retry" }).click();
+    expect((await retryResponse).ok()).toBeTruthy();
+
+    const daily = automations.locator(
+      'section:has(h2:text-is("E2E Daily Health"))',
+    );
+    const weekly = automations.locator(
+      'section:has(h2:text-is("E2E Weekly Cleanup"))',
+    );
+    await expect(daily.getByRole("link")).toHaveCount(3);
+    await expect(weekly.getByRole("link")).toHaveCount(1);
+    const producedRun = daily.locator(
+      `a[href="/agents/${triggered.thread_id}"]`,
+    );
+    await expect(producedRun).toContainText("Add greet() helper");
+    await expect(producedRun).toContainText("Test run");
+
+    const scheduledRun = daily.getByRole("link").filter({
+      hasText: TITLES.dailyScheduled,
+    });
+    const testRun = daily.getByRole("link").filter({
+      hasText: TITLES.dailyTest,
+    });
+    await expect(scheduledRun).toContainText("Finished");
+    await expect(scheduledRun).toContainText("Scheduled run");
+    await expect(scheduledRun).toContainText("Posted to Slack");
+    await expect(scheduledRun).toContainText("acme/alpha");
+    await expect(testRun).toContainText("Error");
+    await expect(testRun).not.toContainText("Posted to Slack");
+    await expect(testRun).toContainText("Test run");
+    await expect(weekly).toContainText("Running");
+    await expect(automations).not.toContainText(TITLES.attention);
+
+    await automations.getByRole("button", { name: "Overview" }).click();
+    const scheduleLink = automations.getByRole("link", {
+      name: /E2E Daily Health/,
+    });
+    await expect(scheduleLink).toBeVisible();
+
+    const recentRunsResponse = waitForThreadsPage(page, {
+      scope: "automation",
+      automation_id: SCHEDULE_IDS.daily,
+      limit: "10",
+      offset: "0",
+    });
+    await scheduleLink.click();
+    expect((await recentRunsResponse).ok()).toBeTruthy();
+    await expect(page).toHaveURL(
+      new RegExp(`/agents/automations/${SCHEDULE_IDS.daily}$`),
+    );
+    await expect(
+      page.getByRole("heading", { name: "Recent runs", level: 2 }),
+    ).toBeVisible();
+    await expect(page.getByText(TITLES.dailyScheduled)).toBeVisible();
+    await expect(page.getByText(TITLES.dailyTest)).toBeVisible();
+    await expect(page.getByText(TITLES.weeklyRunning)).toHaveCount(0);
+    const recentProducedRun = page
+      .locator(`a[href="/agents/${triggered.thread_id}"]`)
+      .filter({ hasText: "Add greet() helper" });
+    await expect(recentProducedRun).toContainText("Add greet() helper");
+
+    await recentProducedRun.click();
+    await expect(page).toHaveURL(new RegExp(`/agents/${triggered.thread_id}$`));
+  });
+});

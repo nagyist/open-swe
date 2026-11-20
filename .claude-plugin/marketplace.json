@@ -1,0 +1,14 @@
+{
+  "name": "robin",
+  "description": "Robin's Claude Code plugin",
+  "owner": {
+    "name": "Robin"
+  },
+  "plugins": [
+    {
+      "name": "robin",
+      "source": "./claude-code-plugin",
+      "description": "Use Robin's MCP tools from Claude Code"
+    }
+  ]
+}

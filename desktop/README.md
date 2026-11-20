@@ -1,0 +1,217 @@
+# Robin Desktop
+
+> [!IMPORTANT]
+> This desktop client is experimental.
+> The web UI is the recommended way to use Robin.
+
+The Electron app downloads a standalone UI release selected by the connected backend.
+It keeps the last complete UI on disk, including lazy routes, for offline use.
+No dashboard is embedded in the installer.
+First launch requires connectivity to download the UI; failure shows a retry screen.
+
+Every thread runs in the cloud, in its own sandbox, exactly as it does from the web.
+In your private threads, the app also lets Robin ask to read or write a file on this Mac, copy a file into the thread's sandbox, or run a command here.
+Each action waits for your approval in a native dialog that names the thread and shows the exact path, contents or command; the thread's card links to the dialog but cannot decide.
+**Allow in <folder> for this thread** lets that thread act in the folder without asking for 30 minutes, for actions the runtime's reviewer clears and paths that cannot hold credentials.
+Grants live only in the running app: quitting or signing out ends them.
+
+The app serves these actions through a local-access bridge: it long-polls the backend for the run's `local_action` requests, asks you, runs what you approve, and posts the results back.
+It uses the shared `bridge-client` package.
+Commands run with your login shell's environment, minus anything secret-shaped except `GITHUB_TOKEN` and `GH_TOKEN`, so `git` and `gh` use your own identity and credentials.
+A thread can ask only while this app is open and signed in as the thread's owner; otherwise the run continues in the cloud without local actions.
+
+## How it connects
+
+The UI runs at `open-swe://app`, with native IPC for menus, sign-in, updates and approved local actions.
+`/desktop-ui.json` on the backend selects a GitHub Release archive by backend commit, SHA-256 and bridge protocol version.
+Downloads carry no session credentials, follow redirects only to GitHub release hosts, and are verified before activation.
+Each backend has its own cache.
+Cached UI opens immediately; updates download in the background and take effect on the next reload.
+While the app is open, the dashboard's reload banner checks for a newer UI every minute and appears once one is installed.
+Interrupted or corrupt downloads leave the previous UI intact.
+Running agents requires the backend.
+
+**Release Desktop UI** publishes `ui.json.gz` and `descriptor.json` as immutable `desktop-ui-<commit>` prereleases on main/preview pushes.
+Backend images select that exact commit through their stamped build identity.
+To run a local UI instead, build `ui/` (`pnpm --filter open-swe-dashboard run build`) and launch the app with `OPEN_SWE_DESKTOP_UI_ARCHIVE=<repo>/ui/.output/desktop/ui.json.gz`; it installs that archive on every load instead of contacting the backend's descriptor.
+
+Electron proxies `/dashboard/api/*` requests to the selected backend, so the browser never receives a LangSmith API key and never calls the raw LangGraph API directly.
+Choose LangSmith or GitHub sign-in from the desktop login screen.
+Native navigation opens the selected provider in your browser with a fresh PKCE loopback handoff; both providers create a signed dashboard session.
+
+Packaged builds ask for the organization's backend URL on first launch and store it in the app's local user data.
+They have no maintainer-hosted default.
+Use **Robin → Backend URL…** to switch deployments; switching clears the previous deployment's local session data.
+
+When the backend the app is connected to sets `OPENSWE_ALTERNATIVE_ENVS="preview:https://...,staging:https://..."`, **Robin → Environment** lists those backends next to it.
+Choosing one switches only until the app restarts; the stored backend URL stays the same.
+Nothing is configured on the desktop side.
+
+On macOS, Universal Links open agent and review pages in the app only when the URL's origin is the configured backend's, or one of the dashboard origins that backend lists (its canonical domain and aliases, from `/dashboard/api/desktop/environments`).
+The app claims `robin.langchain.dev` and `openswe.langchain.dev` (`entitlements.mac.plist`).
+Links for other deployments open in the default browser instead.
+Associated domains are fixed in the signed app, so macOS may still launch Robin before it hands a mismatched link back to the browser.
+
+The shared backend's GitHub App must allow `<backend-url>/dashboard/api/auth/callback` as a callback URL.
+Set `ALLOWED_GITHUB_ORGS` or `ALLOWED_GITHUB_USERS` on that backend to control which GitHub users can create dashboard sessions.
+
+## Install on macOS
+
+On Apple Silicon Macs running macOS Ventura or later, you can install with Homebrew:
+
+```sh
+brew install --cask langchain-ai/tap/open-swe-desktop
+```
+
+This installs Robin and links the `robin` and `oswe` commands onto your `PATH`; both share configuration and credentials.
+The CLI updates with the app.
+If you installed the cask before 0.3.13, run `brew reinstall --cask open-swe-desktop` once to switch to `Robin.app` and get the `robin` link (a plain `brew upgrade` skips auto-updating casks).
+
+To build and install from source, install Git, Node.js 26, and [Bun](https://bun.com/docs/installation), clone this repository, then run this from its root:
+
+```bash
+make install-desktop
+```
+
+The command fast-forwards to the latest `main`, builds Robin, and installs it in `/Applications` (or `~/Applications` when needed).
+Run it again to update and replace the app; saved backend settings and login sessions are preserved.
+
+## Local development
+
+Install the workspace dependencies, then run the backend, desktop app, and web UI independently:
+
+```bash
+pnpm install # from the repo root
+
+# terminal 1
+make dev
+
+# terminal 2
+make desktop
+
+# terminal 3 (optional web UI)
+make web
+```
+
+`pnpm run dev:desktop` is equivalent to `make desktop`.
+Both build `ui/` first and run the app on that build through `OPEN_SWE_DESKTOP_UI_ARCHIVE`, so the window shows this checkout's UI rather than the one the backend publishes.
+After changing `ui/`, rerun `make desktop`, or rebuild the UI and use View → Reload.
+The desktop app connects to the backend at `http://localhost:2024`; approved local actions reach it through the bridge, which needs that backend's PostgreSQL.
+
+The app keeps the original `com.langchain.openswe` bundle ID and `Open SWE` production Electron profile for existing sessions, caches, and instance locks.
+At startup, Electron uses the legacy profile name until `app.whenReady()` resolves, then switches its display name to Robin.
+Electron 44.9.1 initializes the macOS Keychain service and account names before that callback, so the app continues using the original Safe Storage key rather than creating a Robin key.
+A signed macOS upgrade pilot must verify cookie decryption and session continuity; Linux tests cannot establish that behavior.
+Packaged apps continue to share backend configuration and sessions with `robin` and `oswe` through `~/.open-swe/config.json`.
+Source launches retain the isolated `Open SWE Development` profile and do not share CLI configuration.
+The dev window is labeled **Robin Development**; existing development sessions are preserved.
+
+Development defaults to `http://localhost:2024`.
+Point to another backend with:
+
+```bash
+pnpm --dir desktop run start -- --backend-url=https://open-swe-api.example.com
+```
+
+`OPEN_SWE_BACKEND_URL` provides the same override.
+Resolution order is command-line argument, environment variable, saved first-launch configuration, then the local development default.
+The original `--url` and `OPEN_SWE_DESKTOP_URL` names remain accepted for compatibility.
+
+## Packaging
+
+```bash
+pnpm --dir desktop run pack # unpacked application for the current platform
+pnpm --dir desktop run dist # installer for the current platform
+```
+
+Neither command builds or embeds the dashboard.
+macOS packaging uses the shared iOS Icon Composer asset at `mobile/assets/icon.icon`, with separate bird layers for native light, dark, tinted, and Clear appearances.
+It requires Xcode 26 or later; Electron Builder compiles the asset into `Assets.car` and a legacy `.icns` fallback for older macOS versions.
+Edit that shared asset for native Apple icon changes rather than flattening its appearance layers into a PNG.
+The dashboard's `ui/public/logo-mark.png` remains the source for Windows/Linux app icons, native window icons, and source launches.
+The shared logo background is the sRGB `Branding.LOGO_BACKGROUND` constant in `scripts/branding.py`, separate from theme-dependent UI action colors.
+Run `python scripts/branding.py` from the Open SWE root to apply it to the PNG's solid background, convert it to Display-P3 for the Apple asset, and regenerate browser, PWA, and environment-specific icons; Pillow is a declared project dependency.
+The PNG remains the artwork source; the generator identifies its background as the most common opaque color, preserving the bird and native Apple appearance layers.
+Preview and staging retain their pink and green backgrounds to distinguish them from production.
+Installed app icons require a desktop shell release, not a downloaded UI update.
+Build outputs are written to `desktop/dist/`; the bundle is `Robin.app`.
+The source installer replaces a verified `Open SWE.app` in the same Applications directory after installing Robin; it does not remove profile or CLI data.
+If an older copy remains in a different Applications directory, remove that app bundle manually after quitting it.
+Release assets use `Robin-*` names, with `Open-SWE-*` aliases for compatibility.
+The `desktop-v*` tags, original stable update feed, and `open-swe-desktop` Homebrew cask stay unchanged.
+There is one desktop product and version, not separate coding and general-purpose distributions.
+An update from an installed Open SWE app and a Homebrew reinstall still need macOS smoke tests to verify bundle replacement, preserved sessions, and the CLI link.
+
+## macOS releases
+
+`desktop/package.json` is the latest stable version.
+Every **Promote main to prod** run publishes a prerelease nightly from the promoted commit with a UTC timestamp, such as `desktop-v0.2.3-nightly.20260902080000`.
+Nightly releases never publish the stable version.
+
+Stable releases use a deliberate bump, test, release process: bump `desktop/package.json` in a normal pull request, merge it to `main`, test the resulting code as needed, then run **Release Desktop** manually.
+The workflow publishes the exact package version and fails if that stable release is already complete.
+A partial stable release remains manually retryable.
+
+Both paths sign and notarize the Electron shell, verify the app and DMG, create the tag, and publish the installers.
+UI releases are separate from desktop shell releases.
+
+The workflow requires these GitHub Actions secrets:
+
+- `APPLE_SIGNING_CERT`: base64-encoded Developer ID Application `.p12` certificate
+- `APPLE_SIGNING_CERT_PASSWORD`: password for the certificate
+- `APPLE_PROVISIONING_PROFILE`: base64-encoded Developer ID provisioning profile for `com.langchain.openswe` with Associated Domains enabled (optional; enables Universal Links)
+- `APPLE_API_KEY`: App Store Connect `.p8` key contents
+- `APPLE_API_KEY_ID`: App Store Connect key ID
+- `APPLE_API_ISSUER`: App Store Connect issuer ID
+
+Local packaging remains available without those credentials; signing and notarization are performed by the release workflow.
+
+## Deployment security
+
+The backend URL is public configuration, not a credential.
+Dashboard routes require an `osw_session` cookie issued after LangSmith login, the only sign-in.
+The backend's `LANGSMITH_API_KEY` determines the authorized LangSmith organization; `ALLOWED_GITHUB_ORGS` or `ALLOWED_GITHUB_USERS` controls which GitHub accounts may be linked.
+CORS alone is not access control.
+
+Raw LangGraph routes are a separate boundary.
+A deployment using `LANGGRAPH_AUTH_TYPE=noop` must keep those routes behind a private network, authenticated gateway, or custom LangGraph auth.
+An external user does not need the deployment's server-side `LANGSMITH_API_KEY` to call an exposed, unauthenticated LangGraph route.
+
+## LangSmith deployment
+
+Register a confidential OAuth client (dynamic registration only permits MCP access) with callback `<DASHBOARD_API_BASE_URL>/dashboard/api/langsmith/callback`; existing clients already register it, so sign-in needs no new client or allowlist entry.
+Configure `LANGSMITH_CONNECTION_URL` (normally `https://api.smith.langchain.com`), `LANGSMITH_OAUTH_CLIENT_ID`, and `LANGSMITH_OAUTH_CLIENT_SECRET` on the backend, alongside its existing dashboard URLs, JWT/encryption secrets and PostgreSQL configuration.
+The backend derives the allowed login organization from its server-side `LANGSMITH_API_KEY` using `GET <LANGSMITH_ENDPOINT>/auth/public`.
+The key must belong to the intended login organization and cannot be a tracing-only key; missing keys or failed lookups deny login.
+Before deploying, verify the deployment key resolves to the intended organization.
+Apply migrations through `0089_1850da6129ee`.
+Never ship the client secret in the app.
+
+Login discovers OIDC endpoints on the issuer origin and requests `openid profile email offline_access` for the API resource.
+Users must select the organization discovered from the backend's API key.
+Membership requires both `/userinfo`'s acting-org claim and current `/orgs?skip_create=true` membership; the claim alone does not prove membership.
+The organization list is unpaginated.
+
+The web dashboard starts `/dashboard/api/auth/langsmith/login` and receives its session cookie at the callback.
+The desktop starts it with a PKCE challenge and loopback port.
+The backend returns a short-lived handoff code to `127.0.0.1`; `/auth/desktop/exchange` requires the verifier.
+No browser session is created, and the handoff cannot itself authenticate as a cookie.
+A LangSmith sign-in starts as its own internal UUID account, never linked by email.
+Coding features need a linked GitHub account: **Link GitHub** runs the GitHub App's OAuth through `/dashboard/api/github/login`.
+When that GitHub account already belongs to a Robin person, the LangSmith identity and login grant move to that person, so their threads and settings return; otherwise the GitHub account joins the LangSmith account.
+A GitHub account already linked to another LangSmith account is refused.
+Once linked, the session acts as the GitHub login while every request still checks the LangSmith grant.
+
+Encrypted `langsmith_login` grants refresh automatically and also serve managed tools; there is no separate LangSmith connection to connect or disconnect.
+Every authenticated request, run dispatch, runtime call and worker grant checks the stored grant.
+Successful organization authorization is cached in PostgreSQL for at most 60 seconds, bound to the current grant and configured organization; provider revocation or membership removal can take up to 60 seconds to take effect.
+Expired authorization must be revalidated; temporary provider failures deny access without extending the cache or discarding the grant.
+Only tokens nearing expiry acquire the cross-replica refresh lock, and refreshed identities are checked before storing their grants.
+Sign out deletes the stored grant, immediately denying subsequent sessions/runtime calls, and attempts remote refresh/access-token revocation at the issuer's advertised RFC 7009 endpoint.
+Remote revocation failures do not prevent local sign out; a new login is required to restore backend access.
+`/me` renews valid seven-day sessions on loading/focus; sessions inactive past expiry need login again.
+Sign out rather than disconnecting the login grant.
+
+Without a linked GitHub account, GitHub operations and borrowed deployment bot/App credentials are unavailable.
+Deploy the login routes and desktop UI with both sign-in providers before distributing installers.
+Real confidential-client OAuth, macOS signing/install and update installation still need production smoke tests; Linux packaging and mocked integration tests do not establish deployment readiness.

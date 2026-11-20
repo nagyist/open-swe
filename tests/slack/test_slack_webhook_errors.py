@@ -1,0 +1,148 @@
+from typing import Any
+from unittest.mock import AsyncMock
+
+import pytest
+
+from openswe.run_config import Repo
+from openswe.slack import failures as slack_failures
+from openswe.slack import webhook as slack_webhook
+from openswe.slack.payloads import SlackChannelContext
+from openswe.slack.request import SlackRequest
+from openswe.users.models import UserIdentity
+from openswe.webhooks import common as webhook_common
+
+
+class _FakeThreads:
+    def __init__(self) -> None:
+        self.updates: list[dict[str, Any]] = []
+
+    async def update(self, *, thread_id: str, metadata: dict[str, Any]) -> None:
+        self.updates.append({"thread_id": thread_id, "metadata": metadata})
+
+
+class _FakeClient:
+    def __init__(self) -> None:
+        self.threads = _FakeThreads()
+
+
+def _event_data() -> SlackRequest:
+    return SlackRequest(
+        channel_id="C1",
+        thread_ts="123.45",
+        event_ts="123.45",
+        user_id="U1",
+        text="help",
+        bot_user_id="BOT",
+    )
+
+
+@pytest.mark.asyncio
+async def test_slack_processing_error_replies_even_without_an_agent_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_processing(event_data: dict[str, Any], repo_config: dict[str, str]) -> None:
+        raise RuntimeError("boom")
+
+    post_reply = AsyncMock(return_value=True)
+    monkeypatch.setattr(slack_webhook, "_process_slack_mention_impl", fail_processing)
+    monkeypatch.setattr(
+        slack_webhook.common, "lookup_slack_thread_id", AsyncMock(return_value=None)
+    )
+    monkeypatch.setattr(slack_webhook, "get_langgraph_client", lambda: _FakeClient())
+    monkeypatch.setattr(slack_failures, "post_slack_thread_reply", post_reply)
+
+    await slack_webhook.process_slack_mention(
+        _event_data(),
+        webhook_common.SlackRepoResolution(Repo(owner="langchain-ai", name="open-swe")),
+    )
+
+    post_reply.assert_awaited_once()
+    await_args = post_reply.await_args
+    assert await_args is not None
+    assert await_args.args[:2] == ("C1", "123.45")
+    assert await_args.kwargs["agent_thread_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_private_dm_does_not_dispatch_when_privacy_metadata_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        slack_webhook.common.ThreadRecord,
+        "read",
+        AsyncMock(return_value=webhook_common.ThreadRecord(exists=False, metadata={})),
+    )
+    dispatch = AsyncMock(return_value={"run_id": "run-1"})
+    monkeypatch.setattr(slack_webhook, "get_langgraph_client", lambda: _FakeClient())
+    monkeypatch.setattr(slack_webhook.common, "get_slack_user_info", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        slack_webhook.common, "fetch_slack_thread_messages", AsyncMock(return_value=[])
+    )
+    monkeypatch.setattr(slack_webhook.common, "get_slack_user_names", AsyncMock(return_value={}))
+    monkeypatch.setattr(
+        slack_webhook.common, "resolve_slack_links_in_context", AsyncMock(return_value=("", []))
+    )
+    monkeypatch.setattr(slack_webhook.User, "login_for_slack", AsyncMock(return_value="alice"))
+    monkeypatch.setattr(
+        slack_webhook.common, "get_valid_access_token", AsyncMock(return_value="tok")
+    )
+    monkeypatch.setattr(
+        slack_webhook.common, "upsert_agent_thread_metadata", AsyncMock(return_value=False)
+    )
+    monkeypatch.setattr(slack_webhook, "_dispatch_or_queue_slack_run", dispatch)
+
+    with pytest.raises(RuntimeError):
+        await slack_webhook._process_slack_mention_impl(
+            SlackRequest(
+                channel_id="D1",
+                channel_context={"is_im": True},
+                thread_ts="1.0",
+                event_ts="1.0",
+                user_id="U1",
+                text="hello",
+                bot_user_id="BOT",
+                thread_id="t1",
+            ),
+            webhook_common.SlackRepoResolution(
+                Repo(owner="langchain-ai", name="open-swe"), explicit=True
+            ),
+        )
+    dispatch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("linked", [True, False])
+async def test_errored_dm_owner_requires_explicit_slack_identity(
+    monkeypatch: pytest.MonkeyPatch, langsmith_users, linked: bool
+) -> None:
+    alice = langsmith_users.add("alice")
+    if linked:
+        alice.identities.append(UserIdentity(provider="slack", external_id="U1"))
+    else:
+        monkeypatch.setattr(slack_webhook.User, "for_identity", AsyncMock(return_value=None))
+    monkeypatch.setattr(slack_webhook.common, "account_link_reason", AsyncMock(return_value=None))
+    upsert = AsyncMock(return_value=True)
+    monkeypatch.setattr(slack_webhook.common, "upsert_agent_thread_metadata", upsert)
+    monkeypatch.setattr(slack_webhook, "get_langgraph_client", lambda: _FakeClient())
+    monkeypatch.setattr(
+        slack_webhook.common, "strip_bot_mention", lambda text, *_args, **_kwargs: text
+    )
+    monkeypatch.setattr(slack_webhook.User, "login_for_slack", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        slack_webhook.common,
+        "get_slack_user_info",
+        AsyncMock(return_value={"profile": {"email": "alice@example.com"}}),
+    )
+    email_lookup = AsyncMock(return_value="alice")
+    monkeypatch.setattr(slack_webhook.User, "login_for_email", email_lookup)
+
+    request = _event_data().model_copy(update={"channel_context": SlackChannelContext(is_im=True)})
+    await slack_webhook._mark_slack_thread_errored("t1", request, None)
+
+    if linked:
+        kwargs = upsert.await_args.kwargs
+        assert kwargs["visibility"] == "private"
+        assert kwargs["owner_login"] == "alice"
+    else:
+        upsert.assert_not_awaited()
+    email_lookup.assert_not_awaited()

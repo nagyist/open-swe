@@ -1,0 +1,1053 @@
+import { CheckIcon, PlusIcon } from "@langchain/macaw-components/icons"
+import { Text } from "@langchain/macaw-components/Text"
+import { useState } from "react"
+import { Link, useNavigate } from "@tanstack/react-router"
+import { Banner } from "@langchain/macaw-components/Banner"
+import { Button } from "@langchain/macaw-components/Button"
+import { Checkbox } from "@langchain/macaw-components/Checkbox"
+import { GroupedTabs } from "@langchain/macaw-components/GroupedTabs"
+import type { IconComponent } from "@langchain/macaw-components/Icon"
+import { IconButton } from "@langchain/macaw-components/IconButton"
+import { Input } from "@langchain/macaw-components/Input"
+import { Link as MacawLink } from "@langchain/macaw-components/Link"
+import { Switch } from "@langchain/macaw-components/Switch"
+import { Textarea } from "@langchain/macaw-components/Textarea"
+import { ClockIcon } from "@phosphor-icons/react/dist/ssr/Clock"
+import { GithubLogoIcon } from "@phosphor-icons/react/dist/ssr/GithubLogo"
+import { KanbanIcon } from "@phosphor-icons/react/dist/ssr/Kanban"
+import { LightningIcon } from "@phosphor-icons/react/dist/ssr/Lightning"
+import { PencilSimpleIcon } from "@phosphor-icons/react/dist/ssr/PencilSimple"
+import { SlackLogoIcon } from "@phosphor-icons/react/dist/ssr/SlackLogo"
+import { TrashIcon } from "@phosphor-icons/react/dist/ssr/Trash"
+
+import type { ModelOption } from "@/lib/api"
+import type {
+  AgentSchedule,
+  GitHubTriggerEvent,
+  LinearTriggerEvent,
+  SlackTriggerEvent,
+  SlackTriggerSenders,
+} from "@/features/agents/lib/types"
+import { AUTOMATION_EVENT_PROVIDERS } from "@/features/agents/lib/types"
+import type { AutomationTemplate } from "@/features/automations/lib/automation-templates"
+import type { ModelSelection } from "@/features/agents/lib/provider/useModelOptions"
+import { RepoSelector } from "@/features/settings/components/RepoSelector"
+import { AutomationRuns } from "@/features/automations/components/AutomationRuns"
+import { TriggerMenu } from "@/features/automations/components/TriggerMenu"
+import { SlackChannelCombobox } from "@/components/SlackChannelCombobox"
+import { SlackChannelTextarea } from "@/components/SlackChannelTextarea"
+import { DEFAULT_CRON, describeCron } from "@/features/automations/lib/cron"
+import type { TriggerDraft } from "@/features/automations/lib/triggers"
+import {
+  BranchPatterns,
+  draftProblem,
+  draftsFor,
+  githubDraft,
+  linearDraft,
+  scheduleDraft,
+  slackDraft,
+  toTriggers,
+} from "@/features/automations/lib/triggers"
+import {
+  useCreateAgentSchedule,
+  useDeleteAgentSchedule,
+  useTriggerAgentSchedule,
+  useUpdateAgentSchedule,
+} from "@/features/agents/lib/queries"
+import { useModelOptions } from "@/features/agents/lib/provider/useModelOptions"
+import { ModelPicker } from "@/features/agents/components/ModelPicker"
+import { useUnsavedChangesWarning } from "@/features/automations/lib/useUnsavedChangesWarning"
+import { useRepos } from "@/lib/profile"
+import { useSession } from "@/lib/session"
+import { cn } from "@/lib/utils"
+
+function eventItems<E extends string>(
+  events: Record<E, string>
+): Array<{ value: E; label: string }> {
+  return (Object.entries(events) as Array<[E, string]>).map(
+    ([value, label]) => ({ value, label })
+  )
+}
+
+const GITHUB_EVENT_ITEMS = eventItems<GitHubTriggerEvent>(
+  AUTOMATION_EVENT_PROVIDERS.github.events
+)
+const SLACK_EVENT_ITEMS = eventItems<SlackTriggerEvent>(
+  AUTOMATION_EVENT_PROVIDERS.slack.events
+)
+const LINEAR_EVENT_ITEMS = eventItems<LinearTriggerEvent>(
+  AUTOMATION_EVENT_PROVIDERS.linear.events
+)
+const SENDER_OPTIONS: Array<{ value: SlackTriggerSenders; display: string }> = [
+  { value: "anyone", display: "Anyone" },
+  { value: "people", display: "People" },
+  { value: "bots", display: "Bots" },
+]
+
+/** ``list`` with ``item`` toggled, kept in ``order``. */
+function toggled<T>(list: Array<T>, item: T, order: Array<T>): Array<T> {
+  return order.filter((value) =>
+    value === item ? !list.includes(value) : list.includes(value)
+  )
+}
+
+interface AutomationEditorProps {
+  mode: "create" | "edit"
+  schedule?: AgentSchedule
+  /** Seeds the form in create mode when the user starts from a template. */
+  template?: AutomationTemplate
+}
+
+function scheduleToSelection(
+  models: Array<ModelOption>,
+  schedule?: AgentSchedule
+): ModelSelection | null {
+  if (!schedule?.model || !schedule.effort) return null
+  const supported = models.some(
+    (model) =>
+      model.id === schedule.model && model.efforts.includes(schedule.effort!)
+  )
+  return supported ? { modelId: schedule.model, effort: schedule.effort } : null
+}
+
+export function AutomationEditor({
+  mode,
+  schedule,
+  template,
+}: AutomationEditorProps) {
+  const navigate = useNavigate()
+  const session = useSession()
+  const isAdmin = session.data?.is_admin === true
+  // A system automation belongs to Robin and only admins manage it; a
+  // personal one, its creator or an admin.
+  const [system, setSystem] = useState(schedule?.system ?? false)
+  const canManage =
+    Boolean(session.data) &&
+    (mode === "create" ||
+      isAdmin ||
+      (schedule?.system !== true &&
+        !!session.data?.user_id &&
+        schedule?.ownerId === session.data.user_id))
+  const reposQuery = useRepos()
+  // A personal automation's runs act as its creator, so its trigger on a repository
+  // known to be public has to be confirmed; a system automation's never does. The
+  // backend decides the same way on save, and likewise lets through a repository
+  // whose visibility it can't read.
+  const isPublicRepo = (repo: string) =>
+    !system &&
+    reposQuery.data?.repositories.find(
+      (each) => each.full_name.toLowerCase() === repo.toLowerCase()
+    )?.private === false
+  const { models, defaultSelection } = useModelOptions()
+
+  const createSchedule = useCreateAgentSchedule()
+  const updateSchedule = useUpdateAgentSchedule()
+  const deleteSchedule = useDeleteAgentSchedule()
+  const triggerSchedule = useTriggerAgentSchedule()
+
+  const [initialDrafts] = useState(() =>
+    draftsFor(schedule, template?.schedule)
+  )
+  const [drafts, setDrafts] = useState<Array<TriggerDraft>>(initialDrafts)
+  const [name, setName] = useState(schedule?.name ?? template?.name ?? "")
+  const [prompt, setPrompt] = useState(
+    schedule?.prompt ?? template?.prompt ?? ""
+  )
+  const [enabled, setEnabled] = useState(schedule?.enabled ?? true)
+  const [adminThread, setAdminThread] = useState(schedule?.adminThread ?? false)
+  // undefined = untouched (derive from the schedule / default as models load).
+  const [selectionOverride, setSelectionOverride] = useState<
+    ModelSelection | null | undefined
+  >(undefined)
+
+  const initialSelection =
+    scheduleToSelection(models, schedule) ?? defaultSelection
+  const activeSelection =
+    selectionOverride !== undefined ? selectionOverride : initialSelection
+  const isDirty =
+    canManage &&
+    (name !== (schedule?.name ?? template?.name ?? "") ||
+      prompt !== (schedule?.prompt ?? template?.prompt ?? "") ||
+      JSON.stringify(toTriggers(drafts)) !==
+        JSON.stringify(toTriggers(initialDrafts)) ||
+      drafts.length !== initialDrafts.length ||
+      enabled !== (schedule?.enabled ?? true) ||
+      adminThread !== (schedule?.adminThread ?? false) ||
+      system !== (schedule?.system ?? false) ||
+      activeSelection?.modelId !== initialSelection?.modelId ||
+      activeSelection?.effort !== initialSelection?.effort)
+  const allowNavigation = useUnsavedChangesWarning(isDirty)
+
+  const isSaving = createSchedule.isPending || updateSchedule.isPending
+
+  const canSave =
+    name.trim().length > 0 &&
+    prompt.trim().length > 0 &&
+    drafts.length > 0 &&
+    drafts.every((draft) => draftProblem(draft, isPublicRepo) === null)
+
+  const updateDraft = (
+    key: string,
+    change: (draft: TriggerDraft) => TriggerDraft
+  ) =>
+    setDrafts((current) =>
+      current.map((draft) => (draft.key === key ? change(draft) : draft))
+    )
+  const removeDraft = (key: string) =>
+    setDrafts((current) => current.filter((draft) => draft.key !== key))
+  // A preset sets the cron; Custom (null) keeps it and switches to text editing.
+  const pickSchedule = (key: string | null, cron: string | null) => {
+    if (key === null) {
+      const draft = scheduleDraft(cron ?? DEFAULT_CRON)
+      setDrafts((current) => [
+        ...current,
+        cron === null ? { ...draft, custom: true } : draft,
+      ])
+      return
+    }
+    updateDraft(key, (draft) =>
+      draft.kind === "schedule"
+        ? cron === null
+          ? { ...draft, custom: true }
+          : { ...draft, cron, custom: false }
+        : draft
+    )
+  }
+  const toggleEvent = (key: string, event: string) =>
+    updateDraft(key, (draft) => {
+      switch (draft.kind) {
+        case "github":
+          return {
+            ...draft,
+            events: toggled(
+              draft.events,
+              event as GitHubTriggerEvent,
+              GITHUB_EVENT_ITEMS.map((item) => item.value)
+            ),
+          }
+        case "slack":
+          return {
+            ...draft,
+            events: toggled(
+              draft.events,
+              event as SlackTriggerEvent,
+              SLACK_EVENT_ITEMS.map((item) => item.value)
+            ),
+          }
+        case "linear":
+          return {
+            ...draft,
+            events: toggled(
+              draft.events,
+              event as LinearTriggerEvent,
+              LINEAR_EVENT_ITEMS.map((item) => item.value)
+            ),
+          }
+        default:
+          return draft
+      }
+    })
+
+  const handleSave = () => {
+    if (!canSave) return
+    const modelIsReal = models.some((m) => m.id === activeSelection?.modelId)
+    const modelId =
+      system && modelIsReal ? (activeSelection?.modelId ?? null) : null
+    const effort =
+      system && modelIsReal ? (activeSelection?.effort ?? null) : null
+
+    if (mode === "create") {
+      createSchedule.mutate(
+        {
+          name: name.trim(),
+          prompt: prompt.trim(),
+          triggers: toTriggers(drafts),
+          admin_thread: isAdmin && adminThread,
+          model_id: modelId,
+          effort,
+          system,
+        },
+        {
+          onSuccess: () => {
+            allowNavigation()
+            navigate({ to: "/agents/automations" })
+          },
+        }
+      )
+      return
+    }
+    if (!schedule) return
+    updateSchedule.mutate(
+      {
+        scheduleId: schedule.id,
+        body: {
+          name: name.trim(),
+          prompt: prompt.trim(),
+          triggers: toTriggers(drafts),
+          admin_thread: isAdmin && adminThread,
+          model_id: modelId,
+          effort,
+          enabled,
+          ...(system !== (schedule.system ?? false) ? { system } : {}),
+        },
+      },
+      {
+        onSuccess: () => {
+          allowNavigation()
+          navigate({ to: "/agents/automations" })
+        },
+      }
+    )
+  }
+
+  const canRun =
+    canManage &&
+    mode === "edit" &&
+    !!schedule &&
+    !isDirty &&
+    !isSaving &&
+    !deleteSchedule.isPending &&
+    !triggerSchedule.isPending
+
+  const handleRun = () => {
+    if (!canRun || !schedule) return
+    triggerSchedule.mutate(schedule.id, {
+      onSuccess: (result) => {
+        void navigate({
+          to: "/agents/$threadId",
+          params: { threadId: result.thread_id },
+        })
+      },
+    })
+  }
+
+  const handleDelete = () => {
+    if (!schedule) return
+    if (!window.confirm(`Delete "${schedule.name}"?`)) return
+    deleteSchedule.mutate(schedule.id, {
+      onSuccess: () => {
+        allowNavigation()
+        navigate({ to: "/agents/automations" })
+      },
+    })
+  }
+
+  return (
+    <div className="flex min-w-0 flex-1 flex-col overflow-y-auto">
+      <header className="flex items-center justify-between gap-space-3 px-space-5 py-space-4 max-md:pt-space-8">
+        <div className="flex min-w-0 items-center gap-space-2 text-xs text-tertiary">
+          <Link
+            to="/agents/automations"
+            className="shrink-0 transition-colors hover:text-primary"
+          >
+            Automations
+          </Link>
+          <span className="shrink-0">/</span>
+          <span className="truncate text-primary">
+            {name.trim() || "New automation"}
+          </span>
+        </div>
+        {canManage && (
+          <div className="flex shrink-0 items-center gap-space-2">
+            {mode === "edit" && (
+              <IconButton
+                icon={TrashIcon}
+                label="Delete automation"
+                color="error"
+                variant="plain"
+                size="md"
+                onClick={handleDelete}
+                disabled={deleteSchedule.isPending}
+              />
+            )}
+            {mode === "edit" && (
+              <Button
+                color="secondary"
+                variant="outlined"
+                size="md"
+                leftDecorator={LightningIcon}
+                onClick={handleRun}
+                disabled={!canRun}
+                title={isDirty ? "Save changes before running" : undefined}
+              >
+                {triggerSchedule.isPending ? "Starting…" : "Run now"}
+              </Button>
+            )}
+            <Button
+              size="md"
+              onClick={handleSave}
+              disabled={!canSave || isSaving || triggerSchedule.isPending}
+            >
+              {isSaving
+                ? "Saving…"
+                : mode === "create"
+                  ? "Create"
+                  : "Save changes"}
+            </Button>
+          </div>
+        )}
+      </header>
+
+      <div className="mx-auto w-full max-w-3xl px-space-5 pt-space-2 pb-space-9">
+        {!canManage && (
+          <Banner intent="neutral" className="mb-space-4">
+            {schedule?.system
+              ? "This system automation is read-only. Only Robin admins can change it."
+              : "This automation is read-only. Only its creator or a Robin admin can change it."}
+          </Banner>
+        )}
+        <Input
+          size="md"
+          debounceMs={0}
+          value={name}
+          onChange={setName}
+          disabled={!canManage}
+          placeholder="Untitled automation"
+          aria-label="Automation name"
+          className="w-full [&_input]:text-base"
+          inputContainerClassName="font-medium border-strong/70 [&:hover:not(:focus-within)]:border-strong"
+        />
+
+        <div className="mt-space-3 flex items-center gap-space-3 text-xs">
+          <Switch
+            checked={enabled}
+            onChange={setEnabled}
+            disabled={!canManage}
+            label={enabled ? "Active" : "Paused"}
+            labelClassName="text-xs text-secondary"
+          />
+          {schedule?.createdBy && (
+            <>
+              <span aria-hidden="true" className="text-quaternary">
+                |
+              </span>
+              <span className="truncate text-tertiary">
+                Created by {schedule.createdBy}
+              </span>
+            </>
+          )}
+        </div>
+
+        <SectionLabel>Triggers</SectionLabel>
+        <div className="flex flex-col gap-space-2">
+          {drafts.map((draft) => {
+            const problem = draftProblem(draft, isPublicRepo)
+            const hint = (fallback: string) => (
+              <p
+                className={cn(
+                  "mt-space-2 text-xs",
+                  problem ? "text-error-secondary" : "text-tertiary"
+                )}
+              >
+                {problem ?? fallback}
+              </p>
+            )
+            const set = (change: Partial<TriggerDraft>) =>
+              updateDraft(
+                draft.key,
+                (current) => ({ ...current, ...change }) as TriggerDraft
+              )
+            if (draft.kind === "schedule") {
+              return (
+                <TriggerCard
+                  key={draft.key}
+                  icon={ClockIcon}
+                  removeLabel="Remove schedule"
+                  onRemove={() => removeDraft(draft.key)}
+                  canManage={canManage}
+                  actions={
+                    canManage && (
+                      <TriggerMenu
+                        onSchedule={(cron) => pickSchedule(draft.key, cron)}
+                        aria-label="Change schedule"
+                        className={CARD_ACTION}
+                      >
+                        <PencilSimpleIcon size={16} weight="regular" />
+                      </TriggerMenu>
+                    )
+                  }
+                >
+                  <div className="-my-0.5 flex items-center gap-space-2">
+                    {draft.custom ? (
+                      <Input
+                        size="md"
+                        debounceMs={0}
+                        value={draft.cron}
+                        onChange={(cron) => set({ cron })}
+                        disabled={!canManage}
+                        placeholder={DEFAULT_CRON}
+                        aria-label="Cron schedule"
+                        className="min-w-0 flex-1"
+                        inputContainerClassName="font-mono border-strong/70 [&:hover:not(:focus-within)]:border-strong"
+                      />
+                    ) : (
+                      <p className="min-w-0 flex-1 text-sm text-primary">
+                        {describeCron(draft.cron, draft.timezone)}{" "}
+                        <span className="font-mono text-xs text-tertiary">
+                          {draft.cron}
+                        </span>
+                      </p>
+                    )}
+                    <TimeZoneToggle
+                      value={draft.timezone}
+                      onChange={(timezone) => set({ timezone })}
+                      disabled={!canManage}
+                    />
+                  </div>
+                  {problem && (
+                    <p className="mt-space-1 text-xs text-error-secondary">
+                      {problem}
+                    </p>
+                  )}
+                </TriggerCard>
+              )
+            }
+            if (draft.kind === "github") {
+              return (
+                <TriggerCard
+                  key={draft.key}
+                  icon={GithubLogoIcon}
+                  removeLabel="Remove GitHub trigger"
+                  onRemove={() => removeDraft(draft.key)}
+                  canManage={canManage}
+                >
+                  <div className="text-sm text-primary">
+                    <RepoSelector
+                      repos={reposQuery.data?.repositories}
+                      selectedRepo={draft.repo}
+                      onRepoChange={(repo) =>
+                        set({ repo, allowPublicRepo: false })
+                      }
+                      placeholder="Choose repository"
+                      triggerClassName="text-secondary"
+                      disabled={!canManage}
+                    />
+                  </div>
+                  <EventChips
+                    items={GITHUB_EVENT_ITEMS}
+                    selected={draft.events}
+                    onToggle={(event) => toggleEvent(draft.key, event)}
+                    disabled={!canManage}
+                  />
+                  {draft.events.some((event) =>
+                    event.startsWith("pull_request.")
+                  ) && (
+                    <div className="mt-space-2 grid gap-space-2 sm:grid-cols-2">
+                      <BranchPatternsInput
+                        label="Skip head branches"
+                        patterns={draft.headBranchesExclude}
+                        onChange={(headBranchesExclude) =>
+                          set({ headBranchesExclude })
+                        }
+                        placeholder={"None; one per line, e.g.\nactions/*"}
+                        disabled={!canManage}
+                      />
+                      <BranchPatternsInput
+                        label="Base branches"
+                        patterns={draft.baseBranches}
+                        onChange={(baseBranches) => set({ baseBranches })}
+                        placeholder={"Any; one per line, e.g.\nmain"}
+                        disabled={!canManage}
+                      />
+                    </div>
+                  )}
+                  {draft.repo && isPublicRepo(draft.repo) && (
+                    <div className="mt-space-2 rounded-md border border-default px-space-2 py-space-2">
+                      <Checkbox
+                        checked={draft.allowPublicRepo}
+                        onCheckedChange={(checked) =>
+                          set({ allowPublicRepo: checked === true })
+                        }
+                        disabled={!canManage}
+                        label="Allow on this public repository"
+                        labelClassName="text-xs font-medium text-primary"
+                        aria-describedby={`${draft.key}-public-repo`}
+                      />
+                      <p
+                        id={`${draft.key}-public-repo`}
+                        className="mt-0.5 pl-space-5 text-xs text-tertiary"
+                      >
+                        Anyone on the internet can open issues and pull requests
+                        here, and what they write becomes part of this
+                        automation&apos;s prompt. Its runs act as you.
+                      </p>
+                    </div>
+                  )}
+                  {hint(
+                    draft.events.includes("pull_request.closed")
+                      ? "PR closed also fires when a pull request is merged."
+                      : "Event details reach the run as untrusted context."
+                  )}
+                </TriggerCard>
+              )
+            }
+            if (draft.kind === "slack") {
+              return (
+                <TriggerCard
+                  key={draft.key}
+                  icon={SlackLogoIcon}
+                  removeLabel="Remove Slack trigger"
+                  onRemove={() => removeDraft(draft.key)}
+                  canManage={canManage}
+                >
+                  <SlackChannelCombobox
+                    value={draft.channel}
+                    onValueChange={(channel) => set({ channel })}
+                    disabled={!canManage}
+                    placeholder="Choose a channel to watch"
+                    aria-label="Slack channel to watch"
+                    className="w-full"
+                  />
+                  <EventChips
+                    items={SLACK_EVENT_ITEMS}
+                    selected={draft.events}
+                    onToggle={(event) => toggleEvent(draft.key, event)}
+                    disabled={!canManage}
+                  />
+                  <div className="mt-space-2 flex flex-wrap items-center gap-space-2 text-xs text-secondary">
+                    <span>From</span>
+                    <GroupedTabs
+                      size="xs"
+                      value={draft.senders}
+                      onChange={(senders) => set({ senders })}
+                      options={SENDER_OPTIONS}
+                      disabled={!canManage}
+                    />
+                  </div>
+                  <div className="mt-space-2 grid gap-space-2 sm:grid-cols-[1fr_9rem]">
+                    <FilterInput
+                      label="Text matches"
+                      value={draft.match}
+                      onChange={(match) => set({ match })}
+                      placeholder="Regular expression, e.g. FIRING|SEV-?1"
+                      disabled={!canManage}
+                    />
+                    <FilterInput
+                      label="Max runs per hour"
+                      value={draft.maxRunsPerHour}
+                      onChange={(maxRunsPerHour) => set({ maxRunsPerHour })}
+                      placeholder="No limit"
+                      inputMode="numeric"
+                      disabled={!canManage}
+                    />
+                  </div>
+                  {hint(
+                    "Top-level messages only. Robin must be in the channel; messages reach the run as untrusted context."
+                  )}
+                </TriggerCard>
+              )
+            }
+            return (
+              <TriggerCard
+                key={draft.key}
+                icon={KanbanIcon}
+                removeLabel="Remove Linear trigger"
+                onRemove={() => removeDraft(draft.key)}
+                canManage={canManage}
+              >
+                <FilterInput
+                  label="Team key"
+                  value={draft.team}
+                  onChange={(team) => set({ team: team.toUpperCase() })}
+                  placeholder="ENG"
+                  disabled={!canManage}
+                />
+                <EventChips
+                  items={LINEAR_EVENT_ITEMS}
+                  selected={draft.events}
+                  onToggle={(event) => toggleEvent(draft.key, event)}
+                  disabled={!canManage}
+                />
+                <div className="mt-space-2 grid gap-space-2 sm:grid-cols-[1fr_1fr_9rem]">
+                  <FilterInput
+                    label="Labels"
+                    value={draft.labels}
+                    onChange={(labels) => set({ labels })}
+                    placeholder="Any; comma-separated"
+                    disabled={!canManage}
+                  />
+                  <FilterInput
+                    label="Project"
+                    value={draft.project}
+                    onChange={(project) => set({ project })}
+                    placeholder="Any"
+                    disabled={!canManage}
+                  />
+                  <FilterInput
+                    label="Max runs per hour"
+                    value={draft.maxRunsPerHour}
+                    onChange={(maxRunsPerHour) => set({ maxRunsPerHour })}
+                    placeholder="No limit"
+                    inputMode="numeric"
+                    disabled={!canManage}
+                  />
+                </div>
+                {hint(
+                  draft.events.includes("issue.labeled")
+                    ? "Label added fires when the issue gains one of these labels, or any label when none are listed."
+                    : "Issue details reach the run as untrusted context."
+                )}
+              </TriggerCard>
+            )
+          })}
+          {canManage && (
+            <TriggerMenu
+              onSchedule={(cron) => pickSchedule(null, cron)}
+              onGitHub={() =>
+                setDrafts((current) => [...current, githubDraft()])
+              }
+              onSlack={() => setDrafts((current) => [...current, slackDraft()])}
+              onLinear={() =>
+                setDrafts((current) => [...current, linearDraft()])
+              }
+              aria-label="Add trigger"
+              className="flex h-auto items-center gap-space-2 self-start rounded-lg border border-dashed border-default px-space-3 py-space-2 text-xs text-secondary transition-colors hover:bg-surface-level-1-hover hover:text-primary dark:hover:bg-surface-level-1-hover"
+            >
+              <PlusIcon size={14} weight="regular" />
+              Add trigger
+            </TriggerMenu>
+          )}
+          {!canManage && drafts.length === 0 && (
+            <p className="text-xs text-tertiary">No triggers.</p>
+          )}
+        </div>
+
+        <SectionLabel>Agent Instructions</SectionLabel>
+        <div className="rounded-xl border border-default bg-surface-level-1 p-space-3">
+          <SlackChannelTextarea
+            bare
+            value={prompt}
+            onValueChange={setPrompt}
+            disabled={!canManage}
+            placeholder="What should Robin do each time this runs?"
+            rows={5}
+            className="w-full resize-none bg-transparent text-sm leading-relaxed text-primary outline-none placeholder:text-placeholder"
+          />
+          <div className="mt-space-2 flex items-center">
+            {system ? (
+              <ModelPicker
+                models={models}
+                selection={activeSelection}
+                onSelectionChange={setSelectionOverride}
+                disabled={!canManage}
+              />
+            ) : (
+              <span className="text-xs text-secondary">Auto</span>
+            )}
+          </div>
+          <div className="mt-space-3 border-t border-subtle pt-space-3">
+            {system ? (
+              <Banner intent="warning" title="Slack history access">
+                Scheduled and test runs of system automations are public, so
+                Robin’s Slack history tools cannot read channel history in those
+                runs, even from public channels. If your task needs it, create a
+                personal automation instead. Personal runs are private, run as
+                their creator, and are billed to them. The workspace bot must
+                have access to the public, internal channel.
+              </Banner>
+            ) : (
+              <p className="text-xs text-secondary">
+                Personal runs are private, run as their creator, and are billed
+                to them. Robin can read public, internal Slack channels the
+                workspace bot can access, not private channels, DMs, or channels
+                shared with another organization.
+              </p>
+            )}
+          </div>
+          {isAdmin && (
+            <div className="mt-space-3 border-t border-subtle pt-space-3">
+              <Checkbox
+                checked={system}
+                onCheckedChange={(checked) => setSystem(checked === true)}
+                disabled={!canManage}
+                label="System automation"
+                labelClassName="text-xs font-medium text-primary"
+                aria-describedby="automation-system-description"
+              />
+              <p
+                id="automation-system-description"
+                className="mt-0.5 pl-space-5 text-xs text-tertiary"
+              >
+                Owned by Robin, not you: only admins manage it. Personal
+                automations run as you, on Auto.
+              </p>
+            </div>
+          )}
+          {isAdmin && (
+            <div className="mt-space-3 border-t border-subtle pt-space-3">
+              <Checkbox
+                checked={adminThread}
+                onCheckedChange={(checked) => setAdminThread(checked === true)}
+                disabled={!canManage}
+                label="Run as admin thread"
+                labelClassName="text-xs font-medium text-primary"
+                aria-describedby="automation-admin-thread-description"
+              />
+              <p
+                id="automation-admin-thread-description"
+                className="mt-0.5 pl-space-5 text-xs text-tertiary"
+              >
+                Allow this automation to use Robin admin capabilities.
+              </p>
+            </div>
+          )}
+        </div>
+
+        {mode === "edit" && schedule && (
+          <>
+            <SectionLabel>Recent runs</SectionLabel>
+            {schedule.lastError && (
+              <Banner
+                intent="error"
+                title="Latest automation error"
+                className="mb-space-3"
+              >
+                {schedule.lastError}
+              </Banner>
+            )}
+            {schedule.lastThreadId && (
+              <div className="mb-space-3">
+                <MacawLink
+                  variant="xs"
+                  as={
+                    <Link
+                      to="/agents/$threadId"
+                      params={{ threadId: schedule.lastThreadId }}
+                    />
+                  }
+                >
+                  Open latest run
+                </MacawLink>
+              </div>
+            )}
+            <AutomationRuns
+              key={schedule.id}
+              automationId={schedule.id}
+              limit={10}
+            />
+          </>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// Every action on a trigger's card: one box and one icon size, as tall as the
+// schedule's controls.
+const CARD_ACTION =
+  "size-8 justify-center rounded-md p-0 text-tertiary hover:bg-surface-level-1-hover hover:text-primary [&_svg]:shrink-0"
+
+/**
+ * A schedule runs in UTC or in the viewer's own zone. A zone saved elsewhere, such
+ * as by the agent, stays a third choice so opening the editor never changes it.
+ */
+function TimeZoneToggle({
+  value,
+  onChange,
+  disabled,
+}: {
+  value: string
+  onChange: (timezone: string) => void
+  disabled: boolean
+}) {
+  // The viewer's own IANA time zone; UTC where the browser can't say.
+  const local = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"
+  const zones = [
+    { value: "UTC", label: "UTC", name: "UTC" },
+    ...(local === "UTC"
+      ? []
+      : [{ value: local, label: "Local", name: `Local time (${local})` }]),
+    ...(value === "UTC" || value === local
+      ? []
+      : [{ value, label: value, name: value }]),
+  ]
+  return (
+    <div
+      role="group"
+      aria-label="Time zone"
+      className="inline-flex h-8 shrink-0 items-center gap-0.5 rounded-lg border border-strong/70 p-0.5"
+    >
+      {zones.map((zone) => {
+        const on = zone.value === value
+        return (
+          <Button
+            color="secondary"
+            variant="plain"
+            size="sm"
+            key={zone.value}
+            type="button"
+            aria-label={zone.name}
+            aria-pressed={on}
+            title={zone.name}
+            onClick={() => onChange(zone.value)}
+            disabled={disabled}
+            className={cn(
+              "h-full min-w-13 rounded-md px-space-2 text-xs font-medium disabled:pointer-events-none",
+              on
+                ? "bg-brand-subtle text-primary hover:bg-brand-subtle disabled:bg-brand-subtle dark:hover:bg-brand-subtle"
+                : "text-secondary hover:bg-surface-level-1-hover hover:text-primary disabled:bg-transparent"
+            )}
+          >
+            {zone.label}
+          </Button>
+        )
+      })}
+    </div>
+  )
+}
+
+function EventChips<E extends string>({
+  items,
+  selected,
+  onToggle,
+  disabled,
+}: {
+  items: Array<{ value: E; label: string }>
+  selected: Array<E>
+  onToggle: (event: E) => void
+  disabled: boolean
+}) {
+  return (
+    <div className="mt-space-2 flex flex-wrap gap-space-2">
+      {items.map((item) => {
+        const on = selected.includes(item.value)
+        return (
+          <Button
+            color="secondary"
+            variant="plain"
+            size="sm"
+            aria-label={item.label}
+            key={item.value}
+            type="button"
+            aria-pressed={on}
+            onClick={() => onToggle(item.value)}
+            disabled={disabled}
+            className={cn(
+              "gap-space-1 rounded-full border px-space-2 py-space-1 disabled:pointer-events-none",
+              on
+                ? "border-brand bg-brand-subtle text-primary hover:bg-brand-subtle disabled:bg-brand-subtle dark:hover:bg-brand-subtle"
+                : "border-default text-secondary hover:bg-surface-level-1-hover hover:text-primary disabled:bg-transparent"
+            )}
+          >
+            {on && (
+              <CheckIcon size={12} weight="bold" className="text-icon-brand" />
+            )}
+            {item.label}
+          </Button>
+        )
+      })}
+    </div>
+  )
+}
+
+function FilterInput({
+  label,
+  value,
+  onChange,
+  placeholder,
+  disabled,
+  inputMode,
+}: {
+  label: string
+  value: string
+  onChange: (value: string) => void
+  placeholder: string
+  disabled: boolean
+  inputMode?: "numeric"
+}) {
+  return (
+    <Input
+      size="sm"
+      label={label}
+      value={value}
+      onChange={onChange}
+      placeholder={placeholder}
+      inputMode={inputMode}
+      disabled={disabled}
+    />
+  )
+}
+
+function BranchPatternsInput({
+  label,
+  patterns,
+  onChange,
+  placeholder,
+  disabled,
+}: {
+  label: string
+  patterns: BranchPatterns
+  onChange: (patterns: BranchPatterns) => void
+  placeholder: string
+  disabled: boolean
+}) {
+  return (
+    <Textarea
+      size="sm"
+      label={label}
+      value={patterns.text}
+      onChange={(text) => onChange(new BranchPatterns(text))}
+      placeholder={placeholder}
+      rows={2}
+      autoResize
+      maxHeight={160}
+      isError={patterns.problem(label) !== null}
+      disabled={disabled}
+    />
+  )
+}
+
+function TriggerCard({
+  icon: Icon,
+  children,
+  actions,
+  removeLabel,
+  onRemove,
+  canManage,
+}: {
+  icon: IconComponent
+  children: React.ReactNode
+  actions?: React.ReactNode
+  removeLabel: string
+  onRemove: () => void
+  canManage: boolean
+}) {
+  return (
+    <div className="flex items-start gap-space-3 rounded-xl border border-default bg-surface-level-1 px-space-3 py-space-2">
+      <div className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-surface-level-2 text-secondary">
+        <Icon size={16} weight="regular" />
+      </div>
+      <div className="min-w-0 flex-1 py-0.5">{children}</div>
+      {canManage && (
+        <div className="flex shrink-0 items-center gap-0.5">
+          {actions}
+          <Button
+            color="secondary"
+            variant="plain"
+            size="sm"
+            type="button"
+            aria-label={removeLabel}
+            onClick={onRemove}
+            className={CARD_ACTION}
+          >
+            <TrashIcon size={16} weight="regular" />
+          </Button>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function SectionLabel({ children }: { children: React.ReactNode }) {
+  return (
+    <Text
+      as="h2"
+      variant="sm"
+      weight="medium"
+      color="secondary"
+      className="mt-space-6 mb-space-2"
+    >
+      {children}
+    </Text>
+  )
+}

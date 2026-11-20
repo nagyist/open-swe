@@ -1,0 +1,235 @@
+import { Button } from "@langchain/macaw-components/Button"
+import { CaretDownIcon, CheckIcon } from "@langchain/macaw-components/icons"
+import { useState } from "react"
+import { Badge } from "@langchain/macaw-components/Badge"
+import { Checkbox } from "@langchain/macaw-components/Checkbox"
+import { IconButton } from "@langchain/macaw-components/IconButton"
+import { Input } from "@langchain/macaw-components/Input"
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@langchain/macaw-components/Popover"
+import { ArrowsClockwiseIcon } from "@phosphor-icons/react/dist/ssr/ArrowsClockwise"
+import { FolderIcon } from "@phosphor-icons/react/dist/ssr/Folder"
+
+import { useRefreshRepos } from "@/lib/profile"
+import { RepositoryLabels } from "@/lib/repo"
+import { cn } from "@/lib/utils"
+
+type RepoOption = { full_name: string; private?: boolean; archived?: boolean }
+
+interface RepoSelectorProps {
+  repos?: Array<RepoOption>
+  selectedRepo?: string | null
+  selectedLabel?: string
+  onRepoChange: (repo: string | null) => void
+  placeholder?: string
+  emptySelectionLabel?: string
+  searchPlaceholder?: string
+  noMatchesLabel?: string
+  className?: string
+  triggerClassName?: string
+  dropdownClassName?: string
+  side?: "top" | "bottom"
+  disabled?: boolean
+  allowArchived?: boolean
+}
+
+export function RepoSelector({
+  repos,
+  selectedRepo,
+  selectedLabel,
+  onRepoChange,
+  placeholder = "Select repository",
+  emptySelectionLabel = "No repository",
+  searchPlaceholder = "Search repositories…",
+  noMatchesLabel = "No matches",
+  className,
+  triggerClassName,
+  dropdownClassName,
+  side = "bottom",
+  disabled = false,
+  allowArchived = false,
+}: RepoSelectorProps) {
+  const [open, setOpen] = useState(false)
+  const [query, setQuery] = useState("")
+  const [showArchived, setShowArchived] = useState(false)
+  const refresh = useRefreshRepos()
+
+  const labels = new RepositoryLabels([
+    ...(repos ?? []).map((repo) => repo.full_name),
+    ...(selectedRepo ? [selectedRepo] : []),
+  ])
+  const selectionLabel =
+    selectedRepo === undefined
+      ? placeholder
+      : (selectedLabel ??
+        (selectedRepo ? labels.label(selectedRepo) : emptySelectionLabel))
+  const filteredRepos = (repos ?? []).filter(
+    (repo) =>
+      ((allowArchived && showArchived) || !repo.archived) &&
+      labels.matches(repo.full_name, query)
+  )
+
+  return (
+    <Popover
+      open={open}
+      onOpenChange={(value) => {
+        setOpen(value)
+        if (!value) setQuery("")
+      }}
+    >
+      <div className={cn("min-w-0 shrink", className)}>
+        <PopoverTrigger asChild>
+          <Button
+            color="secondary"
+            variant="plain"
+            size="sm"
+            aria-label={selectionLabel}
+            type="button"
+            disabled={disabled}
+            title={selectedRepo ?? undefined}
+            className={cn(
+              "max-w-[260px] cursor-pointer gap-space-1 text-secondary transition-opacity hover:opacity-80 disabled:cursor-default disabled:bg-transparent disabled:opacity-60",
+              triggerClassName
+            )}
+          >
+            <FolderIcon size={14} weight="regular" className="shrink-0" />
+            <span className="flex-1 truncate text-left">{selectionLabel}</span>
+            <CaretDownIcon
+              size={12}
+              weight="regular"
+              className="shrink-0 opacity-70"
+            />
+          </Button>
+        </PopoverTrigger>
+        <PopoverContent
+          align="start"
+          side={side}
+          className={cn(
+            "flex max-h-72 w-72 flex-col overflow-hidden bg-elevated p-0 text-xs text-primary",
+            dropdownClassName
+          )}
+        >
+          <div className="border-b border-default">
+            <Input
+              autoFocus
+              size="sm"
+              variant="plain"
+              value={query}
+              onChange={setQuery}
+              placeholder={searchPlaceholder}
+              aria-label={searchPlaceholder}
+              rightDecorator={
+                <IconButton
+                  icon={ArrowsClockwiseIcon}
+                  label="Refresh repositories"
+                  size="xs"
+                  color="secondary"
+                  variant="plain"
+                  loading={refresh.isPending}
+                  disabled={refresh.isPending}
+                  onClick={() => refresh.mutate()}
+                />
+              }
+            />
+          </div>
+          {allowArchived && repos?.some((repo) => repo.archived) && (
+            <Checkbox
+              size="sm"
+              label="Show archived"
+              checked={showArchived}
+              onCheckedChange={(checked) => setShowArchived(checked === true)}
+              containerClassName="border-b border-default px-space-2 py-space-1"
+              labelClassName="text-secondary"
+            />
+          )}
+          <div className="overflow-y-auto">
+            <Button
+              color="secondary"
+              variant="plain"
+              size="sm"
+              aria-label={emptySelectionLabel}
+              aria-pressed={selectedRepo === null}
+              type="button"
+              onClick={() => {
+                onRepoChange(null)
+                setOpen(false)
+                setQuery("")
+              }}
+              className={cn(
+                "h-auto justify-start whitespace-normal",
+                "w-full px-space-2 py-space-1 text-left hover:bg-elevated-hover",
+                selectedRepo === null ? "text-primary" : "text-secondary"
+              )}
+            >
+              {emptySelectionLabel}
+              {selectedRepo === null && (
+                <CheckIcon
+                  size={12}
+                  weight="regular"
+                  aria-label="Selected"
+                  className="ml-auto shrink-0 text-icon-secondary"
+                />
+              )}
+            </Button>
+            {filteredRepos.length === 0 ? (
+              <div className="px-space-2 py-space-1 text-secondary">
+                {noMatchesLabel}
+              </div>
+            ) : (
+              filteredRepos.map((repo) => {
+                const selected = repo.full_name === selectedRepo
+                return (
+                  <Button
+                    color="secondary"
+                    variant="plain"
+                    size="sm"
+                    aria-label={`${repo.full_name}${repo.private === undefined ? "" : ` ${repo.private ? "Private" : "Public"}${repo.archived ? " archive" : ""}`}`}
+                    aria-pressed={selected}
+                    key={repo.full_name}
+                    type="button"
+                    title={repo.full_name}
+                    onClick={() => {
+                      onRepoChange(repo.full_name)
+                      setOpen(false)
+                      setQuery("")
+                    }}
+                    className={cn(
+                      "h-auto justify-start whitespace-normal",
+                      "w-full gap-space-2 px-space-2 py-space-1 text-left hover:bg-elevated-hover",
+                      selected ? "text-primary" : "text-secondary"
+                    )}
+                  >
+                    <span className="min-w-0 flex-1 break-words">
+                      {labels.label(repo.full_name)}
+                    </span>
+                    {repo.private !== undefined && (
+                      <Badge
+                        color="secondary"
+                        size="xxs"
+                        rounded="xs"
+                        className="shrink-0"
+                      >
+                        {`${repo.private ? "Private" : "Public"}${repo.archived ? " archive" : ""}`}
+                      </Badge>
+                    )}
+                    {selected && (
+                      <CheckIcon
+                        size={12}
+                        weight="regular"
+                        aria-label="Selected"
+                        className="shrink-0 text-icon-secondary"
+                      />
+                    )}
+                  </Button>
+                )
+              })
+            )}
+          </div>
+        </PopoverContent>
+      </div>
+    </Popover>
+  )
+}

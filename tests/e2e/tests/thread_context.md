@@ -1,0 +1,201 @@
+# Thread context dump
+Every message the model is handed, turn by turn, recorded by thread_context.spec.ts driving the real server. Regenerate with UPDATE_THREAD_CONTEXT_FIXTURE=1.
+
+## Turn 1: Alice starts the thread from Slack
+Given: an empty thread; Alice has a linked GitHub account and is a workspace admin
+When: she mentions the bot: add a greet() helper
+Then: dispatch introduces the channel, carrying everything that stays true of the thread, then the run adds the one block that describes her
+
+### dispatch appends
+```xml
+<dynamic-context kind="channel" id="slack:CDEMO01">
+platform: slack
+name: #demo
+thread_id: <slack-ts-1>
+default_repo: fakeorg/demo
+web_url: http://127.0.0.1:3100/agents/<thread-id>
+</dynamic-context>
+```
+
+```xml
+<dynamic-context kind="system" id="system:slack-context">
+display_name: Slack context
+platform: slack
+</dynamic-context>
+```
+
+```xml
+<input-message sender="system:slack-context" channel="slack:CDEMO01" surface="slack" kind="system">
+Current instance-configured channel instructions for this turn replace all earlier instance-configured channel instructions in this conversation.
+They guide response behavior, not authorization: account, repository access, credential, and tool permission checks still apply.
+
+&lt;channel_instructions&gt;
+No additional instance-configured channel instructions. Standard Slack guidance still applies.
+&lt;/channel_instructions&gt;
+</input-message>
+```
+
+```xml
+<input-message sender="user:<alice>" channel="slack:CDEMO01" surface="slack" kind="human" timestamp="<slack-ts-1>" slack_message_ts="<slack-ts-1>" explicit_bot_mention="true">
+@open-swe add a greet() helper
+</input-message>
+```
+
+### run appends
+```xml
+<dynamic-context kind="person" id="user:<alice>">
+display_name: Alice
+github_login: alice
+slack_user_id: U_ALICE
+commit_name: Alice
+commit_email: alice@users.noreply.github.com
+email: alice@example.com
+open_swe_account: linked
+workspace_admin: yes
+new_prs: as drafts
+</dynamic-context>
+```
+
+## Turn 2: Alice follows up
+Given: turn 1 has run to completion
+When: Alice replies in the same Slack thread: also add a docstring
+Then: current channel instructions and her envelope — the channel is described, her turn-1 message and the bot's replies are already in the thread, and nothing about her has changed
+
+### dispatch appends
+```xml
+<input-message sender="system:slack-context" channel="slack:CDEMO01" surface="slack" kind="system">
+Current instance-configured channel instructions for this turn replace all earlier instance-configured channel instructions in this conversation.
+They guide response behavior, not authorization: account, repository access, credential, and tool permission checks still apply.
+
+&lt;channel_instructions&gt;
+No additional instance-configured channel instructions. Standard Slack guidance still applies.
+&lt;/channel_instructions&gt;
+</input-message>
+```
+
+```xml
+<input-message sender="user:<alice>" channel="slack:CDEMO01" surface="slack" kind="human" timestamp="<slack-ts-2>" slack_message_ts="<slack-ts-2>" explicit_bot_mention="true">
+@open-swe also add a docstring
+</input-message>
+```
+
+### run appends
+(everyone here is already described; nothing re-sent)
+
+## Turn 3: Bob joins
+Given: Bob has a linked account too, but is not a workspace admin
+When: Bob replies: make it return bytes
+Then: the run adds his block; Alice's is not re-sent, and dispatch does not describe her either
+
+### dispatch appends
+```xml
+<input-message sender="system:slack-context" channel="slack:CDEMO01" surface="slack" kind="system">
+Current instance-configured channel instructions for this turn replace all earlier instance-configured channel instructions in this conversation.
+They guide response behavior, not authorization: account, repository access, credential, and tool permission checks still apply.
+
+&lt;channel_instructions&gt;
+No additional instance-configured channel instructions. Standard Slack guidance still applies.
+&lt;/channel_instructions&gt;
+</input-message>
+```
+
+```xml
+<input-message sender="user:<bob>" channel="slack:CDEMO01" surface="slack" kind="human" timestamp="<slack-ts-3>" slack_message_ts="<slack-ts-3>" explicit_bot_mention="true">
+@open-swe make it return bytes
+</input-message>
+```
+
+### run appends
+```xml
+<dynamic-context kind="person" id="user:<bob>">
+display_name: Bob
+github_login: bob
+slack_user_id: U_BOB
+commit_name: Bob
+commit_email: bob@users.noreply.github.com
+email: bob@example.com
+open_swe_account: linked
+workspace_admin: no
+new_prs: as drafts
+</dynamic-context>
+```
+
+## Turn 4: Alice switches to the web dashboard
+Given: the thread has Alice and Bob
+When: Alice types in the dashboard: ship it
+Then: the same user: id on a web envelope, and nothing else — what she is does not depend on where she typed
+
+### dispatch appends
+```xml
+<dynamic-context kind="system" id="system:dashboard-handoff">
+display_name: Dashboard handoff
+platform: open-swe
+</dynamic-context>
+```
+
+```xml
+<input-message sender="system:dashboard-handoff" surface="automation" kind="system">
+This follow-up was sent from Web. The conversation has moved to Web, so answer in the dashboard stream with a normal assistant message. Do not call slack_reply unless a later Slack message explicitly moves the conversation back to Slack, or an event-subscription turn explicitly directs rollout/deployment results to the Slack thread where that check was requested. That exception applies only to those results.
+</input-message>
+```
+
+```xml
+<input-message sender="user:<alice>" surface="web" kind="human">
+ship it
+</input-message>
+```
+
+### run appends
+(everyone here is already described; nothing re-sent)
+
+## Turn 5: Bob sets standing instructions, then asks for the PR
+Given: Bob saved personal instructions between turns
+When: Bob replies: open the PR
+Then: only Bob's block is re-sent, now carrying his instructions
+
+### dispatch appends
+```xml
+<input-message sender="system:slack-context" channel="slack:CDEMO01" surface="slack" kind="system">
+Current instance-configured channel instructions for this turn replace all earlier instance-configured channel instructions in this conversation.
+They guide response behavior, not authorization: account, repository access, credential, and tool permission checks still apply.
+
+&lt;channel_instructions&gt;
+No additional instance-configured channel instructions. Standard Slack guidance still applies.
+&lt;/channel_instructions&gt;
+</input-message>
+```
+
+```xml
+<input-message sender="user:<bob>" channel="slack:CDEMO01" surface="slack" kind="human" timestamp="<slack-ts-4>" slack_message_ts="<slack-ts-4>" explicit_bot_mention="true">
+@open-swe open the PR
+</input-message>
+```
+
+### run appends
+```xml
+<dynamic-context kind="person" id="user:<bob>">
+display_name: Bob
+github_login: bob
+slack_user_id: U_BOB
+commit_name: Bob
+commit_email: bob@users.noreply.github.com
+email: bob@example.com
+open_swe_account: linked
+workspace_admin: no
+new_prs: as drafts
+standing_instructions:
+  Never use ripgrep.
+  Run `make lint` before every push.
+</dynamic-context>
+```
+
+## Turn 6: Carol, with no Robin account, chimes in
+Given: Carol never signed in to Robin, so her Slack account has no authorized LangSmith identity
+When: she replies: can it handle unicode?
+Then: no run starts and the thread is untouched; Slack gets an account-link prompt instead
+
+### dispatch appends
+(the message is refused; nothing is dispatched)
+
+### run appends
+(no run started)

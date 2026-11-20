@@ -1,0 +1,113 @@
+"""Unit tests for the unified-diff parsing helpers."""
+
+from unittest.mock import AsyncMock
+
+import httpx2
+import pytest
+
+from openswe.github import http as github_http
+from openswe.review.diff import (
+    compute_diff_line_set,
+    extract_diff_hunk,
+    fetch_pr_metadata,
+    is_range_in_diff,
+)
+
+_TWO_FILE_DIFF = """diff --git a/foo.py b/foo.py
+index 1111111..2222222 100644
+--- a/foo.py
++++ b/foo.py
+@@ -10,3 +10,4 @@ def existing():
+     pass
++    new_line_13 = 1
++    new_line_14 = 2
+     return 1
+diff --git a/bar.py b/bar.py
+index 3333333..4444444 100644
+--- a/bar.py
++++ b/bar.py
+@@ -1,2 +1,3 @@
+ import os
++import sys
+ print(os.getcwd())
+@@ -50,3 +51,4 @@ def other():
+     line_a = 1
++    line_b = 2
+     line_c = 3
+"""
+
+
+def test_compute_diff_line_set_also_covers_old_side_lines() -> None:
+    """LEFT-side findings anchor to deleted/old-side lines; the line set
+    must expose those so add_finding doesn't wrongly reject them."""
+    line_set = compute_diff_line_set(_TWO_FILE_DIFF)
+    assert line_set["foo.py"]["LEFT"] == {10, 11, 12}
+    assert line_set["bar.py"]["LEFT"] == {1, 2, 50, 51, 52}
+
+
+def test_is_range_in_diff_left_side_accepts_old_line_numbers() -> None:
+    """A finding with side=LEFT must validate against the OLD-side line set,
+    not the new-side. The new-side hunk for foo.py is +10..+13; the old-side
+    is -10..-12. Asserting against the wrong side would falsely reject a
+    valid deleted-line finding."""
+    line_set = compute_diff_line_set(_TWO_FILE_DIFF)
+    assert is_range_in_diff(line_set, "foo.py", 12, 12, side="LEFT") is True
+    # And the same line on RIGHT side is also in-diff (it's context).
+    assert is_range_in_diff(line_set, "foo.py", 12, 12, side="RIGHT") is True
+    # A LEFT anchor on a line that doesn't exist on the old side must be rejected.
+    assert is_range_in_diff(line_set, "foo.py", 13, 13, side="LEFT") is False
+
+
+@pytest.mark.parametrize(
+    ("start", "end"),
+    [(1, 1), (1, 3)],
+)
+def test_extract_diff_hunk_supports_single_line_and_range(start: int, end: int) -> None:
+    hunk = extract_diff_hunk(_TWO_FILE_DIFF, "bar.py", start, end)
+    assert hunk is not None
+    assert "import sys" in hunk
+
+
+@pytest.mark.asyncio
+async def test_compute_diff_in_sandbox_uses_three_dot_for_merge_base() -> None:
+    """First-review path passes merge_base=True so we use base...head, not base..head."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from openswe.review.diff import compute_diff_in_sandbox
+
+    backend = MagicMock()
+    backend.aexecute = AsyncMock(return_value="")
+
+    await compute_diff_in_sandbox(
+        backend, work_dir="/w", base_ref="base", head_ref="head", merge_base=True
+    )
+    cmd = backend.aexecute.call_args.args[0]
+    assert "base...head" in cmd
+    assert "base..head" not in cmd.replace("base...head", "")
+    assert "--no-prefix" not in cmd  # invalid flag must not appear
+
+
+@pytest.mark.parametrize("body", ["Why it changed", None])
+async def test_pr_metadata_is_read_over_graphql_not_rest(
+    monkeypatch: pytest.MonkeyPatch, body: str | None
+) -> None:
+    # The installation's REST quota runs out; a review's title and body must not spend it.
+    request = AsyncMock(
+        return_value=httpx2.Response(
+            200,
+            json={"data": {"repository": {"pullRequest": {"title": "Fix it", "body": body}}}},
+            request=httpx2.Request("POST", github_http.GITHUB_GRAPHQL),
+        )
+    )
+    monkeypatch.setattr(github_http, "github_request", request)
+
+    metadata = await fetch_pr_metadata(owner="acme", repo="widgets", pr_number=7, token="t")
+
+    assert metadata == ("Fix it", body or "")
+    request.assert_awaited_once()
+    assert request.await_args.args[1:] == ("POST", github_http.GITHUB_GRAPHQL)
+    assert request.await_args.kwargs["json"]["variables"] == {
+        "owner": "acme",
+        "repo": "widgets",
+        "number": 7,
+    }

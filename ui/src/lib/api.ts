@@ -1,0 +1,2155 @@
+import { productAnalytics } from "@/lib/analytics"
+/**
+ * Typed client for the open-swe dashboard backend.
+ *
+ * All requests are sent with credentials so the httpOnly `osw_session`
+ * cookie set by the OAuth callback rides along on cross-origin calls.
+ */
+
+import { dashboardApiBase } from "./api-base"
+import {
+  DashboardRequestError,
+  REQUEST_ID_HEADER,
+  dashboardApiUrl,
+  dashboardForwardedHeaders,
+  networkError,
+  newRequestId,
+} from "./dashboard-fetch"
+
+export interface AppNotification {
+  id: string
+  title: string
+  body: string
+  url: string
+  /** The in-app route for `url`, or null when it points outside the dashboard. */
+  path: string | null
+}
+
+export interface AuditLogFilters {
+  start_time: string
+  end_time: string
+  operation_name?: string
+  user_id?: string
+  api_key_id?: string
+  workspace_id?: string
+}
+
+export interface AuditLog {
+  id: string
+  request_time: string
+  operation_name: string
+  operation_succeeded: boolean | null
+  api_key_id: string | null
+  user_id: string | null
+  workspace_id: string | null
+  enrichments: {
+    source: "http" | "tool"
+    actor_kind: "person" | "api_key" | "github_actions" | "agent" | null
+    actor_login: string | null
+    request_method: string | null
+    request_path: string | null
+    response_status_code: number | null
+    resource_ids: string[]
+    workspace: string | null
+    thread_id: string | null
+    delegated_from_sandbox_id: string | null
+    settings_scope: "instance" | "workspace" | null
+    settings_changes: Record<
+      string,
+      {
+        before: boolean | number | "[REDACTED]" | null
+        after: boolean | number | "[REDACTED]" | null
+      }
+    > | null
+    expedited_exclusions: ExpeditedExclusions | null
+  }
+}
+
+export interface ExpeditedExclusions {
+  pull_request_id: string | null
+  base_sha: string
+  head_sha: string
+  approvals_md_sha256: string
+  requested: {
+    path: string
+    hunks: number[]
+    guideline: string
+    reason: string
+  }[]
+  hunks: {
+    path: string
+    digest: string
+    header: string
+    additions: number
+    deletions: number
+    guideline: string
+    reason: string
+  }[]
+}
+
+export interface EventLogFilters {
+  start_time: string
+  end_time: string
+  source?: string
+  event_type?: string
+  event_type_prefix?: string
+  delivery_id?: string
+  user_id?: string
+  workspace_id?: string
+  repository_id?: string
+  pull_request_id?: string
+}
+
+export interface LoggedEvent {
+  source: string
+  event_type: string
+  delivery_id: string
+  received_at: string
+  user_id: string | null
+  workspace_id: string | null
+  repository_id: string | null
+  pull_request_id: string | null
+  payload: unknown
+  visibility: "public" | "private" | "admin"
+  visible_to_user_id: string | null
+  user_name: string | null
+  workspace_name: string | null
+  repository_name: string | null
+  pull_request_name: string | null
+  pull_request_title: string | null
+}
+
+export interface EventLogUser {
+  id: string
+  display_name: string
+  logins: string
+}
+
+export interface EventLogPage {
+  items: LoggedEvent[]
+  cursor: string | null
+}
+
+export interface AuditLogsPage {
+  items: AuditLog[]
+  cursor: string | null
+}
+
+const API_BASE = dashboardApiBase()
+
+const GITHUB_IMAGE_HOST_RE =
+  /^(?:www\.)?github\.com$|\.githubusercontent\.com$/i
+
+/**
+ * Build an authenticated proxy URL for GitHub-hosted PR images. Private-repo
+ * attachments can't be loaded directly by the browser, so they're routed
+ * through the dashboard backend which holds the App token. Non-GitHub image
+ * URLs are returned unchanged.
+ */
+export function reviewImageProxyUrl(
+  owner: string,
+  repo: string,
+  number: number,
+  src: string
+): string {
+  let parsed: URL
+  try {
+    parsed = new URL(src)
+  } catch {
+    return src
+  }
+  if (
+    parsed.protocol !== "https:" ||
+    !GITHUB_IMAGE_HOST_RE.test(parsed.hostname)
+  ) {
+    return src
+  }
+  if (
+    /^(?:www\.)?github\.com$/i.test(parsed.hostname) &&
+    !parsed.pathname.startsWith("/user-attachments/")
+  ) {
+    return src
+  }
+  const path = `/reviews/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${number}/image`
+  return `${API_BASE}/dashboard/api${path}?url=${encodeURIComponent(src)}`
+}
+
+export interface ClientErrorReport {
+  error_id: string
+  title: string
+  error_message: string
+  status: number | null
+  mutation: string | null
+  path: string
+}
+
+export class ApiError extends DashboardRequestError {
+  constructor(
+    status: number,
+    message: string,
+    requestId?: string,
+    retryAfter?: string | null
+  ) {
+    super(status, message, requestId, undefined, retryAfter)
+    this.name = "ApiError"
+  }
+}
+
+export function isGithubReauthError(error: unknown): boolean {
+  if (!(error instanceof ApiError)) return false
+  if (error.status === 401) return true
+  return /github token|re-login required/i.test(error.message)
+}
+
+async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+  return productAnalytics.mutation(path, init.method, async () => {
+    const requestId = newRequestId()
+    const res = await fetch(dashboardApiUrl(path), {
+      ...init,
+      credentials: "include",
+      headers: {
+        "Content-Type": "application/json",
+        [REQUEST_ID_HEADER]: requestId,
+        ...dashboardForwardedHeaders(),
+        ...init.headers,
+      },
+    }).catch((cause: unknown) => {
+      throw networkError(cause, requestId)
+    })
+    if (!res.ok) {
+      let message = res.statusText
+      try {
+        const body = await res.json()
+        if (body?.detail)
+          message =
+            typeof body.detail === "string"
+              ? body.detail
+              : JSON.stringify(body.detail)
+      } catch {
+        /* ignore */
+      }
+      throw new ApiError(
+        res.status,
+        message,
+        requestId,
+        res.headers.get("Retry-After")
+      )
+    }
+    if (res.status === 204) return undefined as T
+    return (await res.json()) as T
+  })
+}
+
+let activePrDetails = 0
+const pendingPrDetails: Array<() => void> = []
+
+async function loadPrDetails(
+  repo: string,
+  number: number
+): Promise<OpenPullRequest | null> {
+  await new Promise<void>((resolve) => {
+    const start = () => {
+      activePrDetails++
+      resolve()
+    }
+    if (activePrDetails < 4) start()
+    else pendingPrDetails.push(start)
+  })
+  try {
+    return await request<OpenPullRequest | null>(
+      `/repos/${repo.split("/").map(encodeURIComponent).join("/")}/pulls/${number}`
+    )
+  } finally {
+    activePrDetails--
+    pendingPrDetails.shift()?.()
+  }
+}
+
+export interface SessionUser {
+  login: string
+  auth_provider?: "github" | "langsmith"
+  github_login?: string | null
+  /** How the server labels this user's messages; empty until they have a name. */
+  display_name?: string
+  email: string | null
+  avatar_url: string | null
+  user_id?: string | null
+  slack_user_id?: string | null
+  is_admin: boolean
+  /** The organizations this Open SWE serves (`ALLOWED_GITHUB_ORGS`), lowercase. */
+  base_orgs?: Array<string>
+  /** Mirrors the user's preference: what Enter does while a run is live. */
+  follow_up_behavior?: FollowUpBehavior
+  /** Mirrors the user's preference: open Changes when a run that edited files finishes. */
+  auto_show_changes?: boolean
+  /** Whether the server records new threads into the transcript log. */
+  transcript_recording?: boolean
+  slack_oauth_enabled?: boolean
+  build_info?: BuildInfo
+  api_base_url?: string
+  slack_base_url?: string
+}
+
+/** Identifiers an artifact discovered about itself; `null` means unavailable, never assumed. */
+export interface BuildInfo {
+  backend: {
+    environment?: string | null
+    /** LangGraph Platform revision id — opaque, never a git SHA. */
+    revision_id: string | null
+    commit: string | null
+    built_at: string | null
+    package_version: string | null
+  }
+  dashboard: {
+    commit: string | null
+    built_at: string | null
+    served: boolean
+  }
+}
+
+/** Normalizes session build identifiers, including older backends with no field. */
+export function normalizeBuildInfo(raw: unknown): BuildInfo | null {
+  if (typeof raw !== "object" || raw === null) return null
+  const backend = (raw as { backend?: unknown }).backend
+  if (typeof backend !== "object" || backend === null) return null
+  const b = backend as Partial<BuildInfo["backend"]>
+  const dashboard = (raw as { dashboard?: unknown }).dashboard
+  const d =
+    typeof dashboard === "object" && dashboard !== null
+      ? (dashboard as Partial<BuildInfo["dashboard"]>)
+      : undefined
+  return {
+    backend: {
+      environment: typeof b.environment === "string" ? b.environment : null,
+      revision_id: typeof b.revision_id === "string" ? b.revision_id : null,
+      commit: typeof b.commit === "string" ? b.commit : null,
+      built_at: typeof b.built_at === "string" ? b.built_at : null,
+      package_version:
+        typeof b.package_version === "string" ? b.package_version : null,
+    },
+    dashboard: {
+      commit: d && typeof d.commit === "string" ? d.commit : null,
+      built_at: d && typeof d.built_at === "string" ? d.built_at : null,
+      served: typeof d?.served === "boolean" ? d.served : false,
+    },
+  }
+}
+
+export interface ModelOption {
+  id: string
+  label: string
+  efforts: Array<string>
+  default_effort: string
+  supports_images: boolean
+  can_be_default?: boolean
+  context_window?: number | null
+}
+
+export interface OptionsPayload {
+  default_repo: string | null
+  models: Array<ModelOption>
+  model_selection_enabled?: boolean
+  default_agent_model: string
+  default_agent_reasoning_effort: string
+  default_agent_subagent_model: string
+  default_agent_subagent_reasoning_effort: string
+}
+
+export interface Profile {
+  experimental_background_callbacks?: boolean | null
+  login?: string
+  email?: string
+  default_repo?: string | null
+  base_branch?: string | null
+  branch_prefix?: string | null
+  auto_fix_ci?: boolean
+  auto_human_review_enabled?: boolean
+  review_request_dms_enabled?: boolean
+  concierge_mode?: boolean
+  experimental_classify?: boolean
+  experimental_force_code_mode?: boolean
+  draft_prs?: boolean
+  review_draft_prs?: boolean | null
+  slack_onboarding_dismissed?: boolean
+  updated_at?: string
+}
+
+export interface ProfileUpdate {
+  experimental_background_callbacks?: boolean | null
+  default_repo?: string | null
+  base_branch?: string | null
+  branch_prefix?: string | null
+  auto_fix_ci?: boolean
+  auto_human_review_enabled?: boolean
+  review_request_dms_enabled?: boolean
+  concierge_mode?: boolean
+  experimental_classify?: boolean
+  experimental_force_code_mode?: boolean
+  draft_prs?: boolean
+  review_draft_prs?: boolean | null
+  slack_onboarding_dismissed?: boolean
+}
+
+export interface SlackBotOption {
+  team_id: string
+  bot_id: string
+  user_id: string
+  name: string
+  image_url: string
+}
+
+export interface AllowedSlackBot {
+  team_id: string
+  bot_id: string
+  user_id: string
+  app_id: string
+  name: string
+  created_by: string
+  created_at: string
+  image_url: string
+}
+
+/** An app reviews follow, by id, pinned to the release (an app version id) an admin approved. */
+export interface AppRelease {
+  app: string
+  release: string
+}
+
+/** An app in everyone's web UI, and the repositories it reads for each person who can. */
+export interface FeaturedApp extends AppRelease {
+  repositories?: Array<string>
+}
+
+/** Robin-wide settings. */
+export interface RobinSettings {
+  review_draft_prs: boolean
+  pr_summaries: boolean
+  review_trace_links: boolean
+  /** The apps whose review step reviews of private repositories follow, each at the release an admin approved. */
+  review_apps?: Array<AppRelease> | null
+  /** Checks, by name, whose success means a pull request's preview serves its head commit. */
+  review_app_preview_checks?: Array<string> | null
+  /** Instance only: listed apps added to everyone's web UI, each at the release an admin approved. */
+  featured_apps?: Array<FeaturedApp> | null
+  /** Instance only: the domains, each with its subdomains, a review's browser may sign in to. */
+  review_browser_domains?: Array<string> | null
+  /** Instance only: the `<connection>/<tool>` that signs a review's browser in. */
+  review_browser_session_tool?: string | null
+  /** Tri-state adaptive model routing toggle; threads may override this default. */
+  model_routing_enabled?: boolean | null
+  /** Routing v2: split Auto threads 50/50 between Balanced and Performance instead of classifying. */
+  model_routing_split?: boolean | null
+  model_selection_enabled?: boolean | null
+  fable_enabled?: boolean
+  /** Experimental: approve and merge tiny PRs from their Slack thread. Off by default. */
+  expedited_review_enabled?: boolean
+  org_guidelines?: string | null
+  default_agent_model?: string | null
+  default_agent_reasoning_effort?: string | null
+  default_agent_subagent_model?: string | null
+  default_agent_subagent_reasoning_effort?: string | null
+  default_agent_routing_fast_model?: string | null
+  default_agent_routing_fast_reasoning_effort?: string | null
+  default_agent_routing_balanced_model?: string | null
+  default_agent_routing_balanced_reasoning_effort?: string | null
+  default_agent_routing_performance_model?: string | null
+  default_agent_routing_performance_reasoning_effort?: string | null
+  default_repo?: string | null
+  default_reviewer_model?: string | null
+  default_reviewer_reasoning_effort?: string | null
+  default_reviewer_subagent_model?: string | null
+  default_reviewer_subagent_reasoning_effort?: string | null
+  default_review_scout_model?: string | null
+  default_review_scout_reasoning_effort?: string | null
+  default_thread_title_model?: string | null
+  default_thread_title_reasoning_effort?: string | null
+  /** Share (0–100) of newly reviewed pull requests that also get a shadow review. */
+  review_shadow_percent?: number | null
+  review_shadow_model?: string | null
+  review_shadow_reasoning_effort?: string | null
+  updated_at?: string | null
+}
+
+export type RobinSettingsPatch = Partial<RobinSettings>
+
+/** One of the caller's LangSmith Managed Tools servers. */
+export interface ManagedServer {
+  /** LangSmith's server ID or built-in key. */
+  id: string
+  name: string
+  kind: "none" | "oauth" | "secret"
+  enabled: boolean
+  connected: boolean
+  /** The caller has a stored credential for it, so it can be disconnected. */
+  has_credential: boolean
+  /** The caller registered it for themselves alone. */
+  personal: boolean
+  icon_url?: string | null
+  icon_dark_url?: string | null
+}
+
+/** A service someone can connect: an OAuth consent page or an API key page. */
+export type ConnectableServer = Pick<ManagedServer, "id" | "name" | "kind">
+
+/** The card the agent offered in a thread, identified by its tool call. */
+export interface ManagedToolsConnectCard {
+  threadId: string
+  cardId: string
+}
+
+export interface ManagedToolsView {
+  configured: boolean
+  langsmith_connected: boolean
+  servers: ManagedServer[]
+}
+
+/** An MCP server someone registers for themselves alone. */
+export interface NewManagedServer {
+  name: string
+  url: string
+  kind: ManagedServer["kind"]
+  /** The request header an API key goes in, when `kind` is `secret`. */
+  header?: string
+}
+
+/** Robin's bot kit: what runs outside private threads load, as the bot's LMT profile. */
+export interface BotToolsView {
+  configured: boolean
+  /** LangSmith lets only a user read a kit, so the admin's own sign-in reads it. */
+  langsmith_connected: boolean
+  servers: ManagedServer[]
+}
+
+export interface ManagedConnectResult {
+  connected: boolean
+  url?: string | null
+}
+
+export interface AdminUser {
+  user_id: string
+  github_login: string
+  email: string
+  slack_user_id: string | null
+  display_name: string
+  avatar_url: string
+  is_admin: boolean
+}
+
+export interface AnnouncementSummary {
+  id: string
+  text: string
+  author: string
+  created_at: string
+  finished_at: string | null
+  recipients: number
+  sent: number
+  failed: number
+}
+
+export interface AnnouncementApproval {
+  id: string
+  thread_id: string
+  text: string
+  recipients: number
+  payload_digest: string
+  created_at: string
+  expires_at: string
+}
+
+export interface AnnouncementsView {
+  recipients: number
+  items: Array<AnnouncementSummary>
+  approvals: Array<AnnouncementApproval>
+}
+
+export interface AdminUsersPage {
+  items: Array<AdminUser>
+  total: number
+  page: number
+  page_size: number
+}
+
+export type UsageLeaderboardPeriod = "24h" | "7d" | "30d" | "all"
+
+/** Origin + mount path only, so diagnostics can name the API without tokens or query data. */
+export function describeApiBase(apiBaseUrl: string | undefined): {
+  origin: string | null
+  path: string
+} {
+  const path = `${dashboardApiBase()}/dashboard/api`
+  if (!apiBaseUrl) return { origin: null, path }
+  try {
+    return { origin: new URL(apiBaseUrl).origin, path }
+  } catch {
+    return { origin: null, path }
+  }
+}
+
+export type UsageLeaderboardSort =
+  | "rank"
+  | "user"
+  | "favorite_model"
+  | "invocations"
+  | "threads"
+  | "avg_invocations_per_thread"
+  | "total_tokens"
+  | "total_cost_usd"
+  | "avg_invocation_seconds"
+  | "avg_thread_seconds"
+  | "prs_opened"
+  | "merged_prs"
+  | "merged_prs_per_thread"
+  | "agent_loc"
+  | "feedback_given"
+  | "prs_reviewed"
+export type SortDirection = "asc" | "desc"
+
+export interface AnalyticsMetadata {
+  reporting_cutover_at: string
+  collection_started_at: string | null
+  last_processed_at: string | null
+  data_source: "event_projections"
+  completeness: "not_started" | "observed_events_only"
+  has_pending_events: boolean
+  has_failed_events: boolean
+  as_of: string
+  /** Absent on backends that predate build reporting. */
+  build_info?: BuildInfo
+}
+
+export interface LeaderboardUser {
+  name: string
+  github_login: string | null
+  email?: string | null
+  avatar_url?: string | null
+}
+
+export interface UsageLeaderboardRow {
+  rank: number
+  user: LeaderboardUser
+  favorite_model: string
+  favorite_model_effort?: string | null
+  invocations: number
+  threads?: number
+  /** @deprecated Rolling compatibility with older clients. */
+  agent_runs?: number
+  prs_opened: number
+  merged_prs: number
+  merged_prs_per_thread?: number
+  agent_loc: number
+  prs_reviewed?: number
+  feedback_given: number
+  is_top_feedback_contributor?: boolean
+  additions: number
+  deletions: number
+  total_tokens: number
+  total_cost_usd: number
+  invocations_without_cost?: number
+  invocations_with_partial_cost?: number
+  avg_invocation_seconds: number
+  avg_thread_seconds?: number
+  /** @deprecated Rolling compatibility with older clients. */
+  avg_run_seconds?: number
+}
+
+export interface ReviewerStatsCounterRow {
+  name: string
+  count: number
+}
+
+export interface ReviewerStatsPayload {
+  period: UsageLeaderboardPeriod
+  reviewed_prs: number
+  prs_with_findings: number
+  findings_recorded: number
+  surfaced_findings: number
+  addressed_findings: number
+  resolved_after_update: number
+  dismissed_findings: number
+  unresolved_surfaced_findings: number
+  resolution_rate: number
+  human_replies: number
+  severity_counts: Record<string, number>
+  top_categories: Array<ReviewerStatsCounterRow>
+  generated_at_ms: number | null
+}
+
+export interface UsageLeaderboardPayload extends AnalyticsMetadata {
+  period: UsageLeaderboardPeriod
+  rows: Array<UsageLeaderboardRow>
+  total_members: number
+  next_cursor?: string | null
+  current_user_rank: number | null
+  generated_at_ms: number | null
+  reviewer_stats: ReviewerStatsPayload
+}
+
+export interface UsageHealthPayload extends AnalyticsMetadata {
+  period: UsageLeaderboardPeriod
+  cache: {
+    hit_rate: number | null
+    prompt_tokens: number | null
+    cache_read_tokens: number | null
+    preservation_added_at: string
+    period_predates_fix: boolean
+    missing_usage_runs: number
+    observed_runs: number
+    data_note: string
+  }
+}
+
+export interface PRMergeRateEffort {
+  effort: string | null
+  merged: number
+  closed_without_merge: number
+  mature_pending: number
+  waiting: number
+  cohort_size: number
+  decided_denominator: number
+  decided_merge_rate: number | null
+  mature_denominator: number
+  mature_cohort_merge_share: number | null
+  avg_merge_seconds?: number | null
+  avg_delivery_seconds?: number | null
+  median_distance_basis_points?: number | null
+  distance_sample_size?: number
+}
+
+export interface PRMergeRateCohort {
+  model_id: string | null
+  model_attribution_quality: "effective" | "configured" | "unavailable"
+  merged: number
+  closed_without_merge: number
+  mature_pending: number
+  waiting: number
+  cohort_size: number
+  decided_denominator: number
+  decided_merge_rate: number | null
+  mature_denominator: number
+  mature_cohort_merge_share: number | null
+  avg_merge_seconds: number | null
+  /**
+   * Present-but-null means every PR in the group lacked valid timing; a missing
+   * key (older backend) means the metric itself is unsupported. Zero is a real
+   * measurement, distinct from both.
+   */
+  avg_delivery_seconds?: number | null
+  efforts: PRMergeRateEffort[]
+  median_distance_basis_points?: number | null
+  mean_distance_basis_points?: number | null
+  distance_sample_size?: number
+}
+
+export interface PRMergeRatePayload extends AnalyticsMetadata {
+  status: "ready" | "not_started" | "no_prs" | "suppressed"
+  metric: "pr_outcomes_by_opening_invocation_configured_model"
+  definition: string
+  maturity_days: number
+  period: UsageLeaderboardPeriod
+  suppression_threshold: number
+  cohorts: PRMergeRateCohort[]
+  unavailable_thread_ids: string[]
+}
+
+/** The PR report plus when this browser last received it, kept apart from the server's `as_of`. */
+export interface PRMergeRateResponse {
+  payload: PRMergeRatePayload
+  fetchedAt: string
+}
+
+export interface Repository {
+  full_name: string
+  private: boolean
+  archived: boolean
+}
+
+export interface Installation {
+  id: number
+  account: string | null
+  account_type: string | null
+}
+
+export interface ReposPayload {
+  installations: Array<Installation>
+  repositories: Array<Repository>
+}
+
+/** What a positive approval assessment does; `null` is the `dry_run` default. */
+export type ReviewApprovalMode = "off" | "dry_run" | "approve"
+
+export interface ApprovalsFileStatus {
+  found: boolean
+}
+
+export interface ReviewStyle {
+  full_name: string
+  owner?: string
+  name?: string
+  custom_prompt: string | null
+  approval_mode?: ReviewApprovalMode | null
+  created_by?: string
+  created_at?: string
+  updated_at?: string
+}
+
+export interface AgentInstructions {
+  full_name: string
+  owner?: string
+  name?: string
+  instructions: string
+  created_by?: string
+  created_at?: string
+  updated_at?: string
+}
+
+export interface UserInstructions {
+  login?: string
+  instructions: string
+  created_at?: string
+  updated_at?: string
+  updated_by?: string
+}
+
+export type ThreadVisibility = "public" | "private"
+/** Queue holds a follow-up until the run ends; steer delivers it into the live run. */
+export type FollowUpBehavior = "queue" | "steer"
+
+export interface UserPreferences {
+  default_visibility: ThreadVisibility
+  follow_up_behavior: FollowUpBehavior
+  auto_show_changes: boolean
+}
+
+export interface Skill {
+  name: string
+  description: string
+  instructions: string
+  created_at?: string
+  updated_at?: string
+}
+
+export interface SkillInput {
+  description: string
+  instructions: string
+}
+
+export interface SkillsPage {
+  items: Array<Skill>
+  next_offset: number | null
+}
+
+export interface OrganizationSkillsPage {
+  items: Array<Skill>
+  next_cursor: string | null
+}
+
+/** A person in the Slack workspace, offered when mentioning someone in a composer. */
+export interface SlackUserOption {
+  id: string
+  name: string
+  display_name: string
+  real_name: string
+}
+
+/** A channel the Slack bot can see. */
+export interface SlackChannelOption {
+  id: string
+  name: string
+  is_private: boolean
+  is_member: boolean
+  is_ext_shared: boolean
+  is_pending_ext_shared?: boolean
+  num_members: number | null
+}
+
+/** The stored channel directory; refreshing while a walk over Slack is due or running. */
+export interface SlackChannelDirectory {
+  channels: Array<SlackChannelOption>
+  refreshing: boolean
+}
+
+export type JsonValue =
+  | string
+  | number
+  | boolean
+  | null
+  | JsonValue[]
+  | { [key: string]: JsonValue }
+
+export interface ExecutionDefaults {
+  prompt: string
+  repos: string[]
+  setup_script: string
+  update_script: string
+  snapshot_id: string | null
+  snapshot_name: string | null
+  base_snapshot_id: string | null
+  vcpus: number | null
+  mem_bytes: number | null
+  fs_capacity_bytes: number | null
+  create_params: Record<string, JsonValue>
+}
+
+export interface RepositorySettings {
+  repo: string
+  may_start_threads: boolean
+}
+
+export interface RoutingSettings {
+  repos: RepositorySettings[]
+  slack_channels: Array<{ channel_id: string; prompt: string }>
+}
+
+export type FindingSeverity = "low" | "medium" | "high" | "critical"
+export type FindingConfidence = "low" | "medium" | "high"
+export type FindingStatus = "open" | "resolved" | "dismissed"
+export type FindingGroup = "bug" | "investigate" | "informational"
+
+export interface FindingInteraction {
+  kind: "human_reply" | "bot_reply"
+  author?: string
+  body?: string
+  created_at?: string
+}
+
+export interface ReviewFinding {
+  id: string
+  severity: FindingSeverity
+  confidence: FindingConfidence
+  category: string
+  title: string
+  description: string
+  suggestion: string | null
+  file: string
+  start_line: number | null
+  end_line: number | null
+  side: "LEFT" | "RIGHT"
+  in_diff: boolean
+  status: FindingStatus
+  outdated: boolean
+  resolution_note: string | null
+  diff_hunk: string | null
+  github_thread_resolved: boolean
+  github_review_comment_id: number | null
+  interactions: Array<FindingInteraction>
+  group: FindingGroup
+}
+
+export interface ReviewCommentCreate {
+  path: string
+  line: number
+  side: "LEFT" | "RIGHT"
+  body: string
+  start_line?: number | null
+  start_side?: "LEFT" | "RIGHT" | null
+}
+
+export type PullRequestReviewEvent = "APPROVE" | "REQUEST_CHANGES" | "COMMENT"
+
+export interface PendingReviewComment {
+  id: number
+  node_id: string
+  path: string
+  line: number | null
+  start_line: number | null
+  side: "LEFT" | "RIGHT" | null
+  start_side: "LEFT" | "RIGHT" | null
+  body: string
+}
+
+/** The viewer's unsubmitted GitHub review; its comments post together on submit. */
+export interface PendingReview {
+  id: number
+  node_id: string
+  comments: Array<PendingReviewComment>
+}
+
+export interface SubmittedReview {
+  id: number
+  html_url: string
+  state: string
+}
+
+export interface ReviewCounts {
+  open: number
+  resolved: number
+  dismissed: number
+  bugs: number
+  flags: number
+}
+
+export interface ReviewSummary {
+  thread_id: string
+  owner: string
+  repo: string
+  number: number
+  title: string
+  url: string
+  head_ref: string
+  base_ref: string
+  author: string
+  head_sha: string
+  watch: boolean
+  status: "running" | "error" | "idle"
+  counts: ReviewCounts
+  updated_at: string | null
+  full_name?: string
+}
+
+export interface ReviewListPayload {
+  reviews: Array<ReviewSummary>
+  page: number
+  has_more: boolean
+}
+
+export interface OpenPullRequest {
+  author?: string | null
+  detailsLoading?: boolean
+  detailsError?: boolean
+  repo: string
+  number: number
+  title: string
+  state: "open" | "closed" | "merged"
+  draft: boolean | null
+  additions: number | null
+  deletions: number | null
+  mergeable: boolean | null
+  mergeState: string
+  autoMerge?: boolean
+  headSha: string | null
+  headRef: string | null
+  reviewDecision: "approved" | "changes_requested" | "none" | null
+  /** Each reviewer's standing review; null when the reviews could not be read. */
+  reviewers: PullRequestReviewer[] | null
+  // Branch protection still wants an approval this PR does not have.
+  reviewRequired: boolean
+  statusAvailable: boolean
+  createdAt: string | null
+  updatedAt: string | null
+  ci: "passing" | "failing" | "pending" | "unknown" | "none"
+  requiredChecksPassing: boolean | null
+  failingChecks: string[]
+  pendingChecks: string[]
+  // Required by the base branch but never reported on the head, so GitHub
+  // refuses the merge.
+  missingChecks: string[]
+  // null when the review threads could not be read, which is not the same
+  // answer as none being unresolved.
+  unresolvedThreads: number | null
+  conversationResolutionRequired: boolean | null
+  // Why it is on the To Review list: Open SWE assigned it, may assign it once
+  // its review goes unclaimed, or it was linked in a Slack thread naming you.
+  assignment?:
+    | "assigned"
+    | "requested"
+    | "tentative"
+    | "mentioned"
+    | "draft"
+    | "speculative"
+    | null
+}
+
+export interface PullRequestReviewer {
+  login: string
+  avatarUrl: string | null
+  /** A comment never replaces an earlier approval or change request. */
+  state: "approved" | "changes_requested" | "dismissed" | "commented"
+}
+
+export type MergeMethod = "squash" | "merge" | "rebase"
+
+export type PullRequestActionName =
+  | "merge"
+  | "disable-auto-merge"
+  | "close"
+  | "mark-ready"
+  | "update-branch"
+
+export type PullRequestActionRequest =
+  | {
+      action: "merge"
+      sha: string | null
+      merge_method: MergeMethod
+      auto_merge?: boolean
+    }
+  | { action: "disable-auto-merge" }
+  | { action: "close"; reason?: string }
+  | { action: "mark-ready" }
+  | { action: "update-branch"; sha: string | null }
+
+export interface PullRequestActionResult {
+  action: PullRequestActionName
+  done: boolean
+  auto_merge?: boolean
+}
+
+export type PullRequestThreadIntent =
+  | { intent: "open"; title: string }
+  | { intent: "message"; title: string; message: string }
+  | { intent: "fix-up"; context: OpenPullRequest | null }
+  | { intent: "address-comment"; comment_url: string; instructions: string }
+  | { intent: "comments"; comments: Array<AgentBatchComment> }
+
+export type AgentBatchComment =
+  | ({ kind: "line" } & Omit<ReviewCommentCreate, "start_side">)
+  | { kind: "thread"; comment_url: string; instructions: string }
+
+export interface PostedReviewComment {
+  id: number
+  html_url: string
+}
+
+export interface ResolveReviewThreadsResult {
+  resolved: Array<string>
+  failed: Array<string>
+}
+
+export interface PullRequestThreadResult {
+  thread_id: string
+  already_running: boolean
+}
+
+export interface PullRequestSearchResult {
+  repo: string
+  number: number
+  url: string
+  title: string
+  state: "open" | "draft" | "merged" | "closed"
+}
+
+export interface PullRequestSearchResults {
+  pull_requests: PullRequestSearchResult[]
+  has_more: boolean
+}
+
+export interface OpenPullRequestsPayload {
+  pullRequests: OpenPullRequest[]
+  nextPage: number | null
+  incomplete: boolean
+  updatedAt: string
+}
+
+export interface ReviewUserRef {
+  login: string
+  avatar_url?: string | null
+}
+
+export interface ReviewCheckRun {
+  name: string
+  status: string
+  conclusion: string | null
+  url: string | null
+}
+
+export interface ReviewPrDetails {
+  state: string
+  title: string
+  body: string
+  description_pull_requests?: Array<number>
+  additions: number
+  deletions: number
+  changed_files: number
+  commits: number
+  head_sha: string
+  head_ref: string
+  base_ref: string
+  author: ReviewUserRef | null
+  created_at: string | null
+  merged_at: string | null
+  assignees: Array<ReviewUserRef>
+  requested_reviewers: Array<ReviewUserRef>
+  labels: Array<{ name: string; color: string | null }>
+}
+
+/** Inclusive `[start, end]` line numbers. */
+export type ReviewLineRange = [number, number]
+
+/** Added lines are head line numbers; deleted lines are merge-base line numbers. */
+export interface ReviewWalkthroughFile {
+  path: string
+  added: Array<ReviewLineRange>
+  deleted: Array<ReviewLineRange>
+}
+
+export interface ReviewWalkthroughStep {
+  index: number
+  title: string
+  summary: string
+  other: boolean
+  files: Array<ReviewWalkthroughFile>
+}
+
+/** The review scout's reading order for the PR's current head. */
+export interface ReviewWalkthrough {
+  head_sha: string
+  /** The scout's summary of what people asked for; empty when it wrote none. */
+  human_input: string
+  steps: Array<ReviewWalkthroughStep>
+}
+
+/** `status: "none"` is a PR the reviewer graph has never run on. */
+export interface ReviewDetail extends Omit<
+  ReviewSummary,
+  "thread_id" | "status"
+> {
+  thread_id: string | null
+  trace_url?: string | null
+  status: ReviewSummary["status"] | "none"
+  assessment?: PublishedReviewAssessment | null
+  pr: ReviewPrDetails
+  findings: Array<ReviewFinding>
+  walkthrough: ReviewWalkthrough | null
+  /** A review scout is working on this head, so `walkthrough` is on its way. */
+  walkthrough_running: boolean
+  /** Why the latest scout run on this head failed, when it did. */
+  walkthrough_error: string | null
+  /** When a scout held back by GitHub's rate limit starts again (ISO time); `null` when none waits. */
+  walkthrough_delayed_until?: string | null
+  walkthrough_scout_thread_id: string | null
+  /** What the running scout has done so far; set only while `walkthrough_running`. */
+  walkthrough_progress: ScoutProgress | null
+  /** Why the latest reviewer run failed, when `status` is `"error"`. */
+  review_error: string | null
+}
+
+export interface ScoutAction {
+  tool: string
+  target: string | null
+}
+
+export interface ScoutProgress {
+  steps: number
+  /** The latest action is still executing. */
+  running: boolean
+  recent: Array<ScoutAction>
+}
+
+export interface PublishedReviewAssessment {
+  approved?: boolean
+  dry_run?: boolean
+  review_id: number
+  head_sha: string
+  risk_score: number
+  decision:
+    | "would_approve"
+    | "would_approve_conditionally"
+    | "needs_human_review"
+  explanation: string
+  approval_condition?: string | null
+  auto_approved?: string | null
+}
+
+export interface ReviewAssessmentFeedbackInput {
+  rating: "helpful" | "unhelpful"
+  comment: string
+}
+
+export interface ReviewAssessmentFeedback extends ReviewAssessmentFeedbackInput {
+  login: string
+  updated_at: string
+}
+
+export interface ReviewDiffFile {
+  baseSha: string
+  headSha: string
+  path: string
+  previousPath: string | null
+  status: "added" | "removed" | "modified" | "renamed"
+  additions: number
+  deletions: number
+  // A full per-file git patch. null when GitHub omits one (binary or very
+  // large files), which is what `unrenderable` reports.
+  patch: string | null
+  unrenderable?: boolean
+}
+
+export interface ReviewFileContents {
+  originalContent: string | null
+  modifiedContent: string | null
+}
+
+export type PreviewFileStatus =
+  | "added"
+  | "removed"
+  | "modified"
+  | "renamed"
+  | "copied"
+  | "changed"
+  | "unchanged"
+
+export interface PreviewFile {
+  path: string
+  status: PreviewFileStatus
+  additions: number
+  deletions: number
+}
+
+export interface PreviewReply {
+  author: string | null
+  body: string
+  url: string | null
+}
+
+export interface PreviewThread {
+  thread_id: string | null
+  author: string | null
+  body: string
+  path: string
+  line: number | null
+  url: string | null
+  replies: Array<PreviewReply>
+}
+
+export interface PreviewCheck {
+  name: string
+  status: string
+  conclusion: string | null
+  url: string | null
+}
+
+export interface PullRequestPreview {
+  title: string
+  body: string
+  author: string | null
+  author_avatar_url: string | null
+  state: string
+  draft: boolean
+  head_ref: string
+  base_ref: string
+  commits: number
+  additions: number
+  deletions: number
+  changed_files: number
+  files: Array<PreviewFile>
+  // null when GitHub could not answer, which is not the same as none unresolved
+  // or no checks configured.
+  unresolved: Array<PreviewThread> | null
+  checks: Array<PreviewCheck> | null
+  /** The review scout's summary of what people asked for; empty until one has run. */
+  human_input: string
+}
+
+export interface ReviewDiffPayload {
+  files: Array<ReviewDiffFile>
+  total_additions: number
+  total_deletions: number
+  truncated: boolean
+}
+
+export interface ReviewChatMeta {
+  available: boolean
+  assistant_id: string
+  thread_id: string
+}
+
+/**
+ * Absolute base URL for the PR chat's LangGraph StreamProvider. The SDK builds
+ * request URLs as `new URL(apiUrl + path)`, so this must be absolute — a
+ * same-origin base is promoted using the current origin.
+ */
+export function reviewChatApiBase(
+  owner: string,
+  repo: string,
+  number: number
+): string {
+  const path = `${API_BASE}/dashboard/api/reviews/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${number}/chat`
+  if (/^https?:\/\//.test(path)) return path
+  if (typeof window !== "undefined") {
+    return `${window.location.origin}${path.startsWith("/") ? "" : "/"}${path}`
+  }
+  return path
+}
+
+export type ReviewerEvalScoreMode = "all_findings" | "surfaced_findings"
+export type ReviewerEvalSeverity = "low" | "medium" | "high" | "critical"
+
+export interface ReviewerEvalConfig {
+  dataset_name: string
+  experiment_prefix: string
+  max_concurrency: number
+  langsmith_project: string
+  langgraph_url: string
+  assistant_id: string
+  model_id: string
+  reasoning_effort: string
+  score_mode: ReviewerEvalScoreMode
+  severity_threshold: ReviewerEvalSeverity
+}
+
+export interface ReviewerEvalStartRequest {
+  dataset_name: string
+  experiment_prefix: string
+  max_concurrency: number
+  model_id: string
+  reasoning_effort: string
+  score_mode: ReviewerEvalScoreMode
+  severity_threshold: ReviewerEvalSeverity
+  limit: number | null
+}
+
+export interface ReviewerEvalProgress {
+  completed: number
+  total: number | null
+}
+
+export interface ReviewerEvalStatus {
+  status: "idle" | "starting" | "running" | "completed" | "failed"
+  run_name?: string
+  langsmith_project: string
+  limit: number | null
+  config_snapshot?: ReviewerEvalConfig
+  started_at: string | null
+  finished_at: string | null
+  created_by: string | null
+  experiment_url: string | null
+  error: string | null
+  log_tail: string | null
+  progress?: ReviewerEvalProgress | null
+  worker_id?: string | null
+}
+
+export interface HumanReviewRequestResult {
+  success: boolean
+  error: string
+  request_id: string
+  channel: string
+  channel_name: string
+  permalink: string
+  reused: boolean
+}
+
+async function pullRequestAction(
+  pr: OpenPullRequest,
+  body: PullRequestActionRequest
+): Promise<PullRequestActionResult> {
+  const result = await request<PullRequestActionResult>(
+    `/repos/${pr.repo.split("/").map(encodeURIComponent).join("/")}/pulls/${pr.number}/action`,
+    { method: "POST", body: JSON.stringify(body) }
+  )
+  if (!result.done)
+    throw new Error(
+      "GitHub did not confirm the change. Refresh to check the PR."
+    )
+  return result
+}
+
+function pullRequestThread(
+  repo: string,
+  number: number,
+  body: PullRequestThreadIntent
+): Promise<PullRequestThreadResult> {
+  return request<PullRequestThreadResult>(
+    `/repos/${repo.split("/").map(encodeURIComponent).join("/")}/pulls/${number}/thread`,
+    { method: "POST", body: JSON.stringify(body) }
+  )
+}
+
+export const api = {
+  me: () => request<SessionUser>("/me"),
+  options: () => request<OptionsPayload>("/options"),
+  concierge: () =>
+    request<{ thread_id: string | null; channel_id: string | null }>(
+      "/slack/concierge"
+    ),
+  profile: () => request<Profile>("/profile"),
+  dismissSlackOnboarding: () =>
+    request<Profile>("/profile/slack-onboarding-dismissal", { method: "POST" }),
+  saveProfile: (body: ProfileUpdate) =>
+    request<Profile>("/profile", { method: "PUT", body: JSON.stringify(body) }),
+  repos: (options?: { refresh?: boolean }) =>
+    request<ReposPayload>(options?.refresh ? "/repos?refresh=true" : "/repos"),
+  listReviewStyles: () => request<Array<ReviewStyle>>("/review-styles"),
+  createReviewStyle: (full_name: string) =>
+    request<ReviewStyle>("/review-styles", {
+      method: "POST",
+      body: JSON.stringify({ full_name }),
+    }),
+  getReviewStyle: (full_name: string) =>
+    request<ReviewStyle>(`/review-styles/${encodeURIComponent(full_name)}`),
+  saveReviewStylePrompt: (full_name: string, custom_prompt: string) =>
+    request<ReviewStyle>(`/review-styles/${encodeURIComponent(full_name)}`, {
+      method: "PUT",
+      body: JSON.stringify({ custom_prompt }),
+    }),
+  saveReviewApprovalMode: (
+    full_name: string,
+    approval_mode: ReviewApprovalMode | null
+  ) =>
+    request<ReviewStyle>(`/review-styles/${encodeURIComponent(full_name)}`, {
+      method: "PUT",
+      body: JSON.stringify({ approval_mode }),
+    }),
+  getApprovalsFile: (full_name: string) =>
+    request<ApprovalsFileStatus>(
+      `/review-styles/${encodeURIComponent(full_name)}/approvals-file`
+    ),
+  deleteReviewStyle: (full_name: string) =>
+    request<void>(`/review-styles/${encodeURIComponent(full_name)}`, {
+      method: "DELETE",
+    }),
+  reportClientError: (report: ClientErrorReport) =>
+    request<void>("/client-errors", {
+      method: "POST",
+      body: JSON.stringify(report),
+      keepalive: true,
+    }),
+  getMyInstructions: () => request<UserInstructions>("/me/instructions"),
+  saveMyInstructions: (instructions: string) =>
+    request<UserInstructions>("/me/instructions", {
+      method: "PUT",
+      body: JSON.stringify({ instructions }),
+    }),
+  deleteMyInstructions: () =>
+    request<void>("/me/instructions", { method: "DELETE" }),
+  getMyPreferences: () => request<UserPreferences>("/me/preferences"),
+  saveMyPreferences: (preferences: UserPreferences) =>
+    request<UserPreferences>("/me/preferences", {
+      method: "PUT",
+      body: JSON.stringify(preferences),
+    }),
+  listSkills: (offset = 0) =>
+    request<SkillsPage>(`/skills?limit=100&offset=${offset}`),
+  createSkill: (name: string, body: SkillInput) =>
+    request<Skill>("/skills", {
+      method: "POST",
+      body: JSON.stringify({ name, ...body }),
+    }),
+  saveSkill: (name: string, body: SkillInput) =>
+    request<Skill>(`/skills/${encodeURIComponent(name)}`, {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
+  deleteSkill: (name: string) =>
+    request<void>(`/skills/${encodeURIComponent(name)}`, {
+      method: "DELETE",
+    }),
+  listOrganizationSkills: (cursor: string | null = null) =>
+    request<OrganizationSkillsPage>(
+      `/organization-skills?limit=100${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`
+    ),
+  createOrganizationSkill: (name: string, body: SkillInput) =>
+    request<Skill>("/organization-skills", {
+      method: "POST",
+      body: JSON.stringify({ name, ...body }),
+    }),
+  saveOrganizationSkill: (name: string, body: SkillInput) =>
+    request<Skill>(`/organization-skills/${encodeURIComponent(name)}`, {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
+  deleteOrganizationSkill: (name: string) =>
+    request<void>(`/organization-skills/${encodeURIComponent(name)}`, {
+      method: "DELETE",
+    }),
+  listAgentInstructions: () =>
+    request<Array<AgentInstructions>>("/agent-instructions"),
+  createAgentInstructions: (full_name: string) =>
+    request<AgentInstructions>("/agent-instructions", {
+      method: "POST",
+      body: JSON.stringify({ full_name }),
+    }),
+  getAgentInstructions: (full_name: string) =>
+    request<AgentInstructions>(
+      `/agent-instructions/${encodeURIComponent(full_name)}`
+    ),
+  saveAgentInstructions: (full_name: string, instructions: string) =>
+    request<AgentInstructions>(
+      `/agent-instructions/${encodeURIComponent(full_name)}`,
+      {
+        method: "PUT",
+        body: JSON.stringify({ instructions }),
+      }
+    ),
+  deleteAgentInstructions: (full_name: string) =>
+    request<void>(`/agent-instructions/${encodeURIComponent(full_name)}`, {
+      method: "DELETE",
+    }),
+  getRouting: () => request<RoutingSettings>("/routing"),
+  configureRoutingRepository: (repo: string, may_start_threads: boolean) =>
+    request<RepositorySettings>(
+      `/routing/repositories/${repo.split("/").map(encodeURIComponent).join("/")}`,
+      { method: "PUT", body: JSON.stringify({ may_start_threads }) }
+    ),
+  removeRoutingRepository: (repo: string) =>
+    request<void>(
+      `/routing/repositories/${repo.split("/").map(encodeURIComponent).join("/")}`,
+      { method: "DELETE" }
+    ),
+  configureRoutingChannel: (channelId: string, prompt: string) =>
+    request<void>(`/routing/slack-channels/${encodeURIComponent(channelId)}`, {
+      method: "PUT",
+      body: JSON.stringify({ prompt }),
+    }),
+  removeRoutingChannel: (channelId: string) =>
+    request<void>(`/routing/slack-channels/${encodeURIComponent(channelId)}`, {
+      method: "DELETE",
+    }),
+  getExecutionDefaults: () => request<ExecutionDefaults>("/settings/execution"),
+  updateExecutionDefaults: (changes: Partial<ExecutionDefaults>) =>
+    request<ExecutionDefaults>("/settings/execution", {
+      method: "PATCH",
+      body: JSON.stringify(changes),
+    }),
+  getInstanceSettings: () => request<RobinSettings>("/settings"),
+  pendingNotifications: () => request<AppNotification[]>("/notifications"),
+  acknowledgeNotification: (id: string) =>
+    request<{ ok: boolean }>(
+      `/notifications/${encodeURIComponent(id)}/delivered`,
+      { method: "POST" }
+    ),
+  listSlackUsers: () => request<{ users: SlackUserOption[] }>("/slack/users"),
+  slackUserName: (userId: string) =>
+    request<{ name: string }>(
+      `/slack/users/${encodeURIComponent(userId)}/name`
+    ),
+  listSlackBots: () => request<SlackBotOption[]>("/slack/bots"),
+  listSlackChannels: () => request<SlackChannelDirectory>("/slack/channels"),
+  refreshSlackChannels: () =>
+    request<SlackChannelDirectory>("/slack/channels/refresh", {
+      method: "POST",
+    }),
+  listAllowedSlackBots: () => request<AllowedSlackBot[]>("/slack/allowed-bots"),
+  allowSlackBot: (body: { bot_id: string }) =>
+    request<AllowedSlackBot>("/slack/allowed-bots", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  removeAllowedSlackBot: (teamId: string, botId: string) =>
+    request<{ ok: boolean }>(
+      `/slack/allowed-bots/${encodeURIComponent(teamId)}/${encodeURIComponent(botId)}`,
+      { method: "DELETE" }
+    ),
+  saveInstanceSettings: (body: RobinSettings) =>
+    request<RobinSettings>("/settings", {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
+  getMyManagedTools: () => request<ManagedToolsView>("/my-managed-tools"),
+  getBotManagedTools: () => request<BotToolsView>("/managed-tools/bot"),
+  /** With a thread's connect card, the thread continues once every service is connected. */
+  connectManagedTool: (serverId: string, card?: ManagedToolsConnectCard) =>
+    request<ManagedConnectResult>(
+      `/my-managed-tools/connect/${encodeURIComponent(serverId)}${
+        card
+          ? `?${new URLSearchParams({ thread_id: card.threadId, card: card.cardId })}`
+          : ""
+      }`,
+      { method: "POST" }
+    ),
+  disconnectManagedTool: (serverId: string) =>
+    request<void>(
+      `/my-managed-tools/services/${encodeURIComponent(serverId)}`,
+      { method: "DELETE" }
+    ),
+  addManagedServer: (server: NewManagedServer) =>
+    request<ManagedServer>("/my-managed-tools/servers", {
+      method: "POST",
+      body: JSON.stringify(server),
+    }),
+  /** The server a thread's card added once confirmed, or null while it is unconfirmed. */
+  getProposedManagedServer: (card: ManagedToolsConnectCard) =>
+    request<ManagedServer | null>(
+      `/my-managed-tools/proposed-server?${new URLSearchParams({ thread_id: card.threadId, card: card.cardId })}`
+    ),
+  /** Confirms the server a thread's card proposed; the card, not the caller, names it. */
+  addProposedManagedServer: (card: ManagedToolsConnectCard) =>
+    request<ManagedServer>(
+      `/my-managed-tools/proposed-server?${new URLSearchParams({ thread_id: card.threadId, card: card.cardId })}`,
+      { method: "POST" }
+    ),
+  removeManagedServer: (serverId: string) =>
+    request<void>(`/my-managed-tools/servers/${encodeURIComponent(serverId)}`, {
+      method: "DELETE",
+    }),
+  listAutoReviewRepos: () =>
+    request<{ repos: Array<string> }>("/enabled-review-repos"),
+  setAutoReviewRepo: (full_name: string, runAutomatically: boolean) =>
+    request<{ repos: Array<string> }>("/enabled-review-repos", {
+      method: "PUT",
+      body: JSON.stringify({ full_name, enabled: runAutomatically }),
+    }),
+  gatewaySpend: () =>
+    request<{
+      status: "ready" | "sign_in_required" | "forbidden" | "unavailable"
+      limits: Array<{
+        policy_id: string
+        name: string
+        window: string
+        providers: string[]
+        limit_usd: string
+        spend_usd: string | null
+        resets_at?: string | null
+      }>
+    }>("/analytics/gateway-spend"),
+  usageLeaderboard: (
+    period: UsageLeaderboardPeriod = "7d",
+    limit = 10,
+    cursor?: string,
+    sort: UsageLeaderboardSort = "rank",
+    direction: SortDirection = "asc"
+  ) =>
+    request<UsageLeaderboardPayload>(
+      `/agent-usage-leaderboard?period=${encodeURIComponent(period)}&limit=${limit}&sort=${sort}&direction=${direction}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`
+    ).then((payload) => ({
+      ...payload,
+      rows: payload.rows.map((row) => ({
+        ...row,
+        invocations: row.invocations ?? row.agent_runs ?? 0,
+        avg_invocation_seconds:
+          row.avg_invocation_seconds ?? row.avg_run_seconds ?? 0,
+      })),
+    })),
+  usageHealth: (period: UsageLeaderboardPeriod = "7d") =>
+    request<UsageHealthPayload>(
+      `/analytics/usage-health?period=${encodeURIComponent(period)}`
+    ),
+  prMergeRateByModel: (
+    period: UsageLeaderboardPeriod = "7d",
+    maturityDays?: number
+  ) =>
+    request<PRMergeRatePayload>(
+      `/analytics/pr-merge-rate-by-model?period=${encodeURIComponent(period)}${maturityDays == null ? "" : `&maturity_days=${maturityDays}`}`
+    ).then((payload) => ({ payload, fetchedAt: new Date().toISOString() })),
+  listAuditLogs: (filters: AuditLogFilters, cursor?: string) => {
+    const params = new URLSearchParams({ ...filters, limit: "50" })
+    if (cursor) params.set("cursor", cursor)
+    return request<AuditLogsPage>(`/audit-logs?${params}`)
+  },
+  searchEventLog: (filters: EventLogFilters, cursor?: string) => {
+    const params = new URLSearchParams({ ...filters, limit: "50" })
+    if (cursor) params.set("cursor", cursor)
+    return request<EventLogPage>(`/admin/event-log?${params}`)
+  },
+  searchEventLogUsers: (q: string) =>
+    request<EventLogUser[]>(
+      `/admin/event-log/users?q=${encodeURIComponent(q)}`
+    ),
+  adminListUsers: (page = 1, pageSize = 20, search = "") =>
+    request<AdminUsersPage>(
+      `/admin/users?page=${page}&page_size=${pageSize}&search=${encodeURIComponent(search)}`
+    ),
+  listAnnouncements: () => request<AnnouncementsView>("/admin/announcements"),
+  decideAnnouncement: (
+    id: string,
+    decision: "approve" | "reject",
+    payloadDigest: string
+  ) =>
+    request<{ status: string }>(
+      `/admin/announcements/approvals/${encodeURIComponent(id)}/${decision}`,
+      {
+        method: "POST",
+        body: JSON.stringify({ payload_digest: payloadDigest }),
+      }
+    ),
+  sendAnnouncement: (text: string, test: boolean) =>
+    request<{ test: boolean; recipients: number }>("/admin/announcements", {
+      method: "POST",
+      body: JSON.stringify({ text, test }),
+    }),
+  listReviews: (page: number, mine: boolean) =>
+    request<ReviewListPayload>(`/reviews?page=${page}&mine=${mine}`),
+  searchPullRequests: (query: string, offset = 0) =>
+    request<PullRequestSearchResults>(
+      `/pull-requests/search?q=${encodeURIComponent(query)}&offset=${offset}`
+    ),
+  openPullRequests: (
+    repo: string,
+    sort: "createdAt" | "updatedAt" = "updatedAt",
+    direction: "asc" | "desc" = "desc",
+    page = 1,
+    scope: "mine" | "review-assigned" | "review-requested" = "mine"
+  ) =>
+    request<OpenPullRequestsPayload>(
+      `${scope === "review-assigned" ? "/review-assignments" : "/pull-requests"}?repo=${encodeURIComponent(repo)}&lightweight=true&sort=${sort === "createdAt" ? "created" : "updated"}&direction=${direction}&page=${page}&scope=${scope}`
+    ),
+  pullRequestStatus: (repo: string, number: number) =>
+    loadPrDetails(repo, number),
+  fixUpPullRequest: (pr: OpenPullRequest) =>
+    pullRequestThread(pr.repo, pr.number, { intent: "fix-up", context: pr }),
+  sendCommentsToAgent: (
+    repo: string,
+    number: number,
+    comments: Array<AgentBatchComment>
+  ) => pullRequestThread(repo, number, { intent: "comments", comments }),
+  resolveReviewThreads: (
+    repo: string,
+    number: number,
+    threadIds: Array<string>
+  ) =>
+    request<ResolveReviewThreadsResult>(
+      `/repos/${repo.split("/").map(encodeURIComponent).join("/")}/pulls/${number}/review-threads/resolve`,
+      { method: "POST", body: JSON.stringify({ thread_ids: threadIds }) }
+    ),
+  pullRequestThreadStatus: (repo: string, number: number) =>
+    request<{ running: boolean }>(
+      `/repos/${repo.split("/").map(encodeURIComponent).join("/")}/pulls/${number}/thread`
+    ),
+  openPullRequestThread: (repo: string, number: number, title: string) =>
+    pullRequestThread(repo, number, { intent: "open", title }),
+  messagePullRequestThread: (
+    repo: string,
+    number: number,
+    title: string,
+    message: string
+  ) => pullRequestThread(repo, number, { intent: "message", title, message }),
+  mergePullRequest: (
+    pr: OpenPullRequest,
+    method: MergeMethod,
+    resolveConversations = false,
+    autoMerge = false
+  ): Promise<PullRequestActionResult> =>
+    pullRequestAction(pr, {
+      action: "merge",
+      sha: pr.headSha,
+      merge_method: method,
+      ...(autoMerge ? { auto_merge: true } : {}),
+      ...(resolveConversations ? { resolve_conversations: true } : {}),
+    }),
+  disablePullRequestAutoMerge: (
+    pr: OpenPullRequest
+  ): Promise<PullRequestActionResult> =>
+    pullRequestAction(pr, { action: "disable-auto-merge" }),
+  closePullRequest: (
+    pr: OpenPullRequest,
+    reason?: string
+  ): Promise<PullRequestActionResult> =>
+    pullRequestAction(
+      pr,
+      reason ? { action: "close", reason } : { action: "close" }
+    ),
+  updatePullRequestBranch: (
+    pr: OpenPullRequest
+  ): Promise<PullRequestActionResult> =>
+    pullRequestAction(pr, { action: "update-branch", sha: pr.headSha }),
+  markPullRequestReady: (
+    pr: OpenPullRequest
+  ): Promise<PullRequestActionResult> =>
+    pullRequestAction(pr, { action: "mark-ready" }),
+  humanReviewAvailability: (
+    pr: Pick<OpenPullRequest, "repo" | "number" | "draft">
+  ) =>
+    request<{
+      available: boolean
+      active: boolean
+      permalink: string
+      awaiting_ready?: boolean
+      blockers: string[]
+    }>(
+      `/repos/${pr.repo.split("/").map(encodeURIComponent).join("/")}/pulls/${pr.number}/human-review${pr.draft === true ? "?active_only=true" : ""}`
+    ),
+  requestHumanReview: (pr: OpenPullRequest, channel = "") =>
+    request<HumanReviewRequestResult>(
+      `/repos/${pr.repo.split("/").map(encodeURIComponent).join("/")}/pulls/${pr.number}/human-review`,
+      { method: "POST", body: JSON.stringify({ channel }) }
+    ),
+  repoMergeMethods: (repo: string) =>
+    request<{ mergeMethods: MergeMethod[] }>(
+      `/repos/${repo.split("/").map(encodeURIComponent).join("/")}/merge-methods`
+    ),
+  reviewSummaries: (pullRequests: Array<{ repo: string; number: number }>) =>
+    request<Record<string, ReviewSummary | null>>("/reviews/summaries", {
+      method: "POST",
+      body: JSON.stringify({ pullRequests }),
+    }),
+  getReview: (owner: string, repo: string, number: number) =>
+    request<ReviewDetail>(
+      `/reviews/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${number}`
+    ),
+  updatePullRequestTitle: (
+    owner: string,
+    repo: string,
+    number: number,
+    title: string
+  ) =>
+    request<void>(
+      `/reviews/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${number}/title`,
+      { method: "PATCH", body: JSON.stringify({ title }) }
+    ),
+  updatePullRequestDescription: (
+    owner: string,
+    repo: string,
+    number: number,
+    body: string
+  ) =>
+    request<void>(
+      `/reviews/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${number}/description`,
+      { method: "PATCH", body: JSON.stringify({ body }) }
+    ),
+  getAssessmentFeedback: (
+    owner: string,
+    repo: string,
+    number: number,
+    reviewId: number
+  ) =>
+    request<ReviewAssessmentFeedback | null>(
+      `/reviews/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${number}/feedback/${reviewId}`
+    ),
+  saveAssessmentFeedback: (
+    owner: string,
+    repo: string,
+    number: number,
+    reviewId: number,
+    feedback: ReviewAssessmentFeedbackInput
+  ) =>
+    request<ReviewAssessmentFeedback>(
+      `/reviews/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${number}/feedback/${reviewId}`,
+      { method: "PUT", body: JSON.stringify(feedback) }
+    ),
+  getPullRequestLabels: (owner: string, repo: string, number: number) =>
+    request<{
+      available: Array<{
+        name: string
+        color: string
+        description: string | null
+      }>
+      selected: Array<{
+        name: string
+        color: string
+        description: string | null
+      }>
+    }>(
+      `/reviews/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${number}/labels`
+    ),
+  changePullRequestLabel: (
+    owner: string,
+    repo: string,
+    number: number,
+    name: string,
+    selected: boolean
+  ) =>
+    request<void>(
+      `/reviews/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${number}/labels`,
+      { method: "PATCH", body: JSON.stringify({ name, selected }) }
+    ),
+  getPullRequestPreview: (owner: string, repo: string, number: number) =>
+    request<PullRequestPreview>(
+      `/reviews/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${number}/preview`
+    ),
+  getReviewChecks: (owner: string, repo: string, number: number) =>
+    request<Array<ReviewCheckRun>>(
+      `/reviews/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${number}/checks`
+    ),
+  getReviewDiff: (owner: string, repo: string, number: number) =>
+    request<ReviewDiffPayload>(
+      `/reviews/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${number}/diff`
+    ),
+  getReviewFileContents: (
+    owner: string,
+    repo: string,
+    number: number,
+    path: string,
+    originalPath: string,
+    baseSha: string,
+    headSha: string
+  ) =>
+    request<ReviewFileContents>(
+      `/reviews/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${number}/file-contents` +
+        `?path=${encodeURIComponent(path)}&original_path=${encodeURIComponent(originalPath)}&base_sha=${encodeURIComponent(baseSha)}&head_sha=${encodeURIComponent(headSha)}`
+    ),
+  getReviewChat: (owner: string, repo: string, number: number) =>
+    request<ReviewChatMeta>(
+      `/reviews/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${number}/chat`
+    ),
+  runReviewScout: (owner: string, repo: string, number: number) =>
+    request<{ started: boolean; run_id: string | null }>(
+      `/reviews/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${number}/scout`,
+      { method: "POST" }
+    ),
+  markReviewViewed: (owner: string, repo: string, number: number) =>
+    request<void>(
+      `/reviews/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${number}/viewed`,
+      { method: "POST" }
+    ),
+  reReview: (owner: string, repo: string, number: number) =>
+    request<{
+      success: boolean
+      queued: boolean
+      thread_id: string
+      pr_url: string
+    }>(
+      `/reviews/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${number}/re-review`,
+      { method: "POST" }
+    ),
+  getPendingReview: (owner: string, repo: string, number: number) =>
+    request<PendingReview | null>(
+      `/reviews/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${number}/pending-review`
+    ),
+  addPendingReviewComment: (
+    owner: string,
+    repo: string,
+    number: number,
+    comment: ReviewCommentCreate
+  ) =>
+    request<PendingReview>(
+      `/reviews/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${number}/pending-review/comments`,
+      { method: "POST", body: JSON.stringify(comment) }
+    ),
+  updatePendingReviewComment: (
+    owner: string,
+    repo: string,
+    number: number,
+    commentId: number,
+    body: string
+  ) =>
+    request<PendingReview>(
+      `/reviews/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${number}/pending-review/comments/${commentId}`,
+      { method: "PATCH", body: JSON.stringify({ body }) }
+    ),
+  deletePendingReviewComment: (
+    owner: string,
+    repo: string,
+    number: number,
+    commentId: number
+  ) =>
+    request<PendingReview | null>(
+      `/reviews/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${number}/pending-review/comments/${commentId}`,
+      { method: "DELETE" }
+    ),
+  discardPendingReview: (owner: string, repo: string, number: number) =>
+    request<{ discarded: boolean }>(
+      `/reviews/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${number}/pending-review`,
+      { method: "DELETE" }
+    ),
+  submitPullRequestReview: (
+    owner: string,
+    repo: string,
+    number: number,
+    review: { event: PullRequestReviewEvent; body: string }
+  ) =>
+    request<SubmittedReview>(
+      `/reviews/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${number}/submit-review`,
+      { method: "POST", body: JSON.stringify(review) }
+    ),
+  postReviewComment: (
+    owner: string,
+    repo: string,
+    number: number,
+    comment: ReviewCommentCreate
+  ) =>
+    request<PostedReviewComment>(
+      `/reviews/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${number}/comments`,
+      { method: "POST", body: JSON.stringify(comment) }
+    ),
+  getReviewerEval: () => request<ReviewerEvalStatus>("/admin/evals/reviewer"),
+  startReviewerEval: (body: ReviewerEvalStartRequest) =>
+    request<ReviewerEvalStatus>("/admin/evals/reviewer", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  logout: () => request<void>("/auth/logout", { method: "POST" }),
+  traceFlightSeason: (signal?: AbortSignal) =>
+    request<TraceFlightSeason>("/trace-flight/season", { signal }),
+  traceFlightBest: () => request<TraceFlightBest | null>("/trace-flight/best"),
+  submitTraceFlightRun: (body: TraceFlightSubmission) =>
+    request<TraceFlightResult>("/trace-flight/runs", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+}
+
+/** The open Trace Flight season: the rules and the course every run is played on. */
+export interface TraceFlightSeason {
+  seasonId: string
+  rulesVersion: number
+  seed: number
+}
+
+/** Your best run this season, as inputs the game replays into your trace. */
+export interface TraceFlightBest {
+  seed: number
+  endTick: number
+  endReason: string
+  flapDeltas: Array<number>
+  score: number
+}
+
+export interface TraceFlightRow {
+  rank: number
+  name: string
+  score: number
+  you: boolean
+}
+
+export interface TraceFlightSubmission {
+  seasonId: string
+  rulesVersion: number
+  endTick: number
+  endReason: string
+  flapDeltas: ReadonlyArray<number>
+}
+
+/** The score is the server's replay of the run, never one the client sent. */
+export interface TraceFlightResult {
+  score: number
+  previousBest: number | null
+  newBest: boolean
+  board: Array<TraceFlightRow>
+}
+
+/** Robin's connect route for one managed tools service, which redirects to its consent page. */
+export function managedToolConnectUrl(
+  serverId: string,
+  card?: ManagedToolsConnectCard
+): string {
+  const query = card
+    ? `?${new URLSearchParams({ thread_id: card.threadId, card: card.cardId })}`
+    : ""
+  return `${API_BASE}/dashboard/api/my-managed-tools/connect/${encodeURIComponent(serverId)}${query}`
+}
+
+export function loginUrl(redirectTo?: string): string {
+  const target =
+    redirectTo ??
+    (typeof window !== "undefined"
+      ? `${window.location.pathname}${window.location.search}${window.location.hash}`
+      : "")
+  const qs = target ? `?redirect_to=${encodeURIComponent(target)}` : ""
+  return `${API_BASE}/dashboard/api/auth/login${qs}`
+}
+
+/**
+ * Start an OAuth connect flow, returning a promise only the desktop app has.
+ *
+ * The web flow is a redirect that comes back to the page that started it. The
+ * desktop app can't use that: its window and the browser that shows the
+ * provider's consent page have separate cookie jars, so it runs the flow
+ * itself and resolves once the connection is stored.
+ */
+export type SlackRecovery = { recoveryToken: string; error?: string }
+export type ConnectResult = boolean | SlackRecovery
+
+export function connectService(
+  provider: "slack" | "github",
+  redirectTo?: string,
+  recoveryToken?: string
+) {
+  const action = productAnalytics.beginAction("integration_connect")
+  const pending = window.openSweDesktop?.connectService(
+    provider,
+    recoveryToken ? { recoveryToken } : undefined
+  )
+  if (!pending) {
+    const target =
+      redirectTo ??
+      (provider === "slack"
+        ? `${window.location.pathname}${window.location.search}${window.location.hash}`
+        : "")
+    const params = new URLSearchParams()
+    if (target) params.set("redirect_to", target)
+    if (recoveryToken) params.set("slack_recovery", recoveryToken)
+    const query = params.size ? `?${params}` : ""
+    window.location.assign(
+      `${API_BASE}/dashboard/api/${provider}/login${query}`
+    )
+  }
+  return pending?.then(
+    (result) => {
+      action.accepted()
+      return result
+    },
+    (error: unknown) => {
+      action.failed(error)
+      throw error
+    }
+  )
+}

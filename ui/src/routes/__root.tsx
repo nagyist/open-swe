@@ -1,0 +1,160 @@
+import { Suspense, lazy, useEffect, useState } from "react"
+import {
+  HeadContent,
+  Outlet,
+  Scripts,
+  createRootRouteWithContext,
+  useRouter,
+  useRouterState,
+} from "@tanstack/react-router"
+import { TanStackRouterDevtoolsPanel } from "@tanstack/react-router-devtools"
+import { TanStackDevtools } from "@tanstack/react-devtools"
+import { QueryClientProvider } from "@tanstack/react-query"
+import { ReactQueryDevtools } from "@tanstack/react-query-devtools"
+
+import appCss from "../styles.css?url"
+import type { QueryClient } from "@tanstack/react-query"
+import { AppCommandProvider } from "@/lib/appCommands"
+import { resolveSessionOnServer } from "@/lib/session-ssr"
+import { TooltipProvider } from "@langchain/macaw-components/Tooltip"
+import { Text } from "@langchain/macaw-components/Text"
+import { Toaster } from "@/components/Toaster"
+import { AppNotifications } from "@/components/AppNotifications"
+import { VersionMismatchBanner } from "@/components/VersionMismatchBanner"
+import { ThemeSync } from "@/lib/ThemeSync"
+import { Favicon } from "@/components/Branding"
+import { AnalyticsIdentity } from "@/lib/AnalyticsIdentity"
+import { InvalidationStream } from "@/lib/invalidations/InvalidationStream"
+import { THEME_COLOR } from "@/lib/theme"
+import { apiWarmupScript } from "@/features/agents/lib/apiWarmup"
+import { isPerfHudEnabled } from "@/lib/perf/trace"
+import { PageCommandRunner } from "@/features/agents/components/PageCommandRunner"
+
+const PerfHud = lazy(() => import("@/lib/perf/PerfHud"))
+
+/** Client-only: the flag lives in localStorage, so the server render never shows it. */
+function PerfHudMount() {
+  const [enabled, setEnabled] = useState(false)
+  // oxlint-disable-next-line react/set-state-in-effect
+  useEffect(() => setEnabled(isPerfHudEnabled()), [])
+  if (!enabled) return null
+  return (
+    <Suspense fallback={null}>
+      <PerfHud />
+    </Suspense>
+  )
+}
+
+const themeInitScript = `(function(){try{var t=localStorage.getItem("open-swe-theme");var d=t==="dark"||((!t||t==="system")&&window.matchMedia("(prefers-color-scheme: dark)").matches);var r=document.documentElement;r.classList.toggle("dark",d);r.style.colorScheme=d?"dark":"light";}catch(e){}})();`
+
+export const Route = createRootRouteWithContext<{
+  queryClient: QueryClient
+}>()({
+  beforeLoad: ({ context, location }) =>
+    resolveSessionOnServer(context.queryClient, location.href),
+  head: () => ({
+    meta: [
+      { charSet: "utf-8" },
+      {
+        name: "viewport",
+        content: "width=device-width, initial-scale=1, maximum-scale=1",
+      },
+      { name: "theme-color", content: THEME_COLOR.light },
+      { title: "Robin" },
+    ],
+    links: [
+      { rel: "stylesheet", href: appCss },
+      {
+        rel: "manifest",
+        href: `${import.meta.env.BASE_URL}manifest.webmanifest`,
+      },
+      {
+        rel: "apple-touch-icon",
+        href: `${import.meta.env.BASE_URL}apple-touch-icon.png`,
+      },
+    ],
+  }),
+  notFoundComponent: () => (
+    <main className="container mx-auto p-space-4 pt-space-9">
+      <Text as="h1" variant="h1" weight="medium" color="primary">
+        404
+      </Text>
+      <p className="text-secondary">The requested page could not be found.</p>
+    </main>
+  ),
+  shellComponent: RootDocument,
+})
+
+function AppProviders({ children }: { children: React.ReactNode }) {
+  return (
+    <>
+      <InvalidationStream />
+      <PageCommandRunner />
+      <AppNotifications />
+      <VersionMismatchBanner />
+      <AppCommandProvider>{children}</AppCommandProvider>
+    </>
+  )
+}
+
+function RootDocument({ children }: { children: React.ReactNode }) {
+  const { queryClient } = useRouter().options.context
+  const selectedPullRequest = useRouterState({
+    select: (s) => s.location.search.pr,
+  })
+  const warmupScript = apiWarmupScript(selectedPullRequest)
+  return (
+    <html lang="en" suppressHydrationWarning>
+      <head>
+        <script dangerouslySetInnerHTML={{ __html: themeInitScript }} />
+        <script
+          dangerouslySetInnerHTML={{ __html: warmupScript }}
+          suppressHydrationWarning
+        />
+        <HeadContent />
+      </head>
+      <body>
+        {typeof window !== "undefined" &&
+          window.openSweDesktop && (
+            // Rendered first so later no-drag elements carve out of it; the
+            // desktop preload styles it. Preload-injected DOM would be cleared
+            // when React takes over the document, so it lives here instead.
+            <div aria-hidden data-desktop-drag-strip="" />
+          )}
+        <ThemeSync />
+        <Toaster position="bottom-right" closeButton />
+        <QueryClientProvider client={queryClient}>
+          <Favicon />
+          <TooltipProvider>
+            <AnalyticsIdentity />
+            <AppProviders>{children ?? <Outlet />}</AppProviders>
+            <PerfHudMount />
+            {import.meta.env.VITE_DEVTOOLS !== "false" && (
+              <>
+                <TanStackDevtools
+                  config={{ position: "bottom-right" }}
+                  plugins={[
+                    {
+                      name: "Tanstack Router",
+                      render: <TanStackRouterDevtoolsPanel />,
+                    },
+                  ]}
+                />
+                <ReactQueryDevtools initialIsOpen={false} />
+              </>
+            )}
+          </TooltipProvider>
+        </QueryClientProvider>
+        {typeof window !== "undefined" &&
+          window.openSweDesktop && (
+            // The title-bar buttons portal here. Electron applies app regions
+            // in DOM order, so they must follow every draggable header; a
+            // portal into <body> lands wherever mount timing puts it, while
+            // React keeps this, its last child, after the app on every remount.
+            <div data-desktop-window-controls="" />
+          )}
+        <Scripts />
+      </body>
+    </html>
+  )
+}
